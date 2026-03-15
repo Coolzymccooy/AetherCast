@@ -44,3 +44,33 @@ export type Recording = {
   fileName: string;
   url?: string;
 };
+
+export type StreamDestination = {
+  id: string;
+  name: string;
+  rtmpUrl: string;
+  streamKey: string;
+  enabled: boolean;
+};
+
+export type CamoSettings = {
+  layout: 'Fill' | 'Center' | 'Reset';
+  contentFit: 'Fit' | 'Fill';
+  scale: number;
+  x: number;
+  y: number;
+  shape: 'Rect' | 'Circle';
+  cornerRadius: number;
+  crop: { left: number; right: number; top: number; bottom: number };
+  filter: 'None' | 'B&W' | 'Sepia' | 'Vivid' | 'Cool' | 'Dim';
+  removeBackground: boolean;
+};
+
+export type AudienceMessage = {
+  id: string;
+  author: string;
+  text: string;
+  type: 'Q&A' | 'Prayer' | 'Testimony' | 'Welcome' | 'Poll';
+  timestamp: number;
+  visible: boolean;
+};

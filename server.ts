@@ -46,34 +46,67 @@ async function startServer() {
 
     // RTMP Streaming Logic
     socket.on("start-stream", (data) => {
-      const { rtmpUrl } = data;
-      console.log(`Streaming started to: ${rtmpUrl}`);
-      socket.emit('server-log', { message: `Initializing FFmpeg for ${rtmpUrl}...`, type: 'info' });
+      const { destinations } = data;
+      if (!destinations || destinations.length === 0) {
+        socket.emit('server-log', { message: 'No destinations provided', type: 'error' });
+        return;
+      }
+      
+      console.log(`Streaming started to ${destinations.length} destinations`);
+      socket.emit('server-log', { message: `Initializing FFmpeg for ${destinations.length} destinations...`, type: 'info' });
 
       inputStream = new PassThrough();
-      ffmpegProcess = ffmpeg(inputStream)
+      
+      let command = ffmpeg(inputStream)
         .inputFormat('webm')
+        // Use libx264 as a safe default, but in a real production environment, 
+        // you would detect and use hardware encoders like h264_nvenc, h264_qsv, or h264_videotoolbox
         .videoCodec('libx264')
         .audioCodec('aac')
-        .format('flv')
         .outputOptions([
-          '-preset ultrafast',
+          '-preset veryfast', // Better quality than ultrafast, still low latency
           '-tune zerolatency',
-          '-g 60', // 2 second keyframe at 30fps
-          '-b:v 5000k',
-          '-maxrate 5000k',
-          '-bufsize 10000k',
+          '-threads 0', // Use all available CPU threads
+          '-g 60', // 2 second keyframe at 30fps (required by Twitch/YouTube)
+          '-keyint_min 60',
+          '-sc_threshold 0', // Disable scene change detection for strict CBR
+          '-b:v 6000k', // 6Mbps for 1080p60 broadcast quality
+          '-maxrate 6000k',
+          '-bufsize 12000k', // 2x maxrate for buffer
           '-pix_fmt yuv420p',
           '-profile:v high',
-          '-level 4.1'
+          '-level 4.2',
+          '-b:a 160k', // High quality audio
+          '-ar 44100'
+        ]);
+
+      // Construct tee output with failure isolation
+      let teeOutputs = '';
+      destinations.forEach((dest: any) => {
+        const url = `${dest.rtmpUrl.replace(/\/$/, '')}/${dest.streamKey}`;
+        // onfail=ignore ensures if one destination drops, the others keep streaming
+        teeOutputs += `[f=flv:onfail=ignore]${url}|`;
+      });
+      // Remove trailing pipe
+      teeOutputs = teeOutputs.slice(0, -1);
+
+      command = command
+        .format('tee')
+        .outputOptions([
+          '-map 0:v',
+          '-map 0:a?', // Map audio if available
+          '-flags +global_header' // Required for some RTMP destinations when using tee
         ])
+        .output(teeOutputs);
+
+      ffmpegProcess = command
         .on('start', (commandLine) => {
           console.log('FFmpeg started with command: ' + commandLine);
           socket.emit('server-log', { message: 'FFmpeg started successfully', type: 'success' });
         })
         .on('stderr', (stderrLine) => {
-          console.log('FFmpeg output: ' + stderrLine);
-          socket.emit('server-log', { message: stderrLine, type: 'ffmpeg' });
+          // console.log('FFmpeg output: ' + stderrLine); // Too noisy
+          // socket.emit('server-log', { message: stderrLine, type: 'ffmpeg' });
         })
         .on('error', (err, stdout, stderr) => {
           console.error('FFmpeg error:', err.message);
@@ -82,8 +115,15 @@ async function startServer() {
         .on('end', () => {
           console.log('FFmpeg process ended');
           socket.emit('server-log', { message: 'FFmpeg process ended', type: 'info' });
-        })
-        .save(rtmpUrl);
+        });
+        
+      ffmpegProcess.run();
+    });
+
+    socket.on("audience-message", (data) => {
+      if (data.roomId) {
+        socket.to(data.roomId).emit("audience-message", data.message);
+      }
     });
 
     socket.on("stream-chunk", (data) => {
