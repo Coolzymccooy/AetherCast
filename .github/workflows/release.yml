@@ -16,10 +16,6 @@ jobs:
         include:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-          - platform: macos-14
-            target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.platform }}
 
@@ -48,14 +44,6 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Create dist placeholder
-        run: |
-          if [ ! -f dist/index.html ]; then
-            mkdir -p dist
-            echo "<html><body>AetherCast</body></html>" > dist/index.html
-          fi
-        shell: bash
-
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -70,11 +58,9 @@ jobs:
 
             ### Downloads
             - **Windows**: `.msi` or `-setup.exe` installer
-            - **macOS (Apple Silicon)**: `.dmg` disk image
-            - **macOS (Intel)**: `.dmg` disk image
 
             ### Features
-            - GPU-accelerated streaming (NVENC/QSV/AMF/VideoToolbox)
+            - GPU-accelerated streaming (NVENC/QSV/AMF)
             - Multi-destination output (RTMP/RTMPS/SRT/RIST)
             - Real-time compositor with scene switching
             - Pro audio processing (compressor, EQ, limiter, LUFS metering)
