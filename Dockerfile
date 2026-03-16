@@ -1,13 +1,13 @@
-# ── Stage 1: Build frontend ──────────────────────────────────────────────────
+# ── Stage 1: Build frontend + prepare server ────────────────────────────────
 FROM node:22-alpine AS builder
 
 WORKDIR /app
 
-# Install dependencies first (cache layer)
+# Install ALL dependencies (devDeps needed for build + tsx)
 COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+RUN npm ci
 
-# Copy source and build
+# Copy source and build frontend
 COPY . .
 RUN npm run build
 
@@ -19,30 +19,29 @@ RUN apk add --no-cache ffmpeg
 
 WORKDIR /app
 
-# Copy package files and install production dependencies only
+# Copy ALL node_modules from builder (tsx + vite needed at runtime for server.ts)
+COPY --from=builder /app/node_modules ./node_modules
+
+# Copy package files
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts
 
 # Copy built frontend
 COPY --from=builder /app/dist ./dist
 
-# Copy server source files
-COPY server.ts ./
-COPY src/lib/sanitize.ts ./src/lib/sanitize.ts
-
-# Copy tsconfig for tsx runtime
-COPY tsconfig.json ./
+# Copy server and all source files it imports
+COPY server.ts tsconfig.json vite.config.ts ./
+COPY src/ ./src/
 
 # Expose port
 EXPOSE 3001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# Health check — increased start period for cold start
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:3001/ || exit 1
 
 # Environment
 ENV NODE_ENV=production
 ENV PORT=3001
 
-# Start server
+# Start server using tsx (TypeScript execution)
 CMD ["npx", "tsx", "server.ts"]
