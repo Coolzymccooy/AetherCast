@@ -1,6 +1,44 @@
 import React, { useEffect, useRef } from 'react';
 import { Scene, Source, AudienceMessage } from '../types';
 
+// ── Canvas & Layout Constants ────────────────────────────────────────────────
+const CANVAS = {
+  WIDTH: 1920,
+  HEIGHT: 1080,
+  FPS: 30,
+  ASPECT_RATIO: 9 / 16,
+} as const;
+
+const LAYOUT = {
+  PADDING: 40,
+  LARGE_PADDING: 80,
+  PIP_MARGIN: 40,
+  PIP_SCALE: 0.25,      // PiP is 1/4 of canvas
+  SCREEN_MAIN: 0.75,    // Screen mode: main takes 75%
+  SCREEN_CAM: 0.25,     // Screen mode: camera takes 25%
+  FREEFORM_SCREEN: 0.8,
+  FREEFORM_CAM: 0.2,
+  GRID_COLS: 2,
+  GRID_ROWS: 2,
+  GRID_GAP: 20,
+} as const;
+
+const OVERLAY = {
+  BUG_SIZE: 60,
+  BUG_MARGIN: 40,
+  LOWER_THIRD_WIDTH: 400,
+  LOWER_THIRD_HEIGHT: 80,
+  LOWER_THIRD_X: 60,
+  LOWER_THIRD_Y_OFFSET: 140, // from bottom
+  SOCIAL_X: 60,
+  SOCIAL_Y: 60,
+  MSG_WIDTH: 600,
+  MSG_HEIGHT: 120,
+  MSG_Y_OFFSET: 200, // from bottom
+  LIVE_DOT_RADIUS: 6,
+  LIVE_MARGIN: 30,
+} as const;
+
 interface CompositorProps {
   activeScene: Scene;
   sources: Source[];
@@ -85,12 +123,18 @@ export const Compositor: React.FC<CompositorProps> = ({
       video.playsInline = true;
       video.play().catch(err => console.error('Compositor: Video play error:', err));
       videoRef.current = video;
-      
+
       return () => {
         video.pause();
         video.srcObject = null;
+        videoRef.current = null;
       };
     } else {
+      // Clean up previous video element if stream becomes null
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.srcObject = null;
+      }
       videoRef.current = null;
     }
   }, [webcamStream]);
@@ -101,14 +145,32 @@ export const Compositor: React.FC<CompositorProps> = ({
       video.srcObject = screenStream;
       video.muted = true;
       video.playsInline = true;
-      video.play().catch(err => console.error('Compositor: Screen video play error:', err));
-      screenVideoRef.current = video;
-      
+      video.autoplay = true;
+      // Wait for the video to be ready before setting the ref
+      video.onloadeddata = () => {
+        screenVideoRef.current = video;
+      };
+      // Also set immediately in case it's already loaded
+      video.play().then(() => {
+        screenVideoRef.current = video;
+      }).catch(err => {
+        console.error('Compositor: Screen video play error:', err);
+        // Still set the ref — it may render on next readyState change
+        screenVideoRef.current = video;
+      });
+
       return () => {
+        video.onloadeddata = null;
         video.pause();
         video.srcObject = null;
+        screenVideoRef.current = null;
       };
     } else {
+      if (screenVideoRef.current) {
+        screenVideoRef.current.onloadeddata = null;
+        screenVideoRef.current.pause();
+        screenVideoRef.current.srcObject = null;
+      }
       screenVideoRef.current = null;
     }
   }, [screenStream]);
@@ -126,7 +188,7 @@ export const Compositor: React.FC<CompositorProps> = ({
       }
     });
 
-    // Cleanup old ones
+    // Cleanup stale entries
     Array.from(remoteVideoRefs.current.keys()).forEach(id => {
       if (!remoteStreams.has(id)) {
         const v = remoteVideoRefs.current.get(id);
@@ -137,6 +199,15 @@ export const Compositor: React.FC<CompositorProps> = ({
         remoteVideoRefs.current.delete(id);
       }
     });
+
+    // Full cleanup on unmount
+    return () => {
+      remoteVideoRefs.current.forEach(v => {
+        v.pause();
+        v.srcObject = null;
+      });
+      remoteVideoRefs.current.clear();
+    };
   }, [remoteStreams]);
 
   const drawFramedVideo = (
@@ -245,7 +316,7 @@ export const Compositor: React.FC<CompositorProps> = ({
     }
 
     if (media) {
-      if (media instanceof HTMLVideoElement && media.readyState >= 2) {
+      if (media instanceof HTMLVideoElement && media.readyState >= 1) {
         ctx.drawImage(media, drawX, drawY, drawW, drawH);
       } else if (media instanceof HTMLImageElement && media.complete) {
         ctx.drawImage(media, drawX, drawY, drawW, drawH);
@@ -310,9 +381,43 @@ export const Compositor: React.FC<CompositorProps> = ({
       secondaryVideo = temp as any;
     }
 
-    if (scene.type === 'CAM') {
+    // If screen share is active and we're in a split layout, auto-handle it regardless of scene type
+    const hasScreenShare = screenVideoRef.current && screenVideoRef.current.readyState >= 1;
+
+    if (hasScreenShare && (layout === 'Side-by-Side' || layout === 'Split Left' || layout === 'Split Right' || layout === 'Picture-in-Pic' || layout === 'PiP' || layout === 'Projector + Spk')) {
+      // Universal screen share handling — works for any scene type
+      const cam = primaryVideo;
+      const screen = screenVideoRef.current!;
+      const padding = 40;
+
+      if (layout === 'Side-by-Side' || layout === 'Split Left') {
+        const w = (width / 2) - (padding * 1.5);
+        const h = w * (9 / 16);
+        const y = (height - h) / 2;
+        drawFramedVideo(ctx, cam, 'Camera', padding, y, w, h, frameCount, '#FF4C4C', camoSettings);
+        drawFramedVideo(ctx, screen, 'Screen Share', width / 2 + padding / 2, y, w, h, frameCount + 100, '#00E5FF');
+      } else if (layout === 'Split Right') {
+        const w = (width / 2) - (padding * 1.5);
+        const h = w * (9 / 16);
+        const y = (height - h) / 2;
+        drawFramedVideo(ctx, screen, 'Screen Share', padding, y, w, h, frameCount, '#00E5FF');
+        drawFramedVideo(ctx, cam, 'Camera', width / 2 + padding / 2, y, w, h, frameCount + 100, '#FF4C4C', camoSettings);
+      } else if (layout === 'Picture-in-Pic' || layout === 'PiP') {
+        ctx.drawImage(screen, 0, 0, width, height);
+        const pipW = width / 4;
+        const pipH = height / 4;
+        drawFramedVideo(ctx, cam, 'Camera', width - pipW - 40, height - pipH - 40, pipW, pipH, frameCount + 200, '#FF4C4C', camoSettings);
+      } else if (layout === 'Projector + Spk') {
+        const screenW = width * 0.75;
+        const screenH = screenW * (9 / 16);
+        drawFramedVideo(ctx, screen, 'Screen Share', 60, (height - screenH) / 2, screenW, screenH, frameCount, '#00E5FF');
+        const camW = width * 0.25;
+        const camH = camW * (9 / 16);
+        drawFramedVideo(ctx, cam, 'Camera', width - camW - 60, height - camH - 60, camW, camH, frameCount, '#FF4C4C', camoSettings);
+      }
+    } else if (scene.type === 'CAM') {
       const video = primaryVideo;
-      
+
       if (layout === 'Framed Solo') {
         const padding = 80;
         const w = width - (padding * 2);
@@ -341,13 +446,13 @@ export const Compositor: React.FC<CompositorProps> = ({
       } else {
         if (scene.name === 'Cam 2') {
           const remoteVideo = remoteVideos[0] || localCam2;
-          if (remoteVideo && remoteVideo.readyState >= 2) {
+          if (remoteVideo && remoteVideo.readyState >= 1) {
             ctx.drawImage(remoteVideo, 0, 0, width, height);
           } else {
             drawSimulatedFeed(ctx, 'REMOTE CAM 2', 0, 0, width, height, frameCount);
           }
         } else {
-          if (video && video.readyState >= 2) {
+          if (video && video.readyState >= 1) {
             ctx.drawImage(video, 0, 0, width, height);
           } else {
             drawSimulatedFeed(ctx, 'LOCAL CAM 1', 0, 0, width, height, frameCount);
@@ -356,8 +461,9 @@ export const Compositor: React.FC<CompositorProps> = ({
       }
     } else if (scene.type === 'DUAL') {
       const video = primaryVideo;
-      const remoteVideo = secondaryVideo;
-      
+      // For DUAL scenes, the secondary can be a remote camera, screen share, or local cam 2
+      const remoteVideo = secondaryVideo || screenVideoRef.current;
+
       if (layout === 'Side-by-Side' || layout === 'Solo') {
         const padding = 40;
         const w = (width / 2) - (padding * 1.5);
@@ -365,10 +471,10 @@ export const Compositor: React.FC<CompositorProps> = ({
         const y = (height - h) / 2;
 
         drawFramedVideo(ctx, video, 'LOCAL CAM 1', padding, y, w, h, frameCount, '#FF4C4C');
-        drawFramedVideo(ctx, remoteVideo, 'REMOTE CAM 2', width / 2 + padding / 2, y, w, h, frameCount + 100, '#00E5FF');
+        drawFramedVideo(ctx, remoteVideo, 'SOURCE 2', width / 2 + padding / 2, y, w, h, frameCount + 100, '#00E5FF');
       } else if (layout === 'Picture-in-Pic') {
         // Remote as background, local as PiP
-        if (remoteVideo && remoteVideo.readyState >= 2) {
+        if (remoteVideo && remoteVideo.readyState >= 1) {
           ctx.drawImage(remoteVideo, 0, 0, width, height);
         } else {
           drawSimulatedFeed(ctx, 'REMOTE CAM 2', 0, 0, width, height, frameCount);
@@ -383,26 +489,30 @@ export const Compositor: React.FC<CompositorProps> = ({
       }
     } else if (scene.type === 'SCREEN') {
       const video = primaryVideo;
-      const screenVideo = secondaryVideo;
-      
-      if (layout === 'Projector + Spk') {
-        // Screen share takes up most of the space, slightly offset to the left
+      // For SCREEN scenes, always use the actual screen stream as the screen source
+      const screenVid = screenVideoRef.current || secondaryVideo;
+
+      if (layout === 'Side-by-Side') {
+        // Side-by-Side: camera on left, screen on right
+        const padding = 40;
+        const w = (width / 2) - (padding * 1.5);
+        const h = w * (9/16);
+        const y = (height - h) / 2;
+
+        drawFramedVideo(ctx, video, 'LOCAL CAM 1', padding, y, w, h, frameCount, '#FF4C4C');
+        drawFramedVideo(ctx, screenVid, 'Screen Share', width / 2 + padding / 2, y, w, h, frameCount + 100, '#00E5FF');
+      } else if (layout === 'Projector + Spk') {
         const padding = 60;
         const screenW = width * 0.75;
         const screenH = screenW * (9/16);
         const screenX = padding;
         const screenY = (height - screenH) / 2;
-
-        // Camera overlaps the bottom right of the screen share
         const camW = width * 0.25;
         const camH = camW * (9/16);
         const camX = width - camW - padding;
         const camY = height - camH - padding;
 
-        // Draw Screen
-        drawFramedVideo(ctx, screenVideo, 'Screen Share', screenX, screenY, screenW, screenH, frameCount, '#00E5FF');
-
-        // Draw Camera
+        drawFramedVideo(ctx, screenVid, 'Screen Share', screenX, screenY, screenW, screenH, frameCount, '#00E5FF');
         drawFramedVideo(ctx, video, 'LOCAL CAM 1', camX, camY, camW, camH, frameCount, '#FF4C4C', camoSettings);
 
       } else if (layout === 'Split Left') {
@@ -410,8 +520,8 @@ export const Compositor: React.FC<CompositorProps> = ({
         const w = (width / 2) - (padding * 1.5);
         const h = w * (9/16);
         const y = (height - h) / 2;
-        
-        drawFramedVideo(ctx, screenVideo, 'Screen Share', padding, y, w, h, frameCount, '#00E5FF');
+
+        drawFramedVideo(ctx, screenVid, 'Screen Share', padding, y, w, h, frameCount, '#00E5FF');
         drawFramedVideo(ctx, video, 'LOCAL CAM 1', width / 2 + padding / 2, y, w, h, frameCount, '#FF4C4C');
 
       } else if (layout === 'Split Right') {
@@ -421,39 +531,32 @@ export const Compositor: React.FC<CompositorProps> = ({
         const y = (height - h) / 2;
 
         drawFramedVideo(ctx, video, 'LOCAL CAM 1', padding, y, w, h, frameCount, '#FF4C4C');
-        drawFramedVideo(ctx, screenVideo, 'Screen Share', width / 2 + padding / 2, y, w, h, frameCount, '#00E5FF');
+        drawFramedVideo(ctx, screenVid, 'Screen Share', width / 2 + padding / 2, y, w, h, frameCount, '#00E5FF');
 
       } else if (layout === 'Freeform') {
-        const screenW = width * 0.8;
-        const screenH = screenW * (9/16);
-        const screenX = (width - screenW) / 2;
-        const screenY = (height - screenH) / 2;
-        
+        const sw = width * 0.8;
+        const sh = sw * (9/16);
+        const sx = (width - sw) / 2;
+        const sy = (height - sh) / 2;
         const camW = width * 0.2;
         const camH = camW * (9/16);
-        const camX = width - camW - 40;
-        const camY = height - camH - 40;
 
-        drawFramedVideo(ctx, screenVideo, 'Screen Share', screenX, screenY, screenW, screenH, frameCount, '#00E5FF');
-        drawFramedVideo(ctx, video, 'LOCAL CAM 1', camX, camY, camW, camH, frameCount, '#FF4C4C', camoSettings);
-      } else if (layout === 'PiP') {
-        if (screenVideo && screenVideo.readyState >= 2) {
-          ctx.drawImage(screenVideo, 0, 0, width, height);
+        drawFramedVideo(ctx, screenVid, 'Screen Share', sx, sy, sw, sh, frameCount, '#00E5FF');
+        drawFramedVideo(ctx, video, 'LOCAL CAM 1', width - camW - 40, height - camH - 40, camW, camH, frameCount, '#FF4C4C', camoSettings);
+      } else if (layout === 'PiP' || layout === 'Picture-in-Pic') {
+        if (screenVid && screenVid.readyState >= 1) {
+          ctx.drawImage(screenVid, 0, 0, width, height);
         } else {
           drawSimulatedFeed(ctx, 'Screen Share', 0, 0, width, height, frameCount, '#00E5FF');
         }
-
         const pipW = width / 4;
         const pipH = height / 4;
-        const pipX = width - pipW - 40;
-        const pipY = height - pipH - 40;
-
-        drawFramedVideo(ctx, video, 'LOCAL CAM 1', pipX, pipY, pipW, pipH, frameCount + 200, '#FF4C4C', camoSettings);
+        drawFramedVideo(ctx, video, 'LOCAL CAM 1', width - pipW - 40, height - pipH - 40, pipW, pipH, frameCount + 200, '#FF4C4C', camoSettings);
 
       } else {
-        // Default full screen
-        if (screenVideo && screenVideo.readyState >= 2) {
-          ctx.drawImage(screenVideo, 0, 0, width, height);
+        // Default: full screen share, any layout not explicitly handled
+        if (screenVid && screenVid.readyState >= 1) {
+          ctx.drawImage(screenVid, 0, 0, width, height);
         } else {
           drawSimulatedFeed(ctx, 'Screen Share', 0, 0, width, height, frameCount, '#00E5FF');
         }
@@ -484,7 +587,7 @@ export const Compositor: React.FC<CompositorProps> = ({
       const video = primaryVideo;
       const remoteVideo = secondaryVideo;
 
-      if (remoteVideo && remoteVideo.readyState >= 2) {
+      if (remoteVideo && remoteVideo.readyState >= 1) {
         ctx.drawImage(remoteVideo, 0, 0, width, height);
       } else {
         drawSimulatedFeed(ctx, 'GUEST (REMOTE)', 0, 0, width, height, frameCount);
@@ -507,6 +610,10 @@ export const Compositor: React.FC<CompositorProps> = ({
       img.src = backgroundImage;
       img.onload = () => {
         bgImageRef.current = img;
+      };
+      return () => {
+        img.onload = null;
+        bgImageRef.current = null;
       };
     } else {
       bgImageRef.current = null;
@@ -548,7 +655,7 @@ export const Compositor: React.FC<CompositorProps> = ({
       ctx.fillRect(0, 0, width, height);
     } else if (background === 'Blur Camera') {
       const video = videoRef.current;
-      if (video && video.readyState >= 2) {
+      if (video && video.readyState >= 1) {
         ctx.save();
         ctx.filter = 'blur(40px) brightness(0.5)';
         ctx.drawImage(video, 0, 0, width, height);
@@ -909,8 +1016,7 @@ export const Compositor: React.FC<CompositorProps> = ({
 
     let frameCount = 0;
     let lastTime = 0;
-    const fps = 30;
-    const interval = 1000 / fps;
+    const interval = 1000 / CANVAS.FPS;
 
     const render = (time: number) => {
       const deltaTime = time - lastTime;
@@ -932,8 +1038,8 @@ export const Compositor: React.FC<CompositorProps> = ({
   return (
     <canvas 
       ref={canvasRef} 
-      width={1920} 
-      height={1080} 
+      width={CANVAS.WIDTH}
+      height={CANVAS.HEIGHT} 
       className="w-full h-full object-contain bg-black"
     />
   );

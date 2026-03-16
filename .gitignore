@@ -6,3 +6,11 @@ coverage/
 *.log
 .env*
 !.env.example
+Thumbs.db
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/binaries/
+
+# Generated icon
+app-icon.png

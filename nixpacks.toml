@@ -1,0 +1,13 @@
+# Coolify/Nixpacks configuration
+# This tells Coolify to use Dockerfile instead of auto-detection
+[phases.setup]
+nixPkgs = ["nodejs_22", "ffmpeg"]
+
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "npx tsx server.ts"

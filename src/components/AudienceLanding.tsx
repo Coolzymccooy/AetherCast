@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { motion } from 'motion/react';
-import { io } from 'socket.io-client';
+import { io, Socket } from 'socket.io-client';
 import { MessageSquare, Heart, Send, Sparkles, User, CheckCircle2 } from 'lucide-react';
 import { AudienceMessage } from '../types';
 
@@ -10,7 +10,7 @@ export const AudienceLanding = () => {
   const [name, setName] = useState('');
   const [type, setType] = useState<'Q&A' | 'Prayer' | 'Testimony' | 'Welcome' | 'Poll'>('Q&A');
   const [status, setStatus] = useState<'idle' | 'sending' | 'success' | 'error'>('idle');
-  const [socket, setSocket] = useState<any>(null);
+  const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
     // Extract room ID from URL
@@ -21,7 +21,7 @@ export const AudienceLanding = () => {
     }
 
     const newSocket = io();
-    setSocket(newSocket);
+    socketRef.current = newSocket;
 
     if (room) {
       newSocket.emit('join-room', room);
@@ -34,7 +34,7 @@ export const AudienceLanding = () => {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!message.trim() || !socket || !roomId) return;
+    if (!message.trim() || !socketRef.current || !roomId) return;
 
     setStatus('sending');
 
@@ -47,13 +47,25 @@ export const AudienceLanding = () => {
       visible: false
     };
 
-    socket.emit('audience-message', { roomId, message: newMsg });
-    
+    socketRef.current.emit('audience-message', { roomId, message: newMsg }, (ack: { ok: boolean }) => {
+      if (ack?.ok) {
+        setStatus('success');
+        setMessage('');
+        setTimeout(() => setStatus('idle'), 3000);
+      } else {
+        setStatus('error');
+        setTimeout(() => setStatus('idle'), 3000);
+      }
+    });
+
+    // Fallback: if server doesn't support ack, resolve success after timeout
     setTimeout(() => {
-      setStatus('success');
-      setMessage('');
-      setTimeout(() => setStatus('idle'), 3000);
-    }, 500);
+      setStatus(prev => prev === 'sending' ? 'success' : prev);
+      if (status === 'sending') {
+        setMessage('');
+        setTimeout(() => setStatus('idle'), 3000);
+      }
+    }, 2000);
   };
 
   const typeOptions = [

@@ -1,0 +1,89 @@
+name: Release Desktop App
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-tauri:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+          - platform: macos-13
+            target: x86_64-apple-darwin
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      # Windows: install FFmpeg for bundling
+      - name: Install FFmpeg (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: choco install ffmpeg -y
+
+      # macOS: install FFmpeg
+      - name: Install FFmpeg (macOS)
+        if: contains(matrix.platform, 'macos')
+        run: brew install ffmpeg
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "AetherCast ${{ github.ref_name }}"
+          releaseBody: |
+            ## AetherCast ${{ github.ref_name }}
+
+            Professional broadcast studio for live streaming.
+
+            ### Downloads
+            - **Windows**: `.msi` or `-setup.exe` installer
+            - **macOS (Apple Silicon)**: `.dmg` disk image
+            - **macOS (Intel)**: `.dmg` disk image
+
+            ### What's included
+            - GPU-accelerated streaming (NVENC/QSV/AMF/VideoToolbox)
+            - Multi-destination output (RTMP/RTMPS/SRT/RIST)
+            - Real-time compositor with scene switching
+            - Pro audio processing (compressor, EQ, limiter, LUFS metering)
+            - AI-powered scene direction
+            - Instant replay buffer
+            - MIDI/Stream Deck support
+          releaseDraft: false
+          prerelease: false
+          args: --target ${{ matrix.target }}
