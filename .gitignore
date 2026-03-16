@@ -14,3 +14,6 @@ src-tauri/binaries/
 
 # Generated icon
 app-icon.png
+
+# Claude settings (may contain tokens)
+.claude/

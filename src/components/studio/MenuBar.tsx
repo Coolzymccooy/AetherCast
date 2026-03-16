@@ -22,10 +22,10 @@ const menuConfig: Record<string, string[]> = {
   'Stream': ['Start Streaming', 'Stop Streaming', 'Stream Settings', 'Output Quality'],
   'Tools': ['AI Director Settings', 'Script Editor', 'Recording Gallery', 'Diagnostics'],
   'Window': ['Audio Mixer', 'Source Rack', 'Director Rack', 'Reset Layout'],
-  'Help': ['Documentation', 'Keyboard Shortcuts', 'Check for Updates', 'About Aether Studio'],
+  'Help': ['Documentation', 'Keyboard Shortcuts', 'Download Desktop App', 'Check for Updates', 'About Aether Studio'],
 };
 
-const DIVIDER_ITEMS = new Set(['Exit', 'Preferences', 'Output Quality', 'Diagnostics', 'About Aether Studio', 'Actual Size', 'Toggle Source Rack', 'Fullscreen']);
+const DIVIDER_ITEMS = new Set(['Exit', 'Preferences', 'Output Quality', 'Diagnostics', 'About Aether Studio', 'Actual Size', 'Toggle Source Rack', 'Fullscreen', 'Download Desktop App']);
 
 const SHORTCUT_MAP: Record<string, string> = {
   'Zoom In': 'Ctrl+=',

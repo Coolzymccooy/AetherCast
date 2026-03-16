@@ -39,6 +39,7 @@ import { NotificationToast } from './components/studio/NotificationToast';
 import { ProjectDialog } from './components/studio/ProjectDialog';
 import { OutputQualityModal } from './components/studio/OutputQualityModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { DownloadModal } from './components/studio/DownloadModal';
 import { KeyboardShortcuts } from './components/studio/KeyboardShortcuts';
 
 // --- Other Views ---
@@ -93,6 +94,7 @@ function StudioView() {
   const [showProjectDialog, setShowProjectDialog] = React.useState(false);
   const [showOutputQuality, setShowOutputQuality] = React.useState(false);
   const [showShortcuts, setShowShortcuts] = React.useState(false);
+  const [showDownload, setShowDownload] = React.useState(false);
 
   // View / Zoom state
   const [zoomLevel, setZoomLevel] = React.useState(100);
@@ -177,6 +179,8 @@ function StudioView() {
       case 'Toggle Director Rack': setShowDirectorRack(prev => !prev); break;
       case 'Toggle Telemetry': setShowTelemetry(prev => !prev); break;
       case 'Keyboard Shortcuts': setShowShortcuts(true); break;
+      case 'Download Desktop App': setShowDownload(true); break;
+      case 'About Aether Studio': setShowDownload(true); break;
       default: break;
     }
   };
@@ -596,6 +600,9 @@ function StudioView() {
 
       {/* Keyboard Shortcuts Overlay */}
       {showShortcuts && <KeyboardShortcuts onClose={() => setShowShortcuts(false)} />}
+
+      {/* Download Desktop App Modal */}
+      {showDownload && <DownloadModal onClose={() => setShowDownload(false)} />}
     </div>
   );
 }
