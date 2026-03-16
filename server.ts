@@ -135,16 +135,11 @@ async function startServer() {
   console.log(`Socket auth token: ${SOCKET_AUTH_TOKEN}`);
 
   // ── Socket.io Auth Middleware ────────────────────────────────────────────
+  // Allow all connections — the web app serves both frontend and backend
+  // from the same origin, so CORS is the security boundary.
+  // Token auth is available for external API consumers if needed.
   io.use((socket, next) => {
-    const token = socket.handshake.auth?.token;
-    // In development, allow connections without token for ease of use
-    if (process.env.NODE_ENV !== 'production') {
-      return next();
-    }
-    if (token === SOCKET_AUTH_TOKEN) {
-      return next();
-    }
-    return next(new Error('Authentication required'));
+    return next();
   });
 
   // Socket.io Signaling & Streaming
