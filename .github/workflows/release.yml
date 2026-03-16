@@ -49,16 +49,6 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      # Windows: install FFmpeg for bundling
-      - name: Install FFmpeg (Windows)
-        if: matrix.platform == 'windows-latest'
-        run: choco install ffmpeg -y
-
-      # macOS: install FFmpeg
-      - name: Install FFmpeg (macOS)
-        if: contains(matrix.platform, 'macos')
-        run: brew install ffmpeg
-
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -76,7 +66,7 @@ jobs:
             - **macOS (Apple Silicon)**: `.dmg` disk image
             - **macOS (Intel)**: `.dmg` disk image
 
-            ### What's included
+            ### Features
             - GPU-accelerated streaming (NVENC/QSV/AMF/VideoToolbox)
             - Multi-destination output (RTMP/RTMPS/SRT/RIST)
             - Real-time compositor with scene switching
