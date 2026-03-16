@@ -321,7 +321,19 @@ export function useWebRTC({
 
     if (socketRef.current) socketRef.current.disconnect();
 
-    const socket = io();
+    // In Tauri desktop mode, connect to the production server for signaling
+    // In browser mode, connect to same origin (default)
+    // In Tauri desktop mode, connect to the production server for signaling
+    const serverUrl = window.__TAURI_INTERNALS__
+      ? 'https://aethercast.tiwaton.co.uk'
+      : undefined; // undefined = same origin in browser
+
+    const socket = io(serverUrl, {
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 2000,
+      timeout: 10000,
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => setIsSocketConnected(true));
