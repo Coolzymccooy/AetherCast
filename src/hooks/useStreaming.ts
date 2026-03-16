@@ -197,31 +197,19 @@ export function useStreaming({
           return;
         }
 
-        // Capture the canvas stream — video only first
+        // Capture video-only from canvas — DO NOT add audio tracks
+        // Adding audio tracks with vp8+opus codec causes MediaRecorder to stall
+        // when the audio track has no active data (common with MediaStreamDestination).
+        // FFmpeg on the server adds silent audio via anullsrc filter.
         const capturedStream = (canvas as HTMLCanvasElement).captureStream(30);
 
-        // Add audio tracks if available — but don't require them
-        const mixedAudio = audioEngine.getMixedStream();
-        const hasAudio = mixedAudio && mixedAudio.getAudioTracks().length > 0;
-        if (hasAudio) {
-          mixedAudio!.getAudioTracks().forEach(t => capturedStream.addTrack(t));
+        // Always use video-only codec — most reliable across all browsers
+        let mimeType = 'video/webm;codecs=vp8';
+        if (!MediaRecorder.isTypeSupported(mimeType)) {
+          mimeType = 'video/webm';
         }
 
-        // Pick a VIDEO-ONLY codec if no audio, or video+audio if audio is present
-        let mimeType = 'video/webm';
-        if (hasAudio) {
-          // Try codecs with audio
-          for (const codec of ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp8', 'video/webm']) {
-            if (MediaRecorder.isTypeSupported(codec)) { mimeType = codec; break; }
-          }
-        } else {
-          // Video-only codecs — NO audio codec specified (prevents MediaRecorder stall)
-          for (const codec of ['video/webm;codecs=vp8', 'video/webm;codecs=h264', 'video/webm']) {
-            if (MediaRecorder.isTypeSupported(codec)) { mimeType = codec; break; }
-          }
-        }
-
-        console.log(`Stream: ${capturedStream.getTracks().length} tracks (audio: ${hasAudio}), mimeType: ${mimeType}`);
+        console.log(`Stream: video-only, mimeType: ${mimeType}`);
 
         const recorder = new MediaRecorder(capturedStream, { mimeType, videoBitsPerSecond: 6_000_000 });
 
