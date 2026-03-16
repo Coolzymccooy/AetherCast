@@ -6,7 +6,9 @@ interface DownloadModalProps {
   onClose: () => void;
 }
 
-const GITHUB_RELEASE_URL = 'https://github.com/Coolzymccooy/AetherCast/releases';
+const GITHUB_REPO = 'https://github.com/Coolzymccooy/AetherCast';
+const LATEST_TAG = 'v1.0.5';
+const DL = `${GITHUB_REPO}/releases/download/${LATEST_TAG}`;
 
 const downloads = [
   {
@@ -14,30 +16,18 @@ const downloads = [
     icon: <Monitor size={24} />,
     description: 'Windows 10/11 (64-bit)',
     files: [
-      { label: 'Installer (.exe)', url: `${GITHUB_RELEASE_URL}/download/Selton.Studio_1.0.0_x64-setup.exe`, size: '~80 MB' },
-      { label: 'MSI Package', url: `${GITHUB_RELEASE_URL}/download/Selton.Studio_1.0.0_x64_en-US.msi`, size: '~80 MB' },
+      { label: 'Installer (.exe)', url: `${DL}/Selton.Studio_1.0.0_x64-setup.exe`, size: '~2 MB' },
+      { label: 'MSI Package', url: `${DL}/Selton.Studio_1.0.0_x64_en-US.msi`, size: '~3 MB' },
     ],
     features: ['GPU encoding (NVIDIA NVENC, Intel QSV, AMD AMF)', 'Direct RTMP output — no server needed', 'Lower CPU usage than browser mode'],
     color: 'accent-cyan',
   },
   {
-    platform: 'macOS (Apple Silicon)',
+    platform: 'macOS',
     icon: <Apple size={24} />,
-    description: 'M1/M2/M3/M4 Mac',
-    files: [
-      { label: 'Disk Image (.dmg)', url: `${GITHUB_RELEASE_URL}/download/Selton.Studio_1.0.0_aarch64.dmg`, size: '~70 MB' },
-    ],
-    features: ['GPU encoding (VideoToolbox)', 'Native Apple Silicon performance', 'No Rosetta needed'],
-    color: 'gray-300',
-  },
-  {
-    platform: 'macOS (Intel)',
-    icon: <Apple size={24} />,
-    description: 'Intel-based Mac',
-    files: [
-      { label: 'Disk Image (.dmg)', url: `${GITHUB_RELEASE_URL}/download/Selton.Studio_1.0.0_x64.dmg`, size: '~75 MB' },
-    ],
-    features: ['GPU encoding (VideoToolbox)', 'Compatible with macOS 10.15+'],
+    description: 'Coming soon',
+    files: [],
+    features: ['macOS build is in progress — check back soon'],
     color: 'gray-300',
   },
 ];
@@ -124,7 +114,7 @@ export const DownloadModal: React.FC<DownloadModalProps> = ({ onClose }) => {
 
         <div className="p-5 border-t border-border bg-black/20 flex items-center justify-between">
           <a
-            href={GITHUB_RELEASE_URL}
+            href={`${GITHUB_REPO}/releases`}
             target="_blank"
             rel="noopener noreferrer"
             className="text-[10px] text-gray-500 hover:text-accent-cyan flex items-center gap-1 transition-colors"
