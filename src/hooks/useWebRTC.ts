@@ -323,10 +323,17 @@ export function useWebRTC({
 
     // In Tauri desktop mode, connect to the production server for signaling
     // In browser mode, connect to same origin (default)
-    // In Tauri desktop mode, connect to the production server for signaling
-    const serverUrl = window.__TAURI_INTERNALS__
-      ? 'https://aethercast.tiwaton.co.uk'
-      : undefined; // undefined = same origin in browser
+    // Connect to the server:
+    // - In browser: same origin (default)
+    // - In Tauri dev: localhost:3001 (the local dev server)
+    // - In Tauri production: the production URL
+    let serverUrl: string | undefined = undefined;
+
+    if (window.__TAURI_INTERNALS__) {
+      // Check if we're in dev mode (page loaded from localhost) or production (tauri:// protocol)
+      const isLocalDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      serverUrl = isLocalDev ? undefined : 'https://aethercast.tiwaton.co.uk';
+    }
 
     const socket = io(serverUrl, {
       reconnection: true,
