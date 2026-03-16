@@ -329,15 +329,13 @@ async function startServer() {
       };
       const encOpts = profiles[profile] || profiles['1080p60'];
 
-      // Input 1: video from browser (WebM via Socket.io chunks)
-      // Input 2: silent audio (browser sends video-only to avoid MediaRecorder stalls)
+      // Video from browser (WebM chunks). No audio from browser —
+      // the stream is video-only. Twitch/YouTube accept this.
       let command = ffmpeg(inputStream)
         .inputFormat('webm')
-        .input('anullsrc=r=44100:cl=stereo')
-        .inputFormat('lavfi')
         .videoCodec('libx264')
-        .audioCodec('aac')
-        .outputOptions([...encOpts, '-map 0:v', '-map 1:a', '-shortest']);
+        .noAudio()
+        .outputOptions(encOpts);
 
       // Build tee output string for multi-destination
       const teeSegments: string[] = [];
