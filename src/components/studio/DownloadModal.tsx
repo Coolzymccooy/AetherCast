@@ -6,7 +6,7 @@ interface DownloadModalProps {
   onClose: () => void;
 }
 
-const GITHUB_RELEASE_URL = 'https://github.com/Coolzymccooy/AetherCast/releases/latest';
+const GITHUB_RELEASE_URL = 'https://github.com/Coolzymccooy/AetherCast/releases';
 
 const downloads = [
   {
