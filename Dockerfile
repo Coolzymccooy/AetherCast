@@ -35,10 +35,6 @@ COPY src/ ./src/
 # Expose port
 EXPOSE 3001
 
-# Health check — increased start period for cold start
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:3001/ || exit 1
-
 # Environment
 ENV NODE_ENV=production
 ENV PORT=3001
