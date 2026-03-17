@@ -327,30 +327,47 @@ async function startServer() {
       };
       const encOpts = profiles[profile] || profiles['1080p60'];
 
-      // Video from browser (WebM VP8 chunks) → re-encode to H.264 for RTMP
-      // Server was encoding at 0.6x speed and crashing. Fix:
-      // - Scale down to 720p (vs 1080p input) — 56% fewer pixels to encode
-      // - 15fps output (vs 30fps input) — half the frames to encode
-      // - ultrafast + baseline — minimum CPU per frame
-      // This gives FFmpeg ~4x more time per frame
-      let command = ffmpeg(inputStream)
-        .inputFormat('webm')
-        .videoCodec('libx264')
-        .noAudio()
-        .outputOptions([
-          '-preset ultrafast',
-          '-tune zerolatency',
-          '-pix_fmt yuv420p',
-          '-vf scale=1280:720',   // Downscale to 720p — much faster to encode
-          '-r 24',                // Output 24fps — reduces encoding load by 20%
-          '-g 48',                // Keyframe every 2s at 24fps
-          '-b:v 2000k',           // 2 Mbps at 720p is good quality
-          '-maxrate 2500k',
-          '-bufsize 4000k',
-          '-threads 2',
-          '-profile:v baseline',
-          '-level 3.1',
-        ]);
+      // Check if browser is sending H.264 (can be copied without re-encoding)
+      const browserH264 = (data as any).browserH264 === true;
+      const inputMime = (data as any).mimeType || 'video/webm';
+      const inputFormat = inputMime.startsWith('video/mp4') ? 'mp4' : 'webm';
+
+      let command;
+
+      if (browserH264) {
+        // H.264 from browser — COPY the video codec (zero CPU cost!)
+        console.log('[stream] Browser sent H.264 — using codec copy (zero CPU)');
+        socket.emit('server-log', { message: 'Using codec copy — zero CPU encoding', type: 'success' });
+
+        command = ffmpeg(inputStream)
+          .inputFormat(inputFormat)
+          .videoCodec('copy')  // No re-encoding! Just remux to FLV
+          .noAudio()
+          .outputOptions(['-flvflags no_duration_filesize']);
+      } else {
+        // VP8 from browser — must re-encode to H.264 for RTMP
+        // Use absolute minimum settings to prevent server CPU overload
+        console.log('[stream] Browser sent VP8 — re-encoding to H.264 (CPU intensive)');
+        socket.emit('server-log', { message: 'Re-encoding VP8→H.264 (CPU intensive)', type: 'warning' });
+
+        command = ffmpeg(inputStream)
+          .inputFormat('webm')
+          .videoCodec('libx264')
+          .noAudio()
+          .outputOptions([
+            '-preset ultrafast',
+            '-tune zerolatency',
+            '-pix_fmt yuv420p',
+            '-vf scale=854:480',    // 480p — the only resolution this server can encode in realtime
+            '-r 15',                // 15fps — half the frames
+            '-g 30',                // Keyframe every 2s at 15fps
+            '-b:v 1000k',           // 1 Mbps at 480p
+            '-maxrate 1200k',
+            '-bufsize 2000k',
+            '-threads 1',
+            '-profile:v baseline',
+          ]);
+      }
 
       // Build tee output string for multi-destination
       const teeSegments: string[] = [];
@@ -538,7 +555,7 @@ async function startServer() {
     });
 
     // ── Multi-Protocol Streaming (RTMP + SRT + RIST) ─────────────────────────
-    socket.on("start-stream", (data) => {
+    socket.on("start-stream", (data: any) => {
       const { destinations, encodingProfile } = data;
       if (!destinations || !Array.isArray(destinations) || destinations.length === 0) {
         socket.emit('server-log', { message: 'No destinations provided', type: 'error' });

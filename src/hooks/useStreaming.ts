@@ -212,19 +212,27 @@ export function useStreaming({
           return;
         }
 
-        // Capture video-only from canvas — DO NOT add audio tracks
-        // Adding audio tracks with vp8+opus codec causes MediaRecorder to stall
-        // when the audio track has no active data (common with MediaStreamDestination).
-        // FFmpeg on the server adds silent audio via anullsrc filter.
+        // Capture video-only from canvas
         const capturedStream = (canvas as HTMLCanvasElement).captureStream(30);
 
-        // Always use video-only codec — most reliable across all browsers
-        let mimeType = 'video/webm;codecs=vp8';
-        if (!MediaRecorder.isTypeSupported(mimeType)) {
+        // Try H.264 first — if the browser supports it, the server can use
+        // codec copy (-c:v copy) with ZERO CPU cost instead of re-encoding
+        let mimeType = 'video/mp4;codecs=avc1';
+        let browserH264 = false;
+
+        if (MediaRecorder.isTypeSupported('video/mp4;codecs=avc1')) {
+          mimeType = 'video/mp4;codecs=avc1';
+          browserH264 = true;
+        } else if (MediaRecorder.isTypeSupported('video/webm;codecs=h264')) {
+          mimeType = 'video/webm;codecs=h264';
+          browserH264 = true;
+        } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+          mimeType = 'video/webm;codecs=vp8';
+        } else {
           mimeType = 'video/webm';
         }
 
-        console.log(`Stream: video-only, mimeType: ${mimeType}`);
+        console.log(`Stream: mimeType=${mimeType}, browserH264=${browserH264}`);
 
         const recorder = new MediaRecorder(capturedStream, { mimeType, videoBitsPerSecond: 6_000_000 });
 
@@ -246,10 +254,12 @@ export function useStreaming({
           setServerLogs(prev => [{ message: `Recorder Error: ${event}`, type: 'error', id: Date.now() } as ServerLog, ...prev]);
         };
 
-        // Start FFmpeg on server first
+        // Start FFmpeg on server first — tell it whether we're sending H.264
         socketRef.current.emit('start-stream', {
           destinations: activeDestinations,
           encodingProfile,
+          browserH264,
+          mimeType,
         });
 
         // Wait for FFmpeg to initialize, then start recording
