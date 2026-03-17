@@ -38,10 +38,8 @@ const __dirname = path.dirname(__filename);
 /** Simple token for Socket.io auth — set SOCKET_AUTH_TOKEN in .env or auto-generate */
 const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || crypto.randomUUID();
 
-/** Allowed origins for CORS — set ALLOWED_ORIGINS as comma-separated in .env */
-const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
-  : [`http://localhost:${process.env.PORT || 3001}`, 'http://localhost:5173', 'tauri://localhost'];
+/** Allowed origins for CORS — allow all origins to support Tauri desktop + web */
+const ALLOWED_ORIGINS = "*";
 
 /** Sanitize user-supplied strings to prevent injection */
 function sanitizeText(input: string, maxLength = 500): string {
