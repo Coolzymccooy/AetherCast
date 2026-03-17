@@ -328,22 +328,28 @@ async function startServer() {
       const encOpts = profiles[profile] || profiles['1080p60'];
 
       // Video from browser (WebM VP8 chunks) → re-encode to H.264 for RTMP
-      // CRITICAL: use ultrafast preset — Docker containers have limited CPU
-      // The -re flag reads at native framerate, preventing buffer overrun crashes
+      // Server was encoding at 0.6x speed and crashing. Fix:
+      // - Scale down to 720p (vs 1080p input) — 56% fewer pixels to encode
+      // - 15fps output (vs 30fps input) — half the frames to encode
+      // - ultrafast + baseline — minimum CPU per frame
+      // This gives FFmpeg ~4x more time per frame
       let command = ffmpeg(inputStream)
         .inputFormat('webm')
         .videoCodec('libx264')
         .noAudio()
         .outputOptions([
-          '-preset ultrafast',    // Fastest encoding — less CPU, slightly larger output
-          '-tune zerolatency',    // No lookahead — reduces latency and memory
+          '-preset ultrafast',
+          '-tune zerolatency',
           '-pix_fmt yuv420p',
-          '-g 60',                // Keyframe every 2s at 30fps
-          '-b:v 2500k',           // 2.5 Mbps — reliable for Docker containers
-          '-maxrate 3000k',
+          '-vf scale=1280:720',   // Downscale to 720p — much faster to encode
+          '-r 24',                // Output 24fps — reduces encoding load by 20%
+          '-g 48',                // Keyframe every 2s at 24fps
+          '-b:v 2000k',           // 2 Mbps at 720p is good quality
+          '-maxrate 2500k',
           '-bufsize 4000k',
-          '-threads 1',           // Single thread — prevents CPU contention in containers
-          '-profile:v baseline',  // Simplest H.264 profile — fastest encoding
+          '-threads 2',
+          '-profile:v baseline',
+          '-level 3.1',
         ]);
 
       // Build tee output string for multi-destination
