@@ -173,7 +173,22 @@ export function useStreaming({
       if (window.__TAURI_INTERNALS__) {
         try {
           const { invoke } = await import('@tauri-apps/api/core');
-          const res = await invoke('start_stream', { destinations });
+          const res = await invoke('start_stream', {
+            config: {
+              destinations: activeDestinations.map(d => ({
+                url: d.rtmpUrl || '',
+                stream_key: d.streamKey || '',
+                protocol: d.protocol || 'rtmp',
+                name: d.name || '',
+                enabled: d.enabled,
+              })),
+              width: 1920,
+              height: 1080,
+              fps: 30,
+              bitrate: 4500,
+              encoder: 'auto',
+            }
+          });
           setServerLogs(prev => [{ message: `Tauri: ${res}`, type: 'success', id: Date.now() } as ServerLog, ...prev]);
           setIsStreaming(true);
           onSuccess?.('Streaming started via Tauri.');

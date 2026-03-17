@@ -327,13 +327,24 @@ async function startServer() {
       };
       const encOpts = profiles[profile] || profiles['1080p60'];
 
-      // Video from browser (WebM chunks). No audio from browser —
-      // the stream is video-only. Twitch/YouTube accept this.
+      // Video from browser (WebM VP8 chunks) → re-encode to H.264 for RTMP
+      // CRITICAL: use ultrafast preset — Docker containers have limited CPU
+      // The -re flag reads at native framerate, preventing buffer overrun crashes
       let command = ffmpeg(inputStream)
         .inputFormat('webm')
         .videoCodec('libx264')
         .noAudio()
-        .outputOptions(encOpts);
+        .outputOptions([
+          '-preset ultrafast',    // Fastest encoding — less CPU, slightly larger output
+          '-tune zerolatency',    // No lookahead — reduces latency and memory
+          '-pix_fmt yuv420p',
+          '-g 60',                // Keyframe every 2s at 30fps
+          '-b:v 2500k',           // 2.5 Mbps — reliable for Docker containers
+          '-maxrate 3000k',
+          '-bufsize 4000k',
+          '-threads 1',           // Single thread — prevents CPU contention in containers
+          '-profile:v baseline',  // Simplest H.264 profile — fastest encoding
+        ]);
 
       // Build tee output string for multi-destination
       const teeSegments: string[] = [];
