@@ -60,7 +60,7 @@ export function useGPUStreaming() {
     const { invoke } = await import('@tauri-apps/api/core');
     const width = options?.width || canvas.width;
     const height = options?.height || canvas.height;
-    const fps = options?.fps || 30;
+    const fps = options?.fps || 15; // 15fps for Tauri IPC — JSON serialization can't handle 30fps at full res
     const bitrate = options?.bitrate || 6000;
     const encoder = options?.encoder || 'auto';
 
@@ -123,17 +123,31 @@ export function useGPUStreaming() {
     try {
       sendingRef.current = true;
 
-      // Get raw RGBA pixels from canvas
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      if (!ctx) return;
+      // Scale canvas down to 640x360 before reading pixels
+      // Full 1920x1080 = 8MB per frame — too large for Tauri IPC (JSON serialized)
+      // 640x360 = 921KB per frame — manageable at 15fps = ~14MB/s
+      const scaledW = 640;
+      const scaledH = 360;
 
-      const imageData = ctx.getImageData(0, 0, width, height);
-      const pixels = Array.from(imageData.data); // Convert to regular array for Tauri serialization
+      // Use a shared offscreen canvas for scaling
+      if (!(window as any).__aether_scale_canvas) {
+        const sc = document.createElement('canvas');
+        sc.width = scaledW;
+        sc.height = scaledH;
+        (window as any).__aether_scale_canvas = sc;
+      }
+      const scaleCanvas = (window as any).__aether_scale_canvas as HTMLCanvasElement;
+      const scaleCtx = scaleCanvas.getContext('2d', { willReadFrequently: true });
+      if (!scaleCtx) return;
+
+      // Draw scaled-down frame
+      scaleCtx.drawImage(canvas, 0, 0, scaledW, scaledH);
+      const imageData = scaleCtx.getImageData(0, 0, scaledW, scaledH);
 
       await invoke('encode_frame', {
-        frameData: pixels,
-        width,
-        height,
+        frameData: Array.from(imageData.data),
+        width: scaledW,
+        height: scaledH,
       });
 
       frameCountRef.current++;
