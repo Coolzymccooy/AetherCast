@@ -265,9 +265,10 @@ function StudioView() {
                     }).then((msg) => {
                       studio.setIsStreaming(true);
                       notify(`GPU Stream: ${msg}`, 'success');
-                    }).catch(() => {
+                    }).catch((err) => {
+                      console.error('[GPU] start_stream failed:', err);
                       // GPU failed — fallback to browser streaming
-                      notify('GPU streaming unavailable, using browser path', 'info');
+                      notify('GPU unavailable, using browser path', 'info');
                       streaming.startStreaming(() => studio.setShowStreamSettings(true));
                     });
                   }
