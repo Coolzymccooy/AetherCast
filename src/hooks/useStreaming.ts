@@ -170,36 +170,7 @@ export function useStreaming({
     }
 
     try {
-      if (window.__TAURI_INTERNALS__) {
-        try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          const res = await invoke('start_stream', {
-            config: {
-              destinations: activeDestinations.map(d => ({
-                url: d.rtmpUrl || '',
-                stream_key: d.streamKey || '',
-                protocol: d.protocol || 'rtmp',
-                name: d.name || '',
-                enabled: d.enabled,
-              })),
-              width: 1920,
-              height: 1080,
-              fps: 30,
-              bitrate: 4500,
-              encoder: 'auto',
-            }
-          });
-          setServerLogs(prev => [{ message: `Tauri: ${res}`, type: 'success', id: Date.now() } as ServerLog, ...prev]);
-          setIsStreaming(true);
-          onSuccess?.('Streaming started via Tauri.');
-        } catch (tauriErr: any) {
-          console.error('Tauri start_stream failed, falling back to browser:', tauriErr);
-          // Tauri native streaming not yet connected — this is expected, not an error
-          console.log('Tauri invoke not available, using browser streaming path');
-          // Fall through to browser-based streaming below
-        }
-        if (isStreaming) return; // Tauri succeeded, no need for browser fallback
-      }
+      // Browser streaming path only — GPU streaming is handled by useGPUStreaming in App.tsx
       {
         const canvas = document.querySelector('canvas');
         if (!canvas) {
@@ -287,19 +258,7 @@ export function useStreaming({
 
   const stopStreaming = async () => {
     try {
-      if (window.__TAURI_INTERNALS__) {
-        try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          const res = await invoke('stop_stream');
-          setServerLogs(prev => [{ message: `Tauri: ${res}`, type: 'info', id: Date.now() } as ServerLog, ...prev]);
-          setIsStreaming(false);
-          lastDestinationsRef.current = [];
-          return;
-        } catch (tauriErr) {
-          console.error('Tauri stop_stream failed:', tauriErr);
-          // Fall through to browser stop
-        }
-      }
+      // Browser streaming stop only — GPU stop is handled by useGPUStreaming
       if (mediaRecorderRef.current && isStreaming) {
         mediaRecorderRef.current.stop();
         setIsStreaming(false);
