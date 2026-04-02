@@ -147,6 +147,10 @@ function StudioView() {
     audioChannels: studio.audioChannels, setAudioChannels: studio.setAudioChannels,
     setSources: studio.setSources,
     onError: (msg) => notify(msg, 'error'),
+    onPhoneConnected: (role) => {
+      const label = role === 'screen' ? 'Screen Share' : 'Camera';
+      notify(`Phone ${label} connected`, 'success');
+    },
   });
 
   const streaming = useStreaming({

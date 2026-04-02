@@ -19,6 +19,7 @@ interface UseWebRTCOptions {
   setAudioChannels: React.Dispatch<React.SetStateAction<AudioChannel[]>>;
   setSources: React.Dispatch<React.SetStateAction<Source[]>>;
   onError?: (message: string) => void;
+  onPhoneConnected?: (role: string) => void;
 }
 
 export function useWebRTC({
@@ -30,6 +31,7 @@ export function useWebRTC({
   setAudioChannels,
   setSources,
   onError,
+  onPhoneConnected,
 }: UseWebRTCOptions) {
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
@@ -55,6 +57,8 @@ export function useWebRTC({
   // without adding them as dependencies (which would cause reconnect loops)
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
+  const onPhoneConnectedRef = useRef(onPhoneConnected);
+  onPhoneConnectedRef.current = onPhoneConnected;
   const setServerLogsRef = useRef(setServerLogs);
   setServerLogsRef.current = setServerLogs;
   const setAudienceMessagesRef = useRef(setAudienceMessages);
@@ -364,10 +368,12 @@ export function useWebRTC({
           return next;
         });
         setIsRemoteConnected(true);
+        const role = call.metadata?.role ?? 'camera';
         setServerLogsRef.current(prev => [
-          { message: `Phone connected: ${call.metadata?.role ?? 'camera'} (${peerId.slice(-8)})`, type: 'info', id: Date.now() } as ServerLog,
+          { message: `Phone connected: ${role} (${peerId.slice(-8)})`, type: 'info', id: Date.now() } as ServerLog,
           ...prev,
         ]);
+        onPhoneConnectedRef.current?.(role);
       });
 
       call.on('close', () => {

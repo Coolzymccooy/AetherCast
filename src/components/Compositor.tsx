@@ -372,8 +372,14 @@ export const Compositor: React.FC<CompositorProps> = ({
     const localCam2 = remoteVideoRefs.current.get('local-cam-2');
     const screenVideo = screenVideoRef.current;
 
-    let primaryVideo = videoRef.current;
-    let secondaryVideo = screenVideo || remoteVideos[0] || localCam2;
+    // If no local webcam, promote the first phone/remote stream to primary so it
+    // appears in Cam 1 (and all single-cam scenes) instead of a black placeholder.
+    let primaryVideo: HTMLVideoElement | null = videoRef.current ?? remoteVideos[0] ?? null;
+    let secondaryVideo: HTMLVideoElement | null = screenVideo ?? remoteVideos[0] ?? localCam2 ?? null;
+    // If primary was promoted from remote, shift secondary to next remote or screen
+    if (!videoRef.current && remoteVideos.length > 0) {
+      secondaryVideo = screenVideo ?? remoteVideos[1] ?? localCam2 ?? null;
+    }
 
     if (sourceSwap) {
       const temp = primaryVideo;

@@ -1,9 +1,15 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import Peer, { MediaConnection } from 'peerjs';
-import { Camera, Wifi, WifiOff, Mic, MicOff, Sun, Moon, RefreshCcw } from 'lucide-react';
+import { Wifi, WifiOff, Mic, MicOff, Sun, Moon, RefreshCcw, ZoomIn, ZoomOut } from 'lucide-react';
 import { motion } from 'motion/react';
 import { hostPeerId, clientPeerId } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
+
+type Resolution = '720p' | '1080p';
+const RESOLUTIONS: Record<Resolution, { width: number; height: number }> = {
+  '720p': { width: 1280, height: 720 },
+  '1080p': { width: 1920, height: 1080 },
+};
 
 /**
  * RemoteCameraView — renders when `?mode=remote` is in the URL.
@@ -24,6 +30,9 @@ export default function RemoteCameraView() {
   const [errorMsg, setErrorMsg] = useState('');
   const [isMuted, setIsMuted] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
+  const [resolution, setResolution] = useState<Resolution>('720p');
+  const [zoom, setZoom] = useState(1);
+  const [maxZoom, setMaxZoom] = useState(1);
   const [logs, setLogs] = useState<string[]>([]);
 
   const peerRef = useRef<Peer | null>(null);
@@ -108,13 +117,17 @@ export default function RemoteCameraView() {
     attempt();
   }, [roomId, addLog]);
 
-  const start = useCallback(async (facing: 'user' | 'environment' = facingMode) => {
+  const start = useCallback(async (facing: 'user' | 'environment' = facingMode, res: Resolution = resolution) => {
     cleanup();
     setStatus('camera');
     setErrorMsg('');
+    setZoom(1);
+    setMaxZoom(1);
 
+    const { width, height } = RESOLUTIONS[res];
     let stream: MediaStream | null = null;
     const attempts: MediaStreamConstraints[] = [
+      { video: { facingMode: facing, width: { ideal: width }, height: { ideal: height } }, audio: true },
       { video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true },
       { video: { facingMode: facing }, audio: true },
       { video: { facingMode: facing }, audio: false },
@@ -135,6 +148,15 @@ export default function RemoteCameraView() {
 
     streamRef.current = stream;
     stream.getAudioTracks().forEach(t => (t.enabled = !isMuted));
+
+    // Detect zoom capability
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) {
+      const caps = videoTrack.getCapabilities?.() as any;
+      if (caps?.zoom) {
+        setMaxZoom(caps.zoom.max ?? 1);
+      }
+    }
 
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
@@ -178,7 +200,7 @@ export default function RemoteCameraView() {
         setErrorMsg(`PeerJS error: ${err.type || err.message}`);
       }
     });
-  }, [facingMode, isMuted, cleanup, addLog, startHostChecker, roomId]);
+  }, [facingMode, resolution, isMuted, cleanup, addLog, startHostChecker, roomId]);
 
   useEffect(() => { start(); }, []);
 
@@ -192,7 +214,23 @@ export default function RemoteCameraView() {
   const flipCamera = async () => {
     const next = facingMode === 'user' ? 'environment' : 'user';
     setFacingMode(next);
-    await start(next);
+    await start(next, resolution);
+  };
+
+  const toggleResolution = async () => {
+    const next: Resolution = resolution === '720p' ? '1080p' : '720p';
+    setResolution(next);
+    await start(facingMode, next);
+  };
+
+  const applyZoom = async (value: number) => {
+    setZoom(value);
+    const videoTrack = streamRef.current?.getVideoTracks()[0];
+    if (videoTrack && typeof videoTrack.applyConstraints === 'function') {
+      try {
+        await videoTrack.applyConstraints({ advanced: [{ zoom: value } as any] });
+      } catch { /* zoom not supported on this device */ }
+    }
   };
 
   const statusLabel = {
@@ -244,25 +282,51 @@ export default function RemoteCameraView() {
           </div>
         )}
 
+        {/* Zoom slider — only visible when zoom is supported */}
+        {maxZoom > 1 && (
+          <div className="absolute left-3 top-1/2 -translate-y-1/2 flex flex-col items-center gap-1">
+            <button onClick={() => applyZoom(Math.min(zoom + 0.5, maxZoom))} className="w-8 h-8 rounded-full bg-black/60 flex items-center justify-center border border-white/20">
+              <ZoomIn size={14} />
+            </button>
+            <input
+              type="range" min={1} max={maxZoom} step={0.1} value={zoom}
+              onChange={e => applyZoom(Number(e.target.value))}
+              className="h-24 appearance-none cursor-pointer"
+              style={{ writingMode: 'vertical-lr', direction: 'rtl' } as React.CSSProperties}
+            />
+            <button onClick={() => applyZoom(Math.max(zoom - 0.5, 1))} className="w-8 h-8 rounded-full bg-black/60 flex items-center justify-center border border-white/20">
+              <ZoomOut size={14} />
+            </button>
+            <span className="text-[9px] text-white/50 font-mono">{zoom.toFixed(1)}x</span>
+          </div>
+        )}
+
         <div className="absolute bottom-20 left-0 right-0 text-center">
           <p className="text-[10px] text-white/40 font-mono uppercase tracking-widest">Room: {roomId}</p>
         </div>
 
         {/* Controls */}
-        <div className="absolute bottom-6 left-0 right-0 flex justify-center gap-6">
+        <div className="absolute bottom-6 left-0 right-0 flex justify-center gap-4">
           <button
             onClick={toggleMute}
-            className={`w-14 h-14 rounded-full flex items-center justify-center border-2 backdrop-blur-md transition-colors ${
+            className={`w-12 h-12 rounded-full flex items-center justify-center border-2 backdrop-blur-md transition-colors ${
               isMuted ? 'bg-red-600/80 border-red-500' : 'bg-black/60 border-white/30 hover:bg-white/20'
             }`}
           >
-            {isMuted ? <MicOff size={22} /> : <Mic size={22} />}
+            {isMuted ? <MicOff size={20} /> : <Mic size={20} />}
           </button>
           <button
             onClick={flipCamera}
-            className="w-14 h-14 rounded-full bg-black/60 border-2 border-white/30 flex items-center justify-center backdrop-blur-md hover:bg-white/20 transition-colors"
+            className="w-12 h-12 rounded-full bg-black/60 border-2 border-white/30 flex items-center justify-center backdrop-blur-md hover:bg-white/20 transition-colors"
+            title={facingMode === 'user' ? 'Switch to rear camera' : 'Switch to front camera'}
           >
-            {facingMode === 'user' ? <Moon size={22} /> : <Sun size={22} />}
+            {facingMode === 'user' ? <Moon size={20} /> : <Sun size={20} />}
+          </button>
+          <button
+            onClick={toggleResolution}
+            className="h-12 px-3 rounded-full bg-black/60 border-2 border-white/30 flex items-center justify-center backdrop-blur-md hover:bg-white/20 transition-colors text-[11px] font-bold"
+          >
+            {resolution}
           </button>
         </div>
       </div>
