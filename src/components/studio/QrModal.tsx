@@ -42,31 +42,34 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   const [activeMode, setActiveMode] = useState<PhoneMode>(
     qrMode === 'camera' ? 'camera' : 'audience'
   );
+  const [lanUrl, setLanUrl] = useState<string>('');
   const [publicUrl, setPublicUrl] = useState<string>('');
   const [copied, setCopied] = useState(false);
 
-  // Fetch LAN IP and optional public URL from server.
-  // Camera/screen modes MUST use LAN IP — WebRTC signalling requires phone and
-  // Studio to reach the same Socket.io server (always localhost:3001).
-  // Only the Audience Portal (pure HTTP) can use the cloud public URL.
   useEffect(() => {
     fetch('/api/local-ip')
       .then(r => r.json())
-      .then(({ publicUrl: pub }: { ip: string; port: number; lanUrl?: string; publicUrl?: string | null }) => {
+      .then(({ ip, port, lanUrl: lan, publicUrl: pub }: { ip: string; port: number; lanUrl?: string; publicUrl?: string | null }) => {
+        setLanUrl(lan ?? `http://${ip}:${port}`);
         setPublicUrl(pub ?? '');
       })
-      .catch(() => { /* ok — publicUrl stays empty */ });
+      .catch(() => {
+        // If server unreachable (e.g. Tauri production), fall back to origin
+        setLanUrl(window.location.origin);
+      });
   }, []);
 
   const isTauri = !!(window as any).__TAURI_INTERNALS__;
   const cfg = MODE_CONFIG[activeMode];
 
-  // Camera/screen use PeerJS cloud signaling — no LAN IP needed, any URL works.
-  // Audience uses Socket.io — must reach the cloud server.
-  //   Tauri desktop → CLOUD_URL (localhost:3001 is not reachable from phones)
-  //   browser → same origin
+  // Camera/screen: phone must load the React app from a reachable URL.
+  //   - publicUrl set (cloud deploy) → use it (phones anywhere can connect)
+  //   - Tauri desktop → publicUrl or CLOUD_URL (tauri.localhost unreachable)
+  //   - Local browser → LAN IP (http://10.x.x.x:3001, reachable on same WiFi)
+  // Audience Portal uses Socket.io → needs cloud server URL.
+  const cameraScreenBase = publicUrl || (isTauri ? CLOUD_URL : (lanUrl || window.location.origin));
   const audienceBase = isTauri ? (publicUrl || CLOUD_URL) : window.location.origin;
-  const baseUrl = activeMode === 'audience' ? audienceBase : window.location.origin;
+  const baseUrl = activeMode === 'audience' ? audienceBase : cameraScreenBase;
   const peerParams = activeMode !== 'audience' ? buildPeerQueryParams() : '';
   const appUrl = `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234${peerParams ? `&${peerParams}` : ''}`;
 
