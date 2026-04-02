@@ -165,7 +165,7 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
   useEffect(() => {
     fetch('/api/local-ip')
       .then(r => r.json())
-      .then(({ ip, port, publicUrl }: { ip: string; port: number; publicUrl?: string }) => setRemoteUrl(`${publicUrl ?? `http://${ip}:${port}`}?mode=remote`))
+      .then(({ ip, port, lanUrl }: { ip: string; port: number; lanUrl?: string }) => setRemoteUrl(`${lanUrl ?? `http://${ip}:${port}`}?mode=remote`))
       .catch(() => setRemoteUrl(`${window.location.origin}?mode=remote`));
   }, []);
 

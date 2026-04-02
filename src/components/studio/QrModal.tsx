@@ -40,26 +40,31 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   const [activeMode, setActiveMode] = useState<PhoneMode>(
     qrMode === 'camera' ? 'camera' : 'audience'
   );
-  const [serverUrl, setServerUrl] = useState<string>('');
+  const [lanUrl, setLanUrl] = useState<string>('');
+  const [publicUrl, setPublicUrl] = useState<string>('');
   const [copied, setCopied] = useState(false);
 
-  // Fetch the local network IP from the server so phones on the same WiFi can connect
+  // Fetch LAN IP and optional public URL from server.
+  // Camera/screen modes MUST use LAN IP — WebRTC signalling requires phone and
+  // Studio to reach the same Socket.io server (always localhost:3001).
+  // Only the Audience Portal (pure HTTP) can use the cloud public URL.
   useEffect(() => {
     fetch('/api/local-ip')
       .then(r => r.json())
-      .then(({ ip, port, publicUrl }: { ip: string; port: number; publicUrl?: string }) => {
-        // Cloud deployments return publicUrl (e.g. https://aethercast.tiwaton.co.uk)
-        setServerUrl(publicUrl ?? `http://${ip}:${port}`);
+      .then(({ ip, port, lanUrl: lan, publicUrl: pub }: { ip: string; port: number; lanUrl?: string; publicUrl?: string | null }) => {
+        setLanUrl(lan ?? `http://${ip}:${port}`);
+        setPublicUrl(pub ?? '');
       })
       .catch(() => {
-        setServerUrl(window.location.origin);
+        setLanUrl(window.location.origin);
       });
   }, []);
 
   const cfg = MODE_CONFIG[activeMode];
-  const appUrl = serverUrl
-    ? `${serverUrl}?mode=${cfg.urlMode}&room=SLTN-1234`
-    : '';
+  // Camera/screen WebRTC signalling requires LAN IP (same Socket.io server as Studio).
+  // Audience portal is pure HTTP so it can use the public cloud URL when available.
+  const baseUrl = activeMode === 'audience' ? (publicUrl || lanUrl) : lanUrl;
+  const appUrl = baseUrl ? `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234` : '';
 
   const handleCopy = () => {
     if (!appUrl) return;

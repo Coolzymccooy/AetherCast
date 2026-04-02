@@ -31,12 +31,19 @@ export default function PhoneScreenView() {
     setStatus('requesting');
     setErrorMsg('');
 
+    // getDisplayMedia is only available on desktop browsers and iOS Safari 16.4+.
+    // Android Chrome does not support it at all.
+    if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
+      setStatus('error');
+      setErrorMsg('Screen sharing is not supported on this device. Please use desktop Chrome, Firefox, or Safari on iOS 16.4 or later.');
+      return;
+    }
+
     try {
-      // getDisplayMedia works on Android Chrome 72+ and iOS 16.4+ Safari
-      const stream = await (navigator.mediaDevices as any).getDisplayMedia({
+      const stream = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 30 }, width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
-      }) as MediaStream;
+      });
 
       streamRef.current = stream;
       if (previewRef.current) {
@@ -45,12 +52,19 @@ export default function PhoneScreenView() {
 
       setStatus('connecting');
 
-      const socket = io();
+      // Use the same origin as the page — the QR code always encodes the LAN IP,
+      // so io() here connects to the local server that the Studio also uses.
+      const socket = io(window.location.origin);
       socketRef.current = socket;
       socket.emit('join-room', roomId);
 
+      const iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ];
+
       socket.on('user-joined', (peerId: string) => {
-        const peer = new SimplePeer({ initiator: true, trickle: false, stream });
+        const peer = new SimplePeer({ initiator: true, trickle: false, stream, config: { iceServers } });
         peerRef.current = peer;
         peer.on('signal', (signal) => socket.emit('signal', { to: peerId, signal, roomId }));
         peer.on('connect', () => setStatus('connected'));
@@ -61,7 +75,7 @@ export default function PhoneScreenView() {
         if (peerRef.current) {
           peerRef.current.signal(signal);
         } else {
-          const peer = new SimplePeer({ initiator: false, trickle: false, stream });
+          const peer = new SimplePeer({ initiator: false, trickle: false, stream, config: { iceServers } });
           peerRef.current = peer;
           peer.signal(signal);
           peer.on('signal', (s) => socket.emit('signal', { to: from, signal: s, roomId }));
@@ -115,6 +129,10 @@ export default function PhoneScreenView() {
           </div>
           <h1 className="text-2xl font-bold">Screen Share</h1>
           <p className="text-gray-400 text-sm mt-2">Broadcast your phone screen to the Studio.</p>
+          <p className="text-[11px] text-yellow-500/80 mt-2">
+            Requires desktop Chrome / Firefox, or Safari on iOS 16.4+.<br />
+            Not supported on Android Chrome.
+          </p>
         </div>
 
         {/* Status */}

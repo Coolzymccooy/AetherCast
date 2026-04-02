@@ -36,12 +36,19 @@ export default function RemoteCameraView() {
         localVideoRef.current.srcObject = stream;
       }
 
-      const socket = io();
+      // Use same origin as page — QR codes always encode LAN IP so phone and Studio
+      // hit the same Socket.io server for WebRTC signalling.
+      const socket = io(window.location.origin);
       socketRef.current = socket;
       socket.emit('join-room', roomId);
 
+      const iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ];
+
       socket.on('user-joined', (peerId: string) => {
-        const peer = new SimplePeer({ initiator: true, trickle: false, stream });
+        const peer = new SimplePeer({ initiator: true, trickle: false, stream, config: { iceServers } });
         peerRef.current = peer;
 
         peer.on('signal', (signal) => {
@@ -56,7 +63,7 @@ export default function RemoteCameraView() {
         if (peerRef.current) {
           peerRef.current.signal(signal);
         } else {
-          const peer = new SimplePeer({ initiator: false, trickle: false, stream });
+          const peer = new SimplePeer({ initiator: false, trickle: false, stream, config: { iceServers } });
           peerRef.current = peer;
           peer.signal(signal);
 

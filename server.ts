@@ -938,13 +938,10 @@ async function startServer() {
   // ──────────────────────────────────────────────────────────────────────────────
 
   app.get('/api/local-ip', (_req, res) => {
-    // In cloud deployments set PUBLIC_URL=https://aethercast.tiwaton.co.uk
-    // so the QR code points to the public domain instead of the LAN IP.
-    if (process.env.PUBLIC_URL) {
-      const url = new URL(process.env.PUBLIC_URL);
-      const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
-      return res.json({ ip: url.hostname, port, publicUrl: process.env.PUBLIC_URL });
-    }
+    // Always compute LAN IP so WebRTC camera/screen QR codes always use it.
+    // (WebRTC signalling requires phone and Studio on the same Socket.io server —
+    //  that server is always the local machine, so camera/screen must use LAN IP.)
+    // PUBLIC_URL is only used for the Audience Portal (HTTP, no WebRTC).
     const nets = os.networkInterfaces();
     let localIp = '127.0.0.1';
     for (const iface of Object.values(nets)) {
@@ -956,7 +953,9 @@ async function startServer() {
       }
       if (localIp !== '127.0.0.1') break;
     }
-    res.json({ ip: localIp, port: PORT });
+    const lanUrl = `http://${localIp}:${PORT}`;
+    const publicUrl = process.env.PUBLIC_URL || null;
+    res.json({ ip: localIp, port: PORT, lanUrl, publicUrl });
   });
 
   // ──────────────────────────────────────────────────────────────────────────────
