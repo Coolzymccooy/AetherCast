@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import Peer from 'simple-peer';
 import { Scene, Source, ServerLog, AudioChannel } from '../types';
-import { ROOM_ID } from '../constants';
+import { ROOM_ID, CLOUD_URL } from '../constants';
 import { audioEngine } from '../lib/audioEngine';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'disconnected' | 'failed';
@@ -40,6 +40,10 @@ export function useWebRTC({
   const [peerStates, setPeerStates] = useState<Map<string, PeerConnectionState>>(new Map());
 
   const socketRef = useRef<Socket | null>(null);
+  // Second socket that bridges audience messages from the cloud when running in Tauri desktop.
+  // Tauri's main socket connects to localhost:3001 (no audience phones reach that).
+  // Phones send messages to the cloud Socket.io — this bridge subscribes there and forwards locally.
+  const audienceBridgeSocketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Map<string, Peer.Instance>>(new Map());
   const iceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
@@ -332,7 +336,22 @@ export function useWebRTC({
     if (window.__TAURI_INTERNALS__) {
       // tauri.localhost is the hostname in production Tauri builds (not just dev)
       const isLocal = ['localhost', '127.0.0.1', 'tauri.localhost'].includes(window.location.hostname);
-      serverUrl = isLocal ? 'http://localhost:3001' : 'https://aethercast.tiwaton.co.uk';
+      serverUrl = isLocal ? 'http://localhost:3001' : CLOUD_URL;
+    }
+
+    // Audience bridge: when Tauri connects to localhost, audience phones reach the cloud.
+    // Open a second connection to the cloud to relay those audience messages into Studio.
+    if (audienceBridgeSocketRef.current) {
+      audienceBridgeSocketRef.current.disconnect();
+      audienceBridgeSocketRef.current = null;
+    }
+    if (serverUrl === 'http://localhost:3001') {
+      const bridge = io(CLOUD_URL, { reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 3000 });
+      audienceBridgeSocketRef.current = bridge;
+      bridge.emit('join-room', ROOM_ID);
+      bridge.on('audience-message', (message: any) => {
+        setAudienceMessagesRef.current(prev => [message, ...prev].slice(0, 50));
+      });
     }
 
     const socket = io(serverUrl, {
@@ -417,6 +436,7 @@ export function useWebRTC({
     return () => {
       destroyAllPeers();
       if (socketRef.current) socketRef.current.disconnect();
+      if (audienceBridgeSocketRef.current) audienceBridgeSocketRef.current.disconnect();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Must only run once on mount
   }, []);

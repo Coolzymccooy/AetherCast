@@ -3,7 +3,7 @@ import {
   Camera, Smartphone, Monitor, Brain, Activity, Sparkles,
   RefreshCw, AlertTriangle, ImageIcon as ImageIcon, Type,
   Check, Square, Circle, Play, ChevronRight, Plus, Trash2,
-  Layers, Settings2, Video, ExternalLink, QrCode
+  Layers, Settings2, Video, ExternalLink, QrCode, Info
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import {
@@ -450,6 +450,21 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
                     </button>
                   </div>
                 )}
+              </div>
+            </div>
+
+            {/* Professional Camera Tip */}
+            <div className="rack-module border-yellow-500/20">
+              <div className="bg-yellow-500/5 p-2 border-b border-yellow-500/20 flex items-center gap-2">
+                <Info size={14} className="text-yellow-500" />
+                <span className="text-[11px] font-bold uppercase tracking-wider text-yellow-400">Pro Camera Tip</span>
+              </div>
+              <div className="p-3 space-y-2 text-[10px] text-gray-400 leading-relaxed">
+                <p><strong className="text-white">Canon / Sony / Mirrorless via HDMI:</strong> Connect your camera to an Elgato or Blackmagic capture card — it will appear as a webcam in Cam 1 / Cam 2.</p>
+                <p className="text-yellow-400/80">
+                  <strong className="text-yellow-300">Clean HDMI:</strong> Turn off the camera&apos;s on-screen display (OSD) / info overlay in the camera menu before connecting — otherwise the battery icon, focus box and exposure info will be baked into your video signal.
+                </p>
+                <p>On Canon: <span className="font-mono bg-black/40 px-1 rounded">Menu → Shooting → Disp level → HDMI → Clean</span></p>
               </div>
             </div>
           </>

@@ -64,3 +64,6 @@ export function getRoomId(): string {
 
 /** @deprecated Use getRoomId() instead — retained for backward compatibility */
 export const ROOM_ID = getRoomId();
+
+/** Public cloud URL — used by Tauri desktop to bridge audience messages from remote phones */
+export const CLOUD_URL = 'https://aethercast.tiwaton.co.uk';

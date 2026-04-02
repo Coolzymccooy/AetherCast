@@ -3,6 +3,7 @@ import { X, Smartphone, ExternalLink, Copy, Monitor, Users, CheckCircle } from '
 import { motion } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import { QrMode } from '../../types';
+import { CLOUD_URL } from '../../constants';
 
 interface QrModalProps {
   qrMode: QrMode;
@@ -60,10 +61,15 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
       });
   }, []);
 
+  const isTauri = !!(window as any).__TAURI_INTERNALS__;
   const cfg = MODE_CONFIG[activeMode];
-  // Camera/screen WebRTC signalling requires LAN IP (same Socket.io server as Studio).
-  // Audience portal is pure HTTP so it can use the public cloud URL when available.
-  const baseUrl = activeMode === 'audience' ? (publicUrl || lanUrl) : lanUrl;
+
+  // Camera/screen: always LAN IP (WebRTC signalling requires same Socket.io server as Studio).
+  // Audience in Tauri: use cloud URL — the Studio audience bridge socket relays messages
+  //   from cloud Socket.io to the local Studio (remote audience doesn't need LAN access).
+  // Audience in browser: use publicUrl if cloud-deployed, otherwise LAN.
+  const audienceBase = isTauri ? (publicUrl || CLOUD_URL) : (publicUrl || lanUrl);
+  const baseUrl = activeMode === 'audience' ? audienceBase : lanUrl;
   const appUrl = baseUrl ? `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234` : '';
 
   const handleCopy = () => {
