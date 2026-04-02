@@ -34,6 +34,7 @@ import { ScriptEditor } from './components/studio/ScriptEditor';
 import { HardwareSetupModal } from './components/studio/HardwareSetupModal';
 import { StreamSettingsModal } from './components/studio/StreamSettingsModal';
 import { QrModal } from './components/studio/QrModal';
+import { PeerSettingsModal } from './components/studio/PeerSettingsModal';
 import { ServerLogsPanel } from './components/studio/ServerLogsPanel';
 import { NotificationToast } from './components/studio/NotificationToast';
 import { ProjectDialog } from './components/studio/ProjectDialog';
@@ -95,6 +96,7 @@ function StudioView() {
 
   const gpuStreaming = useGPUStreaming();
 
+  const [showPeerSettings, setShowPeerSettings] = React.useState(false);
   const [showProjectDialog, setShowProjectDialog] = React.useState(false);
   const [showOutputQuality, setShowOutputQuality] = React.useState(false);
   const [showShortcuts, setShowShortcuts] = React.useState(false);
@@ -202,6 +204,7 @@ function StudioView() {
         onZoomIn={zoomIn}
         onZoomOut={zoomOut}
         onZoomReset={zoomReset}
+        onOpenSettings={() => setShowPeerSettings(true)}
       />
 
       {/* Engine status bar */}
@@ -239,7 +242,7 @@ function StudioView() {
         </ErrorBoundary>
         )}
 
-        <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex-1 flex flex-col min-w-0 min-h-0">
           <ErrorBoundary name="Compositor" onError={(err) => notify(err.message, 'error')}>
           <ProgramView
             activeScene={studio.activeScene}
@@ -307,7 +310,7 @@ function StudioView() {
           />
           </ErrorBoundary>
 
-          <div className="h-72 flex border-t border-border bg-panel">
+          <div className="h-72 flex-shrink-0 flex border-t border-border bg-panel overflow-hidden">
             <ErrorBoundary name="Scene Switcher" onError={(err) => notify(err.message, 'error')}>
             <SceneSwitcher scenes={studio.scenes} activeScene={studio.activeScene} onSceneChange={studio.setActiveScene} />
             </ErrorBoundary>
@@ -478,6 +481,10 @@ function StudioView() {
 
         {studio.showQrModal && (
           <QrModal qrMode={studio.qrMode} setQrMode={studio.setQrMode} onClose={() => studio.setShowQrModal(false)} />
+        )}
+
+        {showPeerSettings && (
+          <PeerSettingsModal onClose={() => setShowPeerSettings(false)} />
         )}
 
         {studio.showRecordingGallery && (

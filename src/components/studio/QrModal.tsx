@@ -4,6 +4,7 @@ import { motion } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import { QrMode } from '../../types';
 import { CLOUD_URL } from '../../constants';
+import { buildPeerQueryParams } from '../../utils/peerEnv';
 
 interface QrModalProps {
   qrMode: QrMode;
@@ -41,7 +42,6 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   const [activeMode, setActiveMode] = useState<PhoneMode>(
     qrMode === 'camera' ? 'camera' : 'audience'
   );
-  const [lanUrl, setLanUrl] = useState<string>('');
   const [publicUrl, setPublicUrl] = useState<string>('');
   const [copied, setCopied] = useState(false);
 
@@ -52,13 +52,10 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   useEffect(() => {
     fetch('/api/local-ip')
       .then(r => r.json())
-      .then(({ ip, port, lanUrl: lan, publicUrl: pub }: { ip: string; port: number; lanUrl?: string; publicUrl?: string | null }) => {
-        setLanUrl(lan ?? `http://${ip}:${port}`);
+      .then(({ publicUrl: pub }: { ip: string; port: number; lanUrl?: string; publicUrl?: string | null }) => {
         setPublicUrl(pub ?? '');
       })
-      .catch(() => {
-        setLanUrl(window.location.origin);
-      });
+      .catch(() => { /* ok — publicUrl stays empty */ });
   }, []);
 
   const isTauri = !!(window as any).__TAURI_INTERNALS__;
@@ -70,7 +67,8 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   //   browser → same origin
   const audienceBase = isTauri ? (publicUrl || CLOUD_URL) : window.location.origin;
   const baseUrl = activeMode === 'audience' ? audienceBase : window.location.origin;
-  const appUrl = `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234`;
+  const peerParams = activeMode !== 'audience' ? buildPeerQueryParams() : '';
+  const appUrl = `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234${peerParams ? `&${peerParams}` : ''}`;
 
   const handleCopy = () => {
     if (!appUrl) return;

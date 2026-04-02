@@ -11,6 +11,7 @@ interface MenuBarProps {
   onZoomIn?: () => void;
   onZoomOut?: () => void;
   onZoomReset?: () => void;
+  onOpenSettings?: () => void;
 }
 
 const menuConfig: Record<string, string[]> = {
@@ -39,6 +40,7 @@ const SHORTCUT_MAP: Record<string, string> = {
 export const MenuBar: React.FC<MenuBarProps> = ({
   onOpenGallery, onOpenEditor, onAction,
   zoomLevel = 100, onZoomIn, onZoomOut, onZoomReset,
+  onOpenSettings,
 }) => {
   const [activeMenu, setActiveMenu] = useState<string | null>(null);
 
@@ -144,7 +146,11 @@ export const MenuBar: React.FC<MenuBarProps> = ({
           <span>Gallery</span>
         </button>
       </div>
-      <button className="text-gray-500 hover:text-white p-1 active:scale-90 transition-transform">
+      <button
+        onClick={onOpenSettings}
+        className="text-gray-500 hover:text-white p-1 active:scale-90 transition-transform"
+        title="Connection Settings"
+      >
         <Settings size={14} />
       </button>
     </div>

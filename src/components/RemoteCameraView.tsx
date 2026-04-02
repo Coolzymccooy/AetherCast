@@ -3,6 +3,7 @@ import Peer, { MediaConnection } from 'peerjs';
 import { Camera, Wifi, WifiOff, Mic, MicOff, Sun, Moon, RefreshCcw } from 'lucide-react';
 import { motion } from 'motion/react';
 import { hostPeerId, clientPeerId } from '../utils/peerId';
+import { getPeerEnv } from '../utils/peerEnv';
 
 /**
  * RemoteCameraView — renders when `?mode=remote` is in the URL.
@@ -129,7 +130,12 @@ export default function RemoteCameraView() {
     addLog('Connecting to PeerJS cloud...');
 
     const myId = clientPeerId(roomId);
+    const peerEnv = getPeerEnv();
     const peer = new Peer(myId, {
+      host: peerEnv.host,
+      port: peerEnv.port,
+      path: peerEnv.path,
+      secure: peerEnv.secure,
       debug: 0,
       config: {
         iceServers: [

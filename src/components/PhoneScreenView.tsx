@@ -3,6 +3,7 @@ import Peer, { MediaConnection } from 'peerjs';
 import { Monitor, Wifi, WifiOff, Share2 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { hostPeerId, clientPeerId } from '../utils/peerId';
+import { getPeerEnv } from '../utils/peerEnv';
 
 /**
  * PhoneScreenView — renders when `?mode=screen` is in the URL.
@@ -90,15 +91,18 @@ export default function PhoneScreenView() {
   }, [roomId, addLog]);
 
   const startSharing = async () => {
-    if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
-      setStatus('error');
-      setErrorMsg('Screen sharing is not supported on this device. Please use desktop Chrome, Firefox, or Safari on iOS 16.4+.');
-      return;
-    }
-
     cleanup();
     setStatus('requesting');
     setErrorMsg('');
+
+    if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
+      setStatus('error');
+      setErrorMsg(
+        'Screen sharing is not available in this browser. ' +
+        'Try Samsung Internet, Firefox, or Chrome on desktop.'
+      );
+      return;
+    }
 
     let stream: MediaStream | null = null;
     try {
@@ -108,7 +112,14 @@ export default function PhoneScreenView() {
       });
     } catch (err: unknown) {
       setStatus('error');
-      setErrorMsg(err instanceof Error ? err.message : 'Screen share was denied or not supported.');
+      const msg = err instanceof Error ? err.message : '';
+      if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('denied') || msg.toLowerCase().includes('not allowed')) {
+        setErrorMsg('Screen share was denied. Please allow it and try again.');
+      } else if (msg.toLowerCase().includes('not supported') || msg.toLowerCase().includes('not implemented')) {
+        setErrorMsg('Screen sharing is not supported in this browser. Try Samsung Internet or Firefox.');
+      } else {
+        setErrorMsg(msg || 'Screen share failed. Try a different browser.');
+      }
       return;
     }
 
@@ -128,7 +139,12 @@ export default function PhoneScreenView() {
     addLog('Connecting to PeerJS cloud...');
 
     const myId = clientPeerId(roomId);
+    const peerEnv = getPeerEnv();
     const peer = new Peer(myId, {
+      host: peerEnv.host,
+      port: peerEnv.port,
+      path: peerEnv.path,
+      secure: peerEnv.secure,
       debug: 0,
       config: {
         iceServers: [
@@ -184,9 +200,8 @@ export default function PhoneScreenView() {
           </div>
           <h1 className="text-2xl font-bold">Screen Share</h1>
           <p className="text-gray-400 text-sm mt-2">Broadcast your screen to Aether Studio.</p>
-          <p className="text-[11px] text-yellow-500/80 mt-2">
-            Requires desktop Chrome / Firefox, or Safari on iOS 16.4+.<br />
-            Not supported on Android Chrome.
+          <p className="text-[11px] text-gray-500 mt-2">
+            Works on desktop Chrome, Firefox, Safari, Samsung Internet, and iOS Safari 15.4+.
           </p>
         </div>
 

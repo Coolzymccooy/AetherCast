@@ -5,6 +5,7 @@ import PeerJS, { MediaConnection } from 'peerjs';
 import { Scene, Source, ServerLog, AudioChannel } from '../types';
 import { ROOM_ID, CLOUD_URL } from '../constants';
 import { hostPeerId } from '../utils/peerId';
+import { getPeerEnv } from '../utils/peerEnv';
 import { audioEngine } from '../lib/audioEngine';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'disconnected' | 'failed';
@@ -329,7 +330,12 @@ export function useWebRTC({
     }
 
     const hostId = hostPeerId(ROOM_ID);
+    const peerEnv = getPeerEnv();
     const hostPeer = new PeerJS(hostId, {
+      host: peerEnv.host,
+      port: peerEnv.port,
+      path: peerEnv.path,
+      secure: peerEnv.secure,
       debug: 0,
       config: {
         iceServers: [
