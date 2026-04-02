@@ -65,6 +65,20 @@ export default function PhoneScreenView() {
         const call = peer.call(hostId, stream, { metadata: { role: 'screen', room: roomId } });
         callRef.current = call;
 
+        // Host answers without a return stream so 'stream' event may never fire.
+        // Watch the underlying RTCPeerConnection for the actual connected state.
+        const peerConn: RTCPeerConnection | undefined = (call as any).peerConnection;
+        if (peerConn) {
+          const onConnState = () => {
+            if (peerConn.connectionState === 'connected') {
+              setStatus('connected');
+              addLog('Connected!');
+              peerConn.removeEventListener('connectionstatechange', onConnState);
+            }
+          };
+          peerConn.addEventListener('connectionstatechange', onConnState);
+        }
+
         call.on('stream', () => {
           setStatus('connected');
           addLog('Connected!');
@@ -98,8 +112,8 @@ export default function PhoneScreenView() {
     if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
       setStatus('error');
       setErrorMsg(
-        'Screen sharing is not available in this browser. ' +
-        'Try Samsung Internet, Firefox, or Chrome on desktop.'
+        'Screen sharing is not supported on mobile browsers. ' +
+        'Use a laptop or desktop with Chrome, Firefox, Edge, or Safari (Mac).'
       );
       return;
     }
@@ -201,7 +215,7 @@ export default function PhoneScreenView() {
           <h1 className="text-2xl font-bold">Screen Share</h1>
           <p className="text-gray-400 text-sm mt-2">Broadcast your screen to Aether Studio.</p>
           <p className="text-[11px] text-gray-500 mt-2">
-            Works on desktop Chrome, Firefox, Safari, Samsung Internet, and iOS Safari 15.4+.
+            Works on desktop Chrome, Firefox, Edge, and Safari (Mac). Not supported on mobile browsers.
           </p>
         </div>
 

@@ -68,7 +68,22 @@ export default function RemoteCameraView() {
         const call = peer.call(hostId, stream, { metadata: { role: 'camera', room: roomId } });
         callRef.current = call;
 
+        // Host answers without a return stream so 'stream' event may never fire.
+        // Watch the underlying RTCPeerConnection for the actual connected state.
+        const peerConn: RTCPeerConnection | undefined = (call as any).peerConnection;
+        if (peerConn) {
+          const onConnState = () => {
+            if (peerConn.connectionState === 'connected') {
+              setStatus('connected');
+              addLog('Connected!');
+              peerConn.removeEventListener('connectionstatechange', onConnState);
+            }
+          };
+          peerConn.addEventListener('connectionstatechange', onConnState);
+        }
+
         call.on('stream', () => {
+          // Host sent a return stream (optional) — mark connected if not already
           setStatus('connected');
           addLog('Connected!');
         });
