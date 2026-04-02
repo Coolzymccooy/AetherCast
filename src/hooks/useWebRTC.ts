@@ -59,6 +59,8 @@ export function useWebRTC({
   onErrorRef.current = onError;
   const onPhoneConnectedRef = useRef(onPhoneConnected);
   onPhoneConnectedRef.current = onPhoneConnected;
+  // Track which peer IDs have already triggered the connect notification to avoid spam
+  const notifiedPeersRef = useRef<Set<string>>(new Set());
   const setServerLogsRef = useRef(setServerLogs);
   setServerLogsRef.current = setServerLogs;
   const setAudienceMessagesRef = useRef(setAudienceMessages);
@@ -373,7 +375,11 @@ export function useWebRTC({
           { message: `Phone connected: ${role} (${peerId.slice(-8)})`, type: 'info', id: Date.now() } as ServerLog,
           ...prev,
         ]);
-        onPhoneConnectedRef.current?.(role);
+        // Only fire notification once per peer to avoid spam on reconnects
+        if (!notifiedPeersRef.current.has(peerId)) {
+          notifiedPeersRef.current.add(peerId);
+          onPhoneConnectedRef.current?.(role);
+        }
       });
 
       call.on('close', () => {
@@ -382,6 +388,8 @@ export function useWebRTC({
           next.delete(peerId);
           return next;
         });
+        // Clear notification guard on disconnect so genuine reconnects notify again
+        notifiedPeersRef.current.delete(peerId);
       });
 
       call.on('error', (err: Error) => {

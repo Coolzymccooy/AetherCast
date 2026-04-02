@@ -117,51 +117,78 @@ export default function RemoteCameraView() {
     attempt();
   }, [roomId, addLog]);
 
-  const start = useCallback(async (facing: 'user' | 'environment' = facingMode, res: Resolution = resolution) => {
-    cleanup();
-    setStatus('camera');
-    setErrorMsg('');
-    setZoom(1);
-    setMaxZoom(1);
-
+  /** Acquire a camera stream only — no PeerJS side effects */
+  const acquireStream = useCallback(async (facing: 'user' | 'environment', res: Resolution): Promise<MediaStream | null> => {
     const { width, height } = RESOLUTIONS[res];
-    let stream: MediaStream | null = null;
     const attempts: MediaStreamConstraints[] = [
       { video: { facingMode: facing, width: { ideal: width }, height: { ideal: height } }, audio: true },
       { video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true },
       { video: { facingMode: facing }, audio: true },
       { video: { facingMode: facing }, audio: false },
     ];
-
     for (const constraints of attempts) {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia(constraints);
-        break;
-      } catch { /* try next */ }
+      try { return await navigator.mediaDevices.getUserMedia(constraints); } catch { /* try next */ }
     }
+    return null;
+  }, []);
 
-    if (!stream) {
-      setStatus('error');
-      setErrorMsg('Camera permission denied or not available.');
-      return;
-    }
-
-    streamRef.current = stream;
-    stream.getAudioTracks().forEach(t => (t.enabled = !isMuted));
-
-    // Detect zoom capability
-    const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack) {
-      const caps = videoTrack.getCapabilities?.() as any;
-      if (caps?.zoom) {
-        setMaxZoom(caps.zoom.max ?? 1);
-      }
-    }
-
+  /** Apply a new stream to preview + update zoom state */
+  const applyStreamLocally = useCallback((stream: MediaStream) => {
     if (videoRef.current) {
       videoRef.current.srcObject = stream;
       videoRef.current.play().catch(() => { /* autoplay ok */ });
     }
+    setZoom(1);
+    const videoTrack = stream.getVideoTracks()[0];
+    if (videoTrack) {
+      const caps = videoTrack.getCapabilities?.() as any;
+      setMaxZoom(caps?.zoom?.max ?? 1);
+    }
+  }, []);
+
+  /**
+   * Swap camera without dropping the WebRTC connection.
+   * Uses RTCPeerConnection.replaceTrack() when connected.
+   * Falls back to full restart only if not yet connected.
+   */
+  const swapCamera = useCallback(async (facing: 'user' | 'environment', res: Resolution) => {
+    const call = callRef.current;
+    const pc: RTCPeerConnection | undefined = (call as any)?.peerConnection;
+
+    if (pc && pc.connectionState === 'connected') {
+      const newStream = await acquireStream(facing, res);
+      if (!newStream) return;
+
+      const newVideo = newStream.getVideoTracks()[0];
+      const newAudio = newStream.getAudioTracks()[0];
+
+      const videoSender = pc.getSenders().find(s => s.track?.kind === 'video');
+      const audioSender = pc.getSenders().find(s => s.track?.kind === 'audio');
+
+      try {
+        if (videoSender && newVideo) await videoSender.replaceTrack(newVideo);
+        if (audioSender && newAudio) await audioSender.replaceTrack(newAudio);
+      } catch { /* replaceTrack not supported — fall through below */ }
+
+      // Stop old tracks, swap ref
+      streamRef.current?.getTracks().forEach(t => t.stop());
+      streamRef.current = newStream;
+      newStream.getAudioTracks().forEach(t => (t.enabled = !isMuted));
+      applyStreamLocally(newStream);
+      return;
+    }
+
+    // Not connected yet — full restart
+    cleanup();
+    setStatus('camera');
+    setErrorMsg('');
+
+    const stream = await acquireStream(facing, res);
+    if (!stream) { setStatus('error'); setErrorMsg('Camera permission denied or not available.'); return; }
+
+    streamRef.current = stream;
+    stream.getAudioTracks().forEach(t => (t.enabled = !isMuted));
+    applyStreamLocally(stream);
 
     setStatus('connecting');
     addLog('Connecting to PeerJS cloud...');
@@ -169,38 +196,21 @@ export default function RemoteCameraView() {
     const myId = clientPeerId(roomId);
     const peerEnv = getPeerEnv();
     const peer = new Peer(myId, {
-      host: peerEnv.host,
-      port: peerEnv.port,
-      path: peerEnv.path,
-      secure: peerEnv.secure,
-      debug: 0,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-        ],
-      },
+      host: peerEnv.host, port: peerEnv.port, path: peerEnv.path, secure: peerEnv.secure, debug: 0,
+      config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] },
     });
     peerRef.current = peer;
-
-    peer.on('open', () => {
-      addLog('Cloud ready');
-      startHostChecker(peer, stream!);
-    });
-
-    peer.on('disconnected', () => {
-      addLog('Cloud disconnected, reconnecting...');
-      try { (peer as any).reconnect?.(); } catch { /* ok */ }
-    });
-
+    peer.on('open', () => { addLog('Cloud ready'); startHostChecker(peer, stream); });
+    peer.on('disconnected', () => { addLog('Cloud disconnected, reconnecting...'); try { (peer as any).reconnect?.(); } catch { /* ok */ } });
     peer.on('error', (err: any) => {
       addLog(`Peer error: ${err.type || err.message}`);
-      if (err.type !== 'peer-unavailable') {
-        setStatus('error');
-        setErrorMsg(`PeerJS error: ${err.type || err.message}`);
-      }
+      if (err.type !== 'peer-unavailable') { setStatus('error'); setErrorMsg(`PeerJS error: ${err.type || err.message}`); }
     });
-  }, [facingMode, resolution, isMuted, cleanup, addLog, startHostChecker, roomId]);
+  }, [acquireStream, applyStreamLocally, cleanup, addLog, startHostChecker, roomId, isMuted]);
+
+  const start = useCallback(async (facing: 'user' | 'environment' = facingMode, res: Resolution = resolution) => {
+    await swapCamera(facing, res);
+  }, [facingMode, resolution, swapCamera]);
 
   useEffect(() => { start(); }, []);
 
@@ -214,13 +224,13 @@ export default function RemoteCameraView() {
   const flipCamera = async () => {
     const next = facingMode === 'user' ? 'environment' : 'user';
     setFacingMode(next);
-    await start(next, resolution);
+    await swapCamera(next, resolution);
   };
 
   const toggleResolution = async () => {
     const next: Resolution = resolution === '720p' ? '1080p' : '720p';
     setResolution(next);
-    await start(facingMode, next);
+    await swapCamera(facingMode, next);
   };
 
   const applyZoom = async (value: number) => {

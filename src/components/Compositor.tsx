@@ -372,14 +372,8 @@ export const Compositor: React.FC<CompositorProps> = ({
     const localCam2 = remoteVideoRefs.current.get('local-cam-2');
     const screenVideo = screenVideoRef.current;
 
-    // If no local webcam, promote the first phone/remote stream to primary so it
-    // appears in Cam 1 (and all single-cam scenes) instead of a black placeholder.
-    let primaryVideo: HTMLVideoElement | null = videoRef.current ?? remoteVideos[0] ?? null;
-    let secondaryVideo: HTMLVideoElement | null = screenVideo ?? remoteVideos[0] ?? localCam2 ?? null;
-    // If primary was promoted from remote, shift secondary to next remote or screen
-    if (!videoRef.current && remoteVideos.length > 0) {
-      secondaryVideo = screenVideo ?? remoteVideos[1] ?? localCam2 ?? null;
-    }
+    let primaryVideo = videoRef.current;
+    let secondaryVideo = screenVideo || remoteVideos[0] || localCam2;
 
     if (sourceSwap) {
       const temp = primaryVideo;
@@ -422,7 +416,9 @@ export const Compositor: React.FC<CompositorProps> = ({
         drawFramedVideo(ctx, cam, 'Camera', width - camW - 60, height - camH - 60, camW, camH, frameCount, '#FF4C4C', camoSettings);
       }
     } else if (scene.type === 'CAM') {
-      const video = primaryVideo;
+      // When no local webcam, fall back to the first phone/remote stream so Cam 1
+      // isn't blank when the phone is the only camera source.
+      const video = primaryVideo ?? remoteVideos[0] ?? null;
 
       if (layout === 'Framed Solo') {
         const padding = 80;
