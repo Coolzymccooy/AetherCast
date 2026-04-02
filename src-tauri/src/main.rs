@@ -5,6 +5,7 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,9 @@ pub struct GPUStreamConfig {
     pub bitrate: u32, // kbps
     #[serde(default)]
     pub encoder: String, // auto, nvenc, qsv, videotoolbox, software
+    /// Input mode: "raw" for raw RGBA pixels, "jpeg" for MJPEG frames via image2pipe
+    #[serde(default)]
+    pub mode: String,
 }
 
 fn default_width() -> u32 { 1920 }
@@ -240,22 +244,36 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     };
 
     let is_gpu = encoder != "libx264";
-    println!("[aether] Starting stream: {}x{} @{}fps {}kbps encoder={}",
-             config.width, config.height, config.fps, config.bitrate, encoder);
+    let is_jpeg_mode = config.mode == "jpeg";
+
+    println!("[aether] Starting stream: {}x{} @{}fps {}kbps encoder={} mode={}",
+             config.width, config.height, config.fps, config.bitrate, encoder,
+             if is_jpeg_mode { "jpeg" } else { "raw" });
 
     let mut args: Vec<String> = Vec::new();
 
     // Global flags
     args.extend(["-y".into(), "-hide_banner".into(), "-loglevel".into(), "warning".into()]);
 
-    // Input 0: raw RGBA video from stdin
-    args.extend([
-        "-f".into(), "rawvideo".into(),
-        "-pixel_format".into(), "rgba".into(),
-        "-video_size".into(), format!("{}x{}", config.width, config.height),
-        "-framerate".into(), config.fps.to_string(),
-        "-i".into(), "pipe:0".into(),
-    ]);
+    if is_jpeg_mode {
+        // JPEG mode: receive JPEG frames via image2pipe (from browser canvas.toBlob)
+        // Each frame is a complete JPEG file written sequentially to stdin
+        args.extend([
+            "-f".into(), "image2pipe".into(),
+            "-c:v".into(), "mjpeg".into(),
+            "-framerate".into(), config.fps.to_string(),
+            "-i".into(), "pipe:0".into(),
+        ]);
+    } else {
+        // Raw mode: receive raw RGBA video from stdin (legacy path)
+        args.extend([
+            "-f".into(), "rawvideo".into(),
+            "-pixel_format".into(), "rgba".into(),
+            "-video_size".into(), format!("{}x{}", config.width, config.height),
+            "-framerate".into(), config.fps.to_string(),
+            "-i".into(), "pipe:0".into(),
+        ]);
+    }
 
     // Input 1: silent audio (required by YouTube/Twitch — they won't start without an audio track)
     args.extend([
@@ -370,6 +388,37 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn FFmpeg: {}", e))?;
     let stdin_handle = child.stdin.take().ok_or("Failed to capture FFmpeg stdin")?;
 
+    // Read FFmpeg stderr on a background thread so we can see why it crashes
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if !l.trim().is_empty() {
+                            println!("[ffmpeg] {}", l);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            println!("[ffmpeg] stderr stream ended");
+
+            // FFmpeg has exited — clear stdin so write_frame stops immediately
+            // instead of getting OS error 232 on every frame
+            if let Ok(mut guard) = ffmpeg_stdin().lock() {
+                *guard = None;
+            }
+            if let Ok(mut guard) = ffmpeg_process().lock() {
+                if let Some(mut child) = guard.take() {
+                    let status = child.wait();
+                    println!("[ffmpeg] Process exited: {:?}", status);
+                }
+            }
+        });
+    }
+
     // Reset frame counter
     if let Ok(mut counter) = frame_counter().lock() { *counter = 0; }
 
@@ -378,7 +427,8 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     *ffmpeg_process().lock().map_err(|e| e.to_string())? = Some(child);
 
     let encoder_label = if is_gpu { format!("GPU ({})", encoder) } else { "Software (libx264)".into() };
-    Ok(format!("Streaming via {} to {} destination(s)", encoder_label, active.len()))
+    let mode_label = if is_jpeg_mode { "JPEG→image2pipe" } else { "Raw RGBA" };
+    Ok(format!("Streaming via {} [{}] to {} destination(s)", encoder_label, mode_label, active.len()))
 }
 
 #[tauri::command]
@@ -395,7 +445,51 @@ async fn stop_stream() -> Result<String, String> {
     }
 }
 
-/// Receive raw RGBA frame and write to FFmpeg stdin
+/// Write a base64-encoded JPEG frame to FFmpeg stdin (used in jpeg mode)
+#[tauri::command]
+async fn write_frame(data: String) -> Result<(), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|e| format!("Base64 decode failed: {}", e))?;
+
+    // Push to replay buffer if active
+    {
+        if let Ok(mut rb) = replay_buffer().lock() {
+            if rb.active && rb.capacity > 0 {
+                let pos = rb.write_pos;
+                if pos < rb.frames.len() {
+                    rb.frames[pos] = bytes.clone();
+                } else {
+                    rb.frames.push(bytes.clone());
+                }
+                rb.write_pos = (pos + 1) % rb.capacity;
+                if rb.count < rb.capacity { rb.count += 1; }
+            }
+        }
+    }
+
+    // Write to FFmpeg stdin
+    let mut guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
+    if let Some(ref mut stdin) = *guard {
+        match stdin.write_all(&bytes) {
+            Ok(()) => {
+                if let Ok(mut c) = frame_counter().lock() { *c += 1; }
+                Ok(())
+            }
+            Err(e) => {
+                // Pipe broken — FFmpeg has died. Clear stdin to prevent further attempts.
+                println!("[aether] FFmpeg stdin write failed: {} — clearing stream", e);
+                *guard = None;
+                // Use a recognizable error so JS can stop the frame loop
+                Err("STREAM_DEAD".into())
+            }
+        }
+    } else {
+        Err("STREAM_DEAD".into())
+    }
+}
+
+/// Receive raw RGBA frame and write to FFmpeg stdin (legacy raw mode)
 #[tauri::command]
 async fn encode_frame(frame_data: Vec<u8>, width: u32, height: u32) -> Result<(), String> {
     let expected = (width * height * 4) as usize;
@@ -522,7 +616,7 @@ async fn stop_replay_buffer() -> Result<String, String> {
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            start_stream, stop_stream, encode_frame,
+            start_stream, stop_stream, encode_frame, write_frame,
             get_stream_stats, detect_encoder,
             start_replay_buffer, capture_replay, stop_replay_buffer,
         ])

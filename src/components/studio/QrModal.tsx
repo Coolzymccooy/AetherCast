@@ -62,14 +62,20 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   }, []);
 
   const isTauri = !!(window as any).__TAURI_INTERNALS__;
+  // localhost / 127.0.0.1 means the user is running the dev server locally in a browser;
+  // phones can't reach "localhost" so we use the LAN IP instead.
+  const isLocalhost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
   const cfg = MODE_CONFIG[activeMode];
 
-  // Camera/screen: always LAN IP (WebRTC signalling requires same Socket.io server as Studio).
-  // Audience in Tauri: use cloud URL — the Studio audience bridge socket relays messages
-  //   from cloud Socket.io to the local Studio (remote audience doesn't need LAN access).
-  // Audience in browser: use publicUrl if cloud-deployed, otherwise LAN.
+  // Pick the right base URL for camera/screen (WebRTC modes):
+  //   Tauri desktop or browser-at-localhost → LAN IP  (server is on this machine)
+  //   Browser at cloud URL                  → same origin (server is the cloud host)
+  // Audience:
+  //   Tauri → cloud URL  (bridge socket relays from cloud to local Studio)
+  //   browser → publicUrl if available, else LAN
+  const webrtcBase = (isTauri || isLocalhost) ? lanUrl : window.location.origin;
   const audienceBase = isTauri ? (publicUrl || CLOUD_URL) : (publicUrl || lanUrl);
-  const baseUrl = activeMode === 'audience' ? audienceBase : lanUrl;
+  const baseUrl = activeMode === 'audience' ? audienceBase : webrtcBase;
   const appUrl = baseUrl ? `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234` : '';
 
   const handleCopy = () => {
