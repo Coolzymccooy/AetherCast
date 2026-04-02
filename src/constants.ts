@@ -50,7 +50,7 @@ export const DEFAULT_CAMO_SETTINGS = {
   removeBackground: false,
 };
 
-/** Room ID — reads from URL ?room= parameter, falls back to 'default-room' */
+/** Room ID — reads from URL ?room= parameter, falls back to 'SLTN-1234' */
 export function getRoomId(): string {
   if (typeof window !== 'undefined') {
     const params = new URLSearchParams(window.location.search);
@@ -59,7 +59,7 @@ export function getRoomId(): string {
       return room;
     }
   }
-  return 'default-room';
+  return 'SLTN-1234';
 }
 
 /** @deprecated Use getRoomId() instead — retained for backward compatibility */

@@ -62,14 +62,16 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   const isTauri = !!(window as any).__TAURI_INTERNALS__;
   const cfg = MODE_CONFIG[activeMode];
 
-  // Camera/screen: phone must load the React app from a reachable URL.
+  // Camera: phone must load the React app from a reachable URL.
   //   - publicUrl set (cloud deploy) → use it (phones anywhere can connect)
   //   - Tauri desktop → publicUrl or CLOUD_URL (tauri.localhost unreachable)
   //   - Local browser → LAN IP (http://10.x.x.x:3001, reachable on same WiFi)
+  // Screen Share: getDisplayMedia requires a secure context (HTTPS) — always use cloud URL.
   // Audience Portal uses Socket.io → needs cloud server URL.
-  const cameraScreenBase = publicUrl || (isTauri ? CLOUD_URL : (lanUrl || window.location.origin));
+  const cameraBase = publicUrl || (isTauri ? CLOUD_URL : (lanUrl || window.location.origin));
+  const screenBase = publicUrl || CLOUD_URL;
   const audienceBase = isTauri ? (publicUrl || CLOUD_URL) : window.location.origin;
-  const baseUrl = activeMode === 'audience' ? audienceBase : cameraScreenBase;
+  const baseUrl = activeMode === 'audience' ? audienceBase : activeMode === 'screen' ? screenBase : cameraBase;
   const peerParams = activeMode !== 'audience' ? buildPeerQueryParams() : '';
   const appUrl = `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234${peerParams ? `&${peerParams}` : ''}`;
 

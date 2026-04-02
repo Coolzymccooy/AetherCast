@@ -78,7 +78,7 @@ export const AudienceLanding = () => {
 
   if (!roomId) {
     return (
-      <div className="min-h-screen bg-bg text-white flex items-center justify-center p-4">
+      <div className="h-screen bg-bg text-white flex items-center justify-center p-4">
         <div className="max-w-md w-full bg-panel border border-border rounded-xl p-8 text-center">
           <h1 className="text-2xl font-bold mb-4">Invalid Link</h1>
           <p className="text-gray-400">Please scan the QR code from the studio to connect.</p>
@@ -88,8 +88,8 @@ export const AudienceLanding = () => {
   }
 
   return (
-    <div className="min-h-screen bg-bg text-white p-4 md:p-8 flex flex-col items-center">
-      <div className="max-w-md w-full space-y-6">
+    <div className="h-screen overflow-y-auto bg-bg text-white">
+      <div className="max-w-md w-full mx-auto p-4 md:p-8 pb-12 space-y-6">
         <div className="text-center mb-8">
           <div className="w-16 h-16 bg-accent-cyan/10 rounded-full flex items-center justify-center mx-auto mb-4 border border-accent-cyan/30">
             <MessageSquare size={32} className="text-accent-cyan" />

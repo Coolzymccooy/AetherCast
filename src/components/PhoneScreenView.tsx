@@ -188,7 +188,7 @@ export default function PhoneScreenView() {
   }[status];
 
   return (
-    <div className="min-h-screen bg-bg text-white flex flex-col items-center justify-center p-6">
+    <div className="h-screen overflow-y-auto bg-bg text-white flex flex-col items-center justify-center p-6">
       <motion.div
         initial={{ opacity: 0, y: 16 }}
         animate={{ opacity: 1, y: 0 }}
