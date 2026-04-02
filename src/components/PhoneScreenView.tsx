@@ -1,98 +1,161 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { io, Socket } from 'socket.io-client';
-import SimplePeer from 'simple-peer';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import Peer, { MediaConnection } from 'peerjs';
 import { Monitor, Wifi, WifiOff, Share2 } from 'lucide-react';
 import { motion } from 'motion/react';
+import { hostPeerId, clientPeerId } from '../utils/peerId';
 
 /**
  * PhoneScreenView — renders when `?mode=screen` is in the URL.
- * Captures the phone screen via getDisplayMedia and streams it to the Studio
- * via WebRTC (same signalling as RemoteCameraView but with screen capture).
+ *
+ * Uses PeerJS cloud signaling (0.peerjs.com) so no LAN IP is needed.
+ *
+ * Flow:
+ *   1. User taps "Start Screen Share" → getDisplayMedia
+ *   2. Create PeerJS client peer
+ *   3. Poll for host peer until found
+ *   4. Call host with screen stream → WebRTC connected
  */
 export default function PhoneScreenView() {
-  const [status, setStatus] = useState<'idle' | 'requesting' | 'connecting' | 'connected' | 'error'>('idle');
-  const [errorMsg, setErrorMsg] = useState('');
-  const socketRef = useRef<Socket | null>(null);
-  const peerRef = useRef<SimplePeer.Instance | null>(null);
-  const previewRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-
   const roomId = new URLSearchParams(window.location.search).get('room') ?? 'SLTN-1234';
 
-  const cleanup = () => {
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    peerRef.current?.destroy();
-    socketRef.current?.disconnect();
-  };
+  const [status, setStatus] = useState<'idle' | 'requesting' | 'connecting' | 'connected' | 'error'>('idle');
+  const [errorMsg, setErrorMsg] = useState('');
+  const [logs, setLogs] = useState<string[]>([]);
 
-  useEffect(() => () => cleanup(), []);
+  const peerRef = useRef<Peer | null>(null);
+  const callRef = useRef<MediaConnection | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const previewRef = useRef<HTMLVideoElement>(null);
+  const hostCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const addLog = useCallback((msg: string) => {
+    setLogs(prev => [msg, ...prev].slice(0, 3));
+  }, []);
+
+  const cleanup = useCallback(() => {
+    if (hostCheckTimerRef.current) clearTimeout(hostCheckTimerRef.current);
+    callRef.current?.close();
+    peerRef.current?.destroy();
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    callRef.current = null;
+    peerRef.current = null;
+    streamRef.current = null;
+  }, []);
+
+  useEffect(() => () => cleanup(), [cleanup]);
+
+  const startHostChecker = useCallback((peer: Peer, stream: MediaStream) => {
+    const hostId = hostPeerId(roomId);
+
+    const attempt = () => {
+      addLog('Searching for Studio...');
+      const conn = peer.connect(hostId, { reliable: true });
+
+      const timeout = setTimeout(() => {
+        try { conn.close(); } catch { /* ok */ }
+        hostCheckTimerRef.current = setTimeout(attempt, 1500);
+      }, 2000);
+
+      conn.on('open', () => {
+        clearTimeout(timeout);
+        try { conn.close(); } catch { /* ok */ }
+        addLog('Studio found — calling...');
+
+        const call = peer.call(hostId, stream, { metadata: { role: 'screen', room: roomId } });
+        callRef.current = call;
+
+        call.on('stream', () => {
+          setStatus('connected');
+          addLog('Connected!');
+        });
+        call.on('close', () => {
+          setStatus('connecting');
+          addLog('Call ended, retrying...');
+          hostCheckTimerRef.current = setTimeout(attempt, 2000);
+        });
+        call.on('error', (err) => {
+          setStatus('connecting');
+          addLog(`Call error: ${err.message}`);
+          hostCheckTimerRef.current = setTimeout(attempt, 2000);
+        });
+      });
+
+      conn.on('error', () => {
+        clearTimeout(timeout);
+        hostCheckTimerRef.current = setTimeout(attempt, 1500);
+      });
+    };
+
+    attempt();
+  }, [roomId, addLog]);
 
   const startSharing = async () => {
-    setStatus('requesting');
-    setErrorMsg('');
-
-    // getDisplayMedia is only available on desktop browsers and iOS Safari 16.4+.
-    // Android Chrome does not support it at all.
     if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
       setStatus('error');
-      setErrorMsg('Screen sharing is not supported on this device. Please use desktop Chrome, Firefox, or Safari on iOS 16.4 or later.');
+      setErrorMsg('Screen sharing is not supported on this device. Please use desktop Chrome, Firefox, or Safari on iOS 16.4+.');
       return;
     }
 
+    cleanup();
+    setStatus('requesting');
+    setErrorMsg('');
+
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30 }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30 }, width: { ideal: 1280 }, height: { ideal: 720 } } as MediaTrackConstraints,
         audio: false,
       });
-
-      streamRef.current = stream;
-      if (previewRef.current) {
-        previewRef.current.srcObject = stream;
-      }
-
-      setStatus('connecting');
-
-      // Use the same origin as the page — the QR code always encodes the LAN IP,
-      // so io() here connects to the local server that the Studio also uses.
-      const socket = io(window.location.origin);
-      socketRef.current = socket;
-      socket.emit('join-room', roomId);
-
-      const iceServers = [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-      ];
-
-      socket.on('user-joined', (peerId: string) => {
-        const peer = new SimplePeer({ initiator: true, trickle: false, stream, config: { iceServers } });
-        peerRef.current = peer;
-        peer.on('signal', (signal) => socket.emit('signal', { to: peerId, signal, roomId }));
-        peer.on('connect', () => setStatus('connected'));
-        peer.on('error', (err) => { setStatus('error'); setErrorMsg(err.message); });
-      });
-
-      socket.on('signal', ({ from, signal }: { from: string; signal: SimplePeer.SignalData }) => {
-        if (peerRef.current) {
-          peerRef.current.signal(signal);
-        } else {
-          const peer = new SimplePeer({ initiator: false, trickle: false, stream, config: { iceServers } });
-          peerRef.current = peer;
-          peer.signal(signal);
-          peer.on('signal', (s) => socket.emit('signal', { to: from, signal: s, roomId }));
-          peer.on('connect', () => setStatus('connected'));
-          peer.on('error', (err) => { setStatus('error'); setErrorMsg(err.message); });
-        }
-      });
-
-      // If user stops screen share from the browser UI
-      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
-        setStatus('idle');
-        cleanup();
-      });
-    } catch (err: any) {
+    } catch (err: unknown) {
       setStatus('error');
-      setErrorMsg(err?.message || 'Screen share was denied or not supported.');
+      setErrorMsg(err instanceof Error ? err.message : 'Screen share was denied or not supported.');
+      return;
     }
+
+    streamRef.current = stream;
+    if (previewRef.current) {
+      previewRef.current.srcObject = stream;
+      previewRef.current.play().catch(() => { /* autoplay ok */ });
+    }
+
+    // If user stops from browser UI
+    stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+      cleanup();
+      setStatus('idle');
+    });
+
+    setStatus('connecting');
+    addLog('Connecting to PeerJS cloud...');
+
+    const myId = clientPeerId(roomId);
+    const peer = new Peer(myId, {
+      debug: 0,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+        ],
+      },
+    });
+    peerRef.current = peer;
+
+    peer.on('open', () => {
+      addLog('Cloud ready');
+      startHostChecker(peer, stream!);
+    });
+
+    peer.on('disconnected', () => {
+      addLog('Cloud disconnected, reconnecting...');
+      try { (peer as any).reconnect?.(); } catch { /* ok */ }
+    });
+
+    peer.on('error', (err: any) => {
+      addLog(`Peer error: ${err.type || err.message}`);
+      if (err.type !== 'peer-unavailable') {
+        setStatus('error');
+        setErrorMsg(`PeerJS error: ${err.type || err.message}`);
+      }
+    });
   };
 
   const stopSharing = () => {
@@ -100,18 +163,10 @@ export default function PhoneScreenView() {
     setStatus('idle');
   };
 
-  const statusColor = {
-    idle: 'text-gray-400',
-    requesting: 'text-yellow-400',
-    connecting: 'text-yellow-400 animate-pulse',
-    connected: 'text-green-400',
-    error: 'text-red-400',
-  }[status];
-
   const statusLabel = {
     idle: 'Not sharing',
     requesting: 'Requesting permission...',
-    connecting: 'Connecting to Studio...',
+    connecting: 'Searching for Studio...',
     connected: 'LIVE — Screen is being shared',
     error: 'Error',
   }[status];
@@ -128,7 +183,7 @@ export default function PhoneScreenView() {
             <Monitor size={32} className="text-blue-400" />
           </div>
           <h1 className="text-2xl font-bold">Screen Share</h1>
-          <p className="text-gray-400 text-sm mt-2">Broadcast your phone screen to the Studio.</p>
+          <p className="text-gray-400 text-sm mt-2">Broadcast your screen to Aether Studio.</p>
           <p className="text-[11px] text-yellow-500/80 mt-2">
             Requires desktop Chrome / Firefox, or Safari on iOS 16.4+.<br />
             Not supported on Android Chrome.
@@ -136,10 +191,22 @@ export default function PhoneScreenView() {
         </div>
 
         {/* Status */}
-        <div className={`flex items-center justify-center gap-2 text-sm font-medium ${statusColor}`}>
+        <div className={`flex items-center justify-center gap-2 text-sm font-medium ${
+          status === 'connected' ? 'text-green-400' :
+          status === 'error' ? 'text-red-400' : 'text-gray-400'
+        }`}>
           {status === 'connected' ? <Wifi size={16} /> : <WifiOff size={16} />}
           <span>{statusLabel}</span>
         </div>
+
+        {/* Live log */}
+        {logs.length > 0 && status === 'connecting' && (
+          <div className="flex flex-col items-center gap-1">
+            {logs.map((l, i) => (
+              <span key={i} className="text-[10px] text-white/50 font-mono">{l}</span>
+            ))}
+          </div>
+        )}
 
         {/* Preview */}
         {(status === 'connecting' || status === 'connected') && (
@@ -155,7 +222,7 @@ export default function PhoneScreenView() {
         )}
 
         {/* Controls */}
-        {status === 'idle' || status === 'error' ? (
+        {(status === 'idle' || status === 'error') ? (
           <button
             onClick={startSharing}
             className="w-full py-4 rounded-xl font-bold text-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors flex items-center justify-center gap-2"

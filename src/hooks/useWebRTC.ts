@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import Peer from 'simple-peer';
+import PeerJS, { MediaConnection } from 'peerjs';
 import { Scene, Source, ServerLog, AudioChannel } from '../types';
 import { ROOM_ID, CLOUD_URL } from '../constants';
+import { hostPeerId } from '../utils/peerId';
 import { audioEngine } from '../lib/audioEngine';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'disconnected' | 'failed';
@@ -40,6 +42,7 @@ export function useWebRTC({
   const [peerStates, setPeerStates] = useState<Map<string, PeerConnectionState>>(new Map());
 
   const socketRef = useRef<Socket | null>(null);
+  const hostPeerRef = useRef<PeerJS | null>(null);
   // Second socket that bridges audience messages from the cloud when running in Tauri desktop.
   // Tauri's main socket connects to localhost:3001 (no audience phones reach that).
   // Phones send messages to the cloud Socket.io — this bridge subscribes there and forwards locally.
@@ -318,6 +321,80 @@ export function useWebRTC({
     iceTimersRef.current.clear();
   }, []);
 
+  // --- PeerJS Host (answers calls from phone camera / phone screen) ---
+  const setupHostPeer = useCallback(() => {
+    if (hostPeerRef.current) {
+      hostPeerRef.current.destroy();
+      hostPeerRef.current = null;
+    }
+
+    const hostId = hostPeerId(ROOM_ID);
+    const hostPeer = new PeerJS(hostId, {
+      debug: 0,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+        ],
+      },
+    });
+    hostPeerRef.current = hostPeer;
+
+    hostPeer.on('open', () => {
+      setServerLogsRef.current(prev => [
+        { message: `PeerJS host ready — waiting for phone connections`, type: 'info', id: Date.now() } as ServerLog,
+        ...prev,
+      ]);
+    });
+
+    hostPeer.on('call', (call: MediaConnection) => {
+      call.answer(); // answer without sending a stream back
+      const peerId = call.peer;
+
+      call.on('stream', (stream: MediaStream) => {
+        setRemoteStreams(prev => {
+          const next = new Map(prev);
+          next.set(peerId, stream);
+          return next;
+        });
+        setIsRemoteConnected(true);
+        setServerLogsRef.current(prev => [
+          { message: `Phone connected: ${call.metadata?.role ?? 'camera'} (${peerId.slice(-8)})`, type: 'info', id: Date.now() } as ServerLog,
+          ...prev,
+        ]);
+      });
+
+      call.on('close', () => {
+        setRemoteStreams(prev => {
+          const next = new Map(prev);
+          next.delete(peerId);
+          return next;
+        });
+      });
+
+      call.on('error', (err: Error) => {
+        console.error('PeerJS call error:', err);
+      });
+    });
+
+    hostPeer.on('disconnected', () => {
+      try { (hostPeer as any).reconnect?.(); } catch { /* ok */ }
+    });
+
+    hostPeer.on('error', (err: any) => {
+      // unavailable-id means another Studio instance already has this ID — retry after a delay
+      if (err.type === 'unavailable-id') {
+        setTimeout(setupHostPeer, 5000);
+      } else {
+        setServerLogsRef.current(prev => [
+          { message: `PeerJS error: ${err.type || err.message}`, type: 'error', id: Date.now() } as ServerLog,
+          ...prev,
+        ]);
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentionally stable
+  }, []);
+
   // --- Socket Signaling ---
   const reconnectSocket = useCallback(() => {
     // Clean up previous peers before reconnecting
@@ -433,10 +510,12 @@ export function useWebRTC({
 
   useEffect(() => {
     reconnectSocket();
+    setupHostPeer();
     return () => {
       destroyAllPeers();
       if (socketRef.current) socketRef.current.disconnect();
       if (audienceBridgeSocketRef.current) audienceBridgeSocketRef.current.disconnect();
+      if (hostPeerRef.current) { hostPeerRef.current.destroy(); hostPeerRef.current = null; }
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Must only run once on mount
   }, []);

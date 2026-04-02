@@ -62,21 +62,15 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   }, []);
 
   const isTauri = !!(window as any).__TAURI_INTERNALS__;
-  // localhost / 127.0.0.1 means the user is running the dev server locally in a browser;
-  // phones can't reach "localhost" so we use the LAN IP instead.
-  const isLocalhost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
   const cfg = MODE_CONFIG[activeMode];
 
-  // Pick the right base URL for camera/screen (WebRTC modes):
-  //   Tauri desktop or browser-at-localhost → LAN IP  (server is on this machine)
-  //   Browser at cloud URL                  → same origin (server is the cloud host)
-  // Audience:
-  //   Tauri → cloud URL  (bridge socket relays from cloud to local Studio)
-  //   browser → publicUrl if available, else LAN
-  const webrtcBase = (isTauri || isLocalhost) ? lanUrl : window.location.origin;
-  const audienceBase = isTauri ? (publicUrl || CLOUD_URL) : (publicUrl || lanUrl);
-  const baseUrl = activeMode === 'audience' ? audienceBase : webrtcBase;
-  const appUrl = baseUrl ? `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234` : '';
+  // Camera/screen use PeerJS cloud signaling — no LAN IP needed, any URL works.
+  // Audience uses Socket.io — must reach the cloud server.
+  //   Tauri desktop → CLOUD_URL (localhost:3001 is not reachable from phones)
+  //   browser → same origin
+  const audienceBase = isTauri ? (publicUrl || CLOUD_URL) : window.location.origin;
+  const baseUrl = activeMode === 'audience' ? audienceBase : window.location.origin;
+  const appUrl = `${baseUrl}?mode=${cfg.urlMode}&room=SLTN-1234`;
 
   const handleCopy = () => {
     if (!appUrl) return;
@@ -118,7 +112,7 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
           </div>
           <h2 className="text-xl font-bold text-white mb-2">Connect Your Phone</h2>
           <p className="text-sm text-gray-400 text-center max-w-md">
-            Make sure your phone is on the same Wi-Fi network, then scan the code below.
+            Scan the QR code below — works on any network.
           </p>
         </div>
 
@@ -206,7 +200,6 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
             <p className="text-sm text-gray-300 mb-4">{cfg.description}</p>
 
             <ol className="text-xs text-gray-400 space-y-3 mb-6 list-decimal list-inside">
-              <li>Connect your phone to the <strong className="text-white">same Wi-Fi</strong> as this computer.</li>
               <li>Open your phone camera and scan the QR code.</li>
               {activeMode === 'camera' && <li>Tap <strong className="text-white">Allow</strong> when asked for camera access.</li>}
               {activeMode === 'screen' && <li>Tap <strong className="text-white">Share Screen</strong> and select what to share.</li>}

@@ -20,7 +20,7 @@ export const AudienceLanding = () => {
       setRoomId(room);
     }
 
-    const newSocket = io();
+    const newSocket = io(window.location.origin);
     socketRef.current = newSocket;
 
     if (room) {
