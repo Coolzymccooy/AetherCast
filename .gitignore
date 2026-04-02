@@ -17,3 +17,6 @@ app-icon.png
 
 # Claude settings (may contain tokens)
 .claude/
+
+# APK binaries — deploy separately, don't track in git
+public/downloads/*.apk

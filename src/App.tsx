@@ -52,6 +52,9 @@ import RemoteCameraView from './components/RemoteCameraView';
 // --- Phone Screen Share View ---
 import PhoneScreenView from './components/PhoneScreenView';
 
+// --- App Download Page ---
+import AppDownload from './components/AppDownload';
+
 // --- Tauri type augmentation ---
 declare global {
   interface Window {
@@ -69,6 +72,7 @@ export default function App() {
   if (urlMode === 'remote') return <RemoteCameraView />;
   if (urlMode === 'screen') return <PhoneScreenView />;
   if (urlMode === 'audience') return <AudienceLanding />;
+  if (urlMode === 'download') return <AppDownload />;
   return <StudioView />;
 }
 

@@ -163,10 +163,7 @@ export default function PhoneScreenView() {
     // Browser path
     if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
       setStatus('error');
-      setErrorMsg(
-        'Screen sharing is not supported on mobile browsers. ' +
-        'Install the AetherCast app from the Studio QR code for Android screen sharing.'
-      );
+      setErrorMsg('DOWNLOAD_PROMPT');
       return;
     }
 
@@ -264,9 +261,22 @@ export default function PhoneScreenView() {
         )}
 
         {status === 'error' && errorMsg && (
-          <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm text-center">
-            {errorMsg}
-          </div>
+          errorMsg === 'DOWNLOAD_PROMPT' ? (
+            <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-xl text-center space-y-3">
+              <p className="text-blue-300 text-sm font-medium">Screen sharing requires the AetherCast app</p>
+              <p className="text-gray-400 text-xs">Mobile browsers can't share screens. Install the free Android app to broadcast your screen to Studio.</p>
+              <a
+                href="/?mode=download"
+                className="block w-full py-3 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm transition-colors"
+              >
+                Download AetherCast Camera
+              </a>
+            </div>
+          ) : (
+            <div className="p-4 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm text-center">
+              {errorMsg}
+            </div>
+          )
         )}
 
         {/* Controls */}
