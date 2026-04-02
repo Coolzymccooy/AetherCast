@@ -330,9 +330,9 @@ export function useWebRTC({
     let serverUrl: string | undefined = undefined;
 
     if (window.__TAURI_INTERNALS__) {
-      // Check if we're in dev mode (page loaded from localhost) or production (tauri:// protocol)
-      const isLocalDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-      serverUrl = isLocalDev ? undefined : 'https://aethercast.tiwaton.co.uk';
+      // tauri.localhost is the hostname in production Tauri builds (not just dev)
+      const isLocal = ['localhost', '127.0.0.1', 'tauri.localhost'].includes(window.location.hostname);
+      serverUrl = isLocal ? 'http://localhost:3001' : 'https://aethercast.tiwaton.co.uk';
     }
 
     const socket = io(serverUrl, {

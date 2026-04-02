@@ -10,12 +10,24 @@ interface GPUStreamStats {
   droppedFrames: number;
 }
 
+/** Convert ArrayBuffer to base64 string (chunked to avoid stack overflow) */
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += 8192) {
+    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 8192) as any));
+  }
+  return btoa(chunks.join(''));
+}
+
 /**
- * GPU Streaming hook — uses Tauri's Rust backend to pipe raw canvas frames
- * directly to FFmpeg with hardware encoding (NVENC/QSV/AMF/VideoToolbox).
+ * GPU Streaming hook — uses Tauri's Rust backend to pipe canvas frames
+ * directly to a local FFmpeg with hardware encoding (NVENC/QSV/AMF/VideoToolbox).
  *
- * Eliminates: MediaRecorder, Socket.io chunks, WebM re-encoding.
- * Pipeline: Canvas → getImageData → Tauri invoke → FFmpeg stdin → RTMP
+ * Pipeline: Canvas → JPEG blob → base64 → Tauri invoke → FFmpeg (image2pipe) → NVENC → RTMP
+ *
+ * This avoids: MediaRecorder, Socket.io, server-side re-encoding.
+ * JPEG compression reduces IPC payload from ~920KB/frame (raw RGBA) to ~30-60KB/frame.
  */
 export function useGPUStreaming() {
   const [isStreaming, setIsStreaming] = useState(false);
@@ -31,6 +43,7 @@ export function useGPUStreaming() {
   const sendingRef = useRef(false); // Prevents overlapping invoke calls
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fpsRef = useRef(30);
+  const scaleCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Detect GPU encoder on mount
   useEffect(() => {
@@ -58,16 +71,27 @@ export function useGPUStreaming() {
     }
 
     const { invoke } = await import('@tauri-apps/api/core');
-    const width = options?.width || canvas.width;
-    const height = options?.height || canvas.height;
-    const fps = options?.fps || 15; // 15fps for Tauri IPC — JSON serialization can't handle 30fps at full res
+
+    // Scale dimensions for FFmpeg — must match what we actually capture
+    // 640x360 is the sweet spot for Tauri IPC (JPEG ~30-60KB/frame)
+    const captureWidth = 640;
+    const captureHeight = 360;
+    const fps = options?.fps || 30; // JPEG compression makes 30fps feasible over IPC
     const bitrate = options?.bitrate || 6000;
     const encoder = options?.encoder || 'auto';
 
     fpsRef.current = fps;
     canvasRef.current = canvas;
 
-    // Start FFmpeg via Tauri
+    // Create/reuse offscreen canvas for scaling
+    if (!scaleCanvasRef.current) {
+      scaleCanvasRef.current = document.createElement('canvas');
+    }
+    scaleCanvasRef.current.width = captureWidth;
+    scaleCanvasRef.current.height = captureHeight;
+
+    // Start FFmpeg via Tauri — use MJPEG pipe input mode
+    // FFmpeg receives JPEG frames via image2pipe, encodes to H.264 with GPU, outputs to RTMP
     const result = await invoke('start_stream', {
       config: {
         destinations: destinations.map(d => ({
@@ -78,7 +102,12 @@ export function useGPUStreaming() {
           enabled: d.enabled,
           rtmp_url: d.rtmpUrl,
         })),
-        width, height, fps, bitrate, encoder,
+        width: captureWidth,
+        height: captureHeight,
+        fps,
+        bitrate,
+        encoder,
+        mode: 'jpeg', // Use MJPEG pipe input instead of raw RGBA
       },
     });
 
@@ -97,7 +126,7 @@ export function useGPUStreaming() {
       const elapsed = time - lastFrameTimeRef.current;
       if (elapsed >= frameDuration) {
         lastFrameTimeRef.current = time - (elapsed % frameDuration);
-        captureAndSendFrame(invoke, canvasRef.current, width, height);
+        captureAndSendFrame(invoke, canvasRef.current, captureWidth, captureHeight);
       }
 
       frameLoopRef.current = requestAnimationFrame(captureLoop);
@@ -123,32 +152,28 @@ export function useGPUStreaming() {
     try {
       sendingRef.current = true;
 
-      // Scale canvas down to 640x360 before reading pixels
-      // Full 1920x1080 = 8MB per frame — too large for Tauri IPC (JSON serialized)
-      // 640x360 = 921KB per frame — manageable at 15fps = ~14MB/s
-      const scaledW = 640;
-      const scaledH = 360;
-
-      // Use a shared offscreen canvas for scaling
-      if (!(window as any).__aether_scale_canvas) {
-        const sc = document.createElement('canvas');
-        sc.width = scaledW;
-        sc.height = scaledH;
-        (window as any).__aether_scale_canvas = sc;
-      }
-      const scaleCanvas = (window as any).__aether_scale_canvas as HTMLCanvasElement;
+      const scaleCanvas = scaleCanvasRef.current;
+      if (!scaleCanvas) return;
       const scaleCtx = scaleCanvas.getContext('2d', { willReadFrequently: true });
       if (!scaleCtx) return;
 
       // Draw scaled-down frame
-      scaleCtx.drawImage(canvas, 0, 0, scaledW, scaledH);
-      const imageData = scaleCtx.getImageData(0, 0, scaledW, scaledH);
+      scaleCtx.drawImage(canvas, 0, 0, width, height);
 
-      await invoke('encode_frame', {
-        frameData: Array.from(imageData.data),
-        width: scaledW,
-        height: scaledH,
-      });
+      // Convert to JPEG blob — hardware accelerated in most browsers
+      // ~30-60KB per frame at 640x360 vs 921KB raw RGBA
+      const blob = await new Promise<Blob | null>((resolve) =>
+        scaleCanvas.toBlob(resolve, 'image/jpeg', 0.85)
+      );
+      if (!blob) return;
+
+      // Convert to base64 for Tauri IPC
+      const buffer = await blob.arrayBuffer();
+      const base64 = arrayBufferToBase64(buffer);
+
+      // Send JPEG frame to Rust — base64 string (~40-80KB) instead of
+      // JSON number array (~3-4MB for raw RGBA)
+      await invoke('write_frame', { data: base64 });
 
       frameCountRef.current++;
 
@@ -162,8 +187,24 @@ export function useGPUStreaming() {
           fps: fpsRef.current,
         }));
       }
-    } catch (err) {
-      console.error('[GPU] Frame encode error:', err);
+    } catch (err: any) {
+      const errMsg = typeof err === 'string' ? err : err?.message || String(err);
+
+      // STREAM_DEAD = FFmpeg process has exited. Stop the frame loop immediately
+      // instead of spamming hundreds of failed write attempts.
+      if (errMsg.includes('STREAM_DEAD')) {
+        console.error('[GPU] FFmpeg process died — stopping frame loop');
+        if (frameLoopRef.current !== null) {
+          cancelAnimationFrame(frameLoopRef.current);
+          frameLoopRef.current = null;
+        }
+        canvasRef.current = null;
+        setIsStreaming(false);
+        setStats(prev => ({ ...prev, isActive: false }));
+        return;
+      }
+
+      console.error('[GPU] Frame encode error:', errMsg);
       droppedRef.current++;
     } finally {
       sendingRef.current = false;

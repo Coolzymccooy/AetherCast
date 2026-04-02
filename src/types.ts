@@ -125,7 +125,7 @@ export type AiSuggestion = {
   reason: string;
 };
 
-export type QrMode = 'camera' | 'audience';
+export type QrMode = 'camera' | 'screen' | 'audience';
 
 export type Graphics = {
   showBug: boolean;

@@ -48,6 +48,9 @@ import { AudienceLanding } from './components/AudienceLanding';
 // --- Remote Camera View ---
 import RemoteCameraView from './components/RemoteCameraView';
 
+// --- Phone Screen Share View ---
+import PhoneScreenView from './components/PhoneScreenView';
+
 // --- Tauri type augmentation ---
 declare global {
   interface Window {
@@ -63,6 +66,7 @@ export default function App() {
   const urlMode = params.get('mode');
 
   if (urlMode === 'remote') return <RemoteCameraView />;
+  if (urlMode === 'screen') return <PhoneScreenView />;
   if (urlMode === 'audience') return <AudienceLanding />;
   return <StudioView />;
 }
@@ -257,22 +261,27 @@ function StudioView() {
                 }
 
                 if (gpuStreaming.isAvailable) {
+                  // Desktop (Tauri) — use local GPU encoding via JPEG pipeline
+                  // No server-side FFmpeg needed; encoding happens locally with NVENC
                   const canvas = document.querySelector('canvas');
                   if (canvas) {
+                    const bitrate = streaming.encodingProfile === '1080p60' ? 6000 : streaming.encodingProfile === '720p30' ? 2500 : 4500;
                     gpuStreaming.startGPUStream(canvas as HTMLCanvasElement, activeDestinations, {
-                      width: 1920, height: 1080, fps: 30,
-                      bitrate: streaming.encodingProfile === '1080p60' ? 6000 : streaming.encodingProfile === '720p30' ? 2500 : 4500,
+                      // Width/height are set inside startGPUStream (640x360 for IPC)
+                      fps: 30,
+                      bitrate,
                     }).then((msg) => {
                       studio.setIsStreaming(true);
                       notify(`GPU Stream: ${msg}`, 'success');
                     }).catch((err) => {
                       console.error('[GPU] start_stream failed:', err);
-                      // GPU failed — fallback to browser streaming
-                      notify('GPU unavailable, using browser path', 'info');
-                      streaming.startStreaming(() => studio.setShowStreamSettings(true));
+                      // Don't auto-fallback to browser path — that triggers server-side FFmpeg
+                      // which crashes on weak servers. Show error and let user retry or use web mode.
+                      notify(`GPU stream failed: ${err?.message || err}. Check FFmpeg and retry.`, 'error');
                     });
                   }
                 } else {
+                  // Browser-only (web) — stream via Socket.io → server FFmpeg → RTMP
                   streaming.startStreaming(() => studio.setShowStreamSettings(true));
                 }
               }

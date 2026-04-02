@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Camera, Smartphone, Monitor, Brain, Activity, Sparkles,
   RefreshCw, AlertTriangle, ImageIcon as ImageIcon, Type,
@@ -160,6 +160,14 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
   proAudio, mediaPlayer, replay, midi,
 }) => {
   const TABS: DirectorTab[] = ['CAMO', 'PROP', 'IN', 'AI', 'OPS', 'AUD', 'FX', 'MED', 'RPL', 'MIDI'];
+
+  const [remoteUrl, setRemoteUrl] = useState<string>('');
+  useEffect(() => {
+    fetch('/api/local-ip')
+      .then(r => r.json())
+      .then(({ ip, port }: { ip: string; port: number }) => setRemoteUrl(`http://${ip}:${port}?mode=remote`))
+      .catch(() => setRemoteUrl(`${window.location.origin}?mode=remote`));
+  }, []);
 
   return (
     <div className="w-80 bg-panel border-l border-border flex flex-col shadow-2xl z-20">
@@ -421,9 +429,9 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
                       Open this URL on your phone to<br />connect as wireless camera:
                     </p>
                     <div className="w-full bg-black/40 p-2 rounded border border-white/5 text-[8px] font-mono break-all text-accent-cyan select-all">
-                      {window.location.origin}?mode=remote
+                      {remoteUrl}
                     </div>
-                    <button onClick={() => navigator.clipboard.writeText(`${window.location.origin}?mode=remote`)}
+                    <button onClick={() => navigator.clipboard.writeText(remoteUrl)}
                       className="w-full btn-hardware text-[10px] uppercase font-bold py-1.5">
                       Copy Link
                     </button>

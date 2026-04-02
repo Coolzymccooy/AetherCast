@@ -6,11 +6,136 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import ffmpeg from "fluent-ffmpeg";
-import { PassThrough } from "stream";
+import { PassThrough, Transform, TransformCallback } from "stream";
+import { spawn, ChildProcess } from "child_process";
 import crypto from "crypto";
+import os from "os";
 import dotenv from "dotenv";
 
 dotenv.config();
+
+// ──────────────────────────────────────────────────────────────────────────────
+// fMP4 → raw H.264 Annex B demuxer
+// ──────────────────────────────────────────────────────────────────────────────
+// Chrome's MediaRecorder with video/mp4;codecs=avc1 produces fragmented MP4.
+// FFmpeg's MP4 demuxer crashes reading fMP4 from pipe (it tries to seek).
+// This Transform parses ISO BMFF boxes, extracts H.264 NAL units from mdat,
+// and converts AVCC (length-prefixed) to Annex B (start-code-prefixed).
+// Feed the output to FFmpeg with: -f h264 -framerate 30 -i pipe:0
+
+const ANNEXB_START_CODE = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+
+class FMP4Demuxer extends Transform {
+  private pending = Buffer.alloc(0);
+  private nalLenSize = 4;     // AVCC NAL length field size (from avcC, almost always 4)
+  private sps: Buffer | null;
+  private pps: Buffer | null;
+  private headerSent = false;
+
+  constructor(cachedSPS?: Buffer | null, cachedPPS?: Buffer | null) {
+    super();
+    this.sps = cachedSPS || null;
+    this.pps = cachedPPS || null;
+    if (this.sps) this.headerSent = false; // will send cached SPS/PPS before first mdat
+  }
+
+  _transform(chunk: Buffer, _: string, done: TransformCallback) {
+    this.pending = Buffer.concat([this.pending, chunk]);
+    try {
+      this.drainBoxes();
+    } catch (err) {
+      console.error('[fMP4] Parse error, passing raw chunk:', (err as Error).message);
+    }
+    done();
+  }
+
+  private drainBoxes() {
+    while (this.pending.length >= 8) {
+      const boxSize = this.pending.readUInt32BE(0);
+      if (boxSize < 8) { this.pending = this.pending.subarray(8); continue; }
+      if (boxSize > this.pending.length) return; // incomplete box, wait for more data
+
+      const boxType = this.pending.toString('ascii', 4, 8);
+      const boxPayload = this.pending.subarray(8, boxSize);
+      this.pending = this.pending.subarray(boxSize);
+
+      if (boxType === 'moov') {
+        console.log(`[fMP4] moov box: ${boxPayload.length}B`);
+        this.handleMoov(boxPayload);
+      } else if (boxType === 'mdat') {
+        this.handleMdat(boxPayload);
+      }
+      // Skip: ftyp, styp, moof, sidx, free, etc.
+    }
+  }
+
+  /** Scan moov for avcC box to extract SPS, PPS, and NAL length size */
+  private handleMoov(data: Buffer) {
+    // Scan for 'avcC' signature anywhere in moov hierarchy
+    // (avoids complex recursive box parsing)
+    for (let i = 0; i <= data.length - 8; i++) {
+      if (data[i+4] === 0x61 && data[i+5] === 0x76 &&
+          data[i+6] === 0x63 && data[i+7] === 0x43) { // 'avcC'
+        const size = data.readUInt32BE(i);
+        if (size >= 15 && i + size <= data.length) {
+          this.parseAvcC(data.subarray(i + 8, i + size));
+          // Emit codec data for caching (used on watchdog restarts)
+          this.emit('codec-data', { sps: this.sps, pps: this.pps });
+        }
+        break;
+      }
+    }
+  }
+
+  /** Parse avcC box: extract SPS, PPS, NAL length size */
+  private parseAvcC(d: Buffer) {
+    if (d.length < 7) return;
+    this.nalLenSize = (d[4] & 0x03) + 1;
+
+    let off = 5;
+    // SPS
+    const nSPS = d[off++] & 0x1f;
+    for (let i = 0; i < nSPS && off + 2 <= d.length; i++) {
+      const len = d.readUInt16BE(off); off += 2;
+      if (off + len <= d.length) { this.sps = Buffer.from(d.subarray(off, off + len)); off += len; }
+    }
+    // PPS
+    if (off < d.length) {
+      const nPPS = d[off++];
+      for (let i = 0; i < nPPS && off + 2 <= d.length; i++) {
+        const len = d.readUInt16BE(off); off += 2;
+        if (off + len <= d.length) { this.pps = Buffer.from(d.subarray(off, off + len)); off += len; }
+      }
+    }
+    console.log(`[fMP4→H.264] avcC parsed: nalLenSize=${this.nalLenSize}, SPS=${this.sps?.length || 0}B, PPS=${this.pps?.length || 0}B`);
+  }
+
+  /** Convert AVCC NAL units in mdat to Annex B format */
+  private handleMdat(payload: Buffer) {
+    // Emit SPS/PPS before first frame (from moov or cache)
+    if (!this.headerSent && this.sps) {
+      this.push(ANNEXB_START_CODE); this.push(this.sps);
+      if (this.pps) { this.push(ANNEXB_START_CODE); this.push(this.pps); }
+      this.headerSent = true;
+    }
+
+    // Parse AVCC NAL units: [nalLenSize bytes: length][length bytes: NAL data]
+    let off = 0;
+    while (off + this.nalLenSize <= payload.length) {
+      let nalLen = 0;
+      for (let i = 0; i < this.nalLenSize; i++) {
+        nalLen = (nalLen << 8) | payload[off + i];
+      }
+      off += this.nalLenSize;
+      if (nalLen <= 0 || off + nalLen > payload.length) break;
+
+      // Replace length prefix with Annex B start code
+      this.push(ANNEXB_START_CODE);
+      this.push(payload.subarray(off, off + nalLen));
+      off += nalLen;
+    }
+  }
+}
 
 // ── Set FFmpeg path explicitly so it works without restarting the terminal ───
 const FFMPEG_PATHS = [
@@ -23,6 +148,14 @@ for (const p of FFMPEG_PATHS) {
   if (fs.existsSync(p)) {
     ffmpeg.setFfmpegPath(p);
     console.log(`FFmpeg found at: ${p}`);
+    break;
+  }
+}
+// Store the resolved FFmpeg path for direct spawn use
+let resolvedFFmpegPath = 'ffmpeg';
+for (const p of FFMPEG_PATHS) {
+  if (fs.existsSync(p)) {
+    resolvedFFmpegPath = p;
     break;
   }
 }
@@ -77,7 +210,7 @@ class RateLimiter {
 }
 
 const messageLimiter = new RateLimiter(60_000, 30); // 30 messages per minute
-const chunkLimiter = new RateLimiter(1_000, 10);    // 10 chunks per second
+const chunkLimiter = new RateLimiter(1_000, 60);    // 60 chunks per second — enough for 30fps without dropping WebM headers
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Stream Session Types
@@ -145,10 +278,15 @@ async function startServer() {
     console.log("User connected:", socket.id);
     let ffmpegProcess: any = null;
     let inputStream: PassThrough | null = null;
+    let fmp4Demuxer: FMP4Demuxer | null = null;
+
+    // ── Cached H.264 codec data (SPS/PPS) for watchdog restarts ──────────
+    let cachedSPS: Buffer | null = null;
+    let cachedPPS: Buffer | null = null;
 
     // ── Stream Session State ──────────────────────────────────────────────
     let currentSession: StreamSession | null = null;
-    let lastStartData: { destinations: any[]; encodingProfile: string } | null = null;
+    let lastStartData: { destinations: any[]; encodingProfile: string; browserH264?: boolean; mimeType?: string } | null = null;
     let destinationHealthMap: Map<string, DestinationHealth> = new Map();
 
     // ── Backpressure State ────────────────────────────────────────────────
@@ -242,11 +380,8 @@ async function startServer() {
       }
     }
 
-    // ── Helper: spawn FFmpeg with current config ─────────────────────────
-    function spawnFFmpeg(data: { destinations: any[]; encodingProfile: string }) {
-      const { destinations, encodingProfile } = data;
-
-      // Validate and classify destinations by protocol
+    // ── Helper: classify destinations by protocol ───────────────────────
+    function classifyDestinations(destinations: any[]) {
       const rtmpDests: any[] = [];
       const srtDests: any[] = [];
       const ristDests: any[] = [];
@@ -255,12 +390,12 @@ async function startServer() {
         const url = dest.rtmpUrl || dest.url || '';
         if (typeof url !== 'string' || !url) {
           socket.emit('server-log', { message: `Invalid destination: missing URL`, type: 'error' });
-          return false;
+          return null;
         }
         if (/^rtmps?:\/\//.test(url)) {
           if (!dest.streamKey || typeof dest.streamKey !== 'string') {
             socket.emit('server-log', { message: `RTMP destination "${dest.name}" missing stream key`, type: 'error' });
-            return false;
+            return null;
           }
           rtmpDests.push(dest);
         } else if (/^srt:\/\//.test(url)) {
@@ -269,9 +404,105 @@ async function startServer() {
           ristDests.push(dest);
         } else {
           socket.emit('server-log', { message: `Unsupported protocol in URL: ${url.substring(0, 30)}`, type: 'error' });
-          return false;
+          return null;
         }
       }
+      return { rtmpDests, srtDests, ristDests };
+    }
+
+    // ── Helper: build output URL(s) for destinations ──────────────────
+    function buildOutputArgs(rtmpDests: any[], srtDests: any[], ristDests: any[]): string[] {
+      const teeSegments: string[] = [];
+
+      for (const dest of rtmpDests) {
+        // Strip librtmp-style "key=" prefix if someone pasted it — FFmpeg's internal RTMP handler rejects it
+        const cleanKey = (dest.streamKey || '').replace(/^key=/i, '');
+        const url = `${(dest.rtmpUrl || dest.url).replace(/\/$/, '')}/${cleanKey}`;
+        teeSegments.push(`[f=flv:onfail=ignore]${url}`);
+      }
+
+      for (const dest of srtDests) {
+        let srtUrl = dest.url || dest.rtmpUrl;
+        if (!srtUrl.includes('mode=')) {
+          srtUrl += (srtUrl.includes('?') ? '&' : '?') + 'mode=caller';
+        }
+        if (dest.streamKey) {
+          srtUrl += `&passphrase=${dest.streamKey}`;
+        }
+        if (!srtUrl.includes('latency=')) {
+          srtUrl += '&latency=200000';
+        }
+        teeSegments.push(`[f=mpegts:onfail=ignore]${srtUrl}`);
+      }
+
+      for (const dest of ristDests) {
+        const ristUrl = dest.url || dest.rtmpUrl;
+        teeSegments.push(`[f=mpegts:onfail=ignore]${ristUrl}`);
+      }
+
+      if (teeSegments.length === 1) {
+        const segment = teeSegments[0];
+        const formatMatch = segment.match(/\[f=(\w+)/);
+        const urlMatch = segment.match(/\](.+)$/);
+        const format = formatMatch?.[1] || 'flv';
+        const url = urlMatch?.[1] || '';
+        return ['-f', format, url];
+      } else {
+        return ['-f', 'tee', teeSegments.join('|')];
+      }
+    }
+
+    // ── Helper: attach process event handlers ─────────────────────────
+    function attachFFmpegHandlers(proc: ChildProcess) {
+      proc.stderr?.on('data', (data: Buffer) => {
+        const lines = data.toString().split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed) {
+            console.log('FFmpeg:', trimmed);
+            // Surface stderr to the UI panel so we can see WHY FFmpeg crashes
+            // Filter out noisy progress lines (they go through parseStderrLine)
+            if (!trimmed.startsWith('frame=') && !trimmed.startsWith('size=')) {
+              socket.emit('server-log', { message: `[ffmpeg] ${trimmed}`, type: trimmed.toLowerCase().includes('error') ? 'error' : 'ffmpeg' });
+            }
+            parseStderrLine(trimmed);
+          }
+        }
+      });
+
+      proc.on('error', (err: Error) => {
+        console.error('FFmpeg process error:', err.message);
+        socket.emit('server-log', { message: `FFmpeg Error: ${err.message}`, type: 'error' });
+        if (currentSession) {
+          currentSession.errors.push({ time: Date.now(), message: err.message });
+        }
+        ffmpegProcess = null;
+        if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
+        if (inputStream) { inputStream.destroy(); inputStream = null; }
+        if (!intentionallyStopped && lastStartData) {
+          attemptRestart();
+        }
+      });
+
+      proc.on('exit', (code: number | null) => {
+        console.log(`FFmpeg exited with code ${code}`);
+        socket.emit('server-log', { message: `FFmpeg exited (code ${code})`, type: code === 0 ? 'info' : 'error' });
+        ffmpegProcess = null;
+        if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
+        if (inputStream) { inputStream.destroy(); inputStream = null; }
+        if (!intentionallyStopped && lastStartData) {
+          attemptRestart();
+        }
+      });
+    }
+
+    // ── Helper: spawn FFmpeg with current config ─────────────────────────
+    function spawnFFmpeg(data: { destinations: any[]; encodingProfile: string }) {
+      const { destinations, encodingProfile } = data;
+
+      const classified = classifyDestinations(destinations);
+      if (!classified) return false;
+      const { rtmpDests, srtDests, ristDests } = classified;
 
       const totalDests = rtmpDests.length + srtDests.length + ristDests.length;
       console.log(`Streaming to ${totalDests} destinations (RTMP: ${rtmpDests.length}, SRT: ${srtDests.length}, RIST: ${ristDests.length})`);
@@ -280,7 +511,6 @@ async function startServer() {
       inputStream = new PassThrough();
       backpressureActive = false;
 
-      // Wire up drain event for backpressure release
       inputStream.on('drain', () => {
         backpressureActive = false;
       });
@@ -293,67 +523,93 @@ async function startServer() {
         socket.emit('destination-status', health);
       }
 
-      // Select encoding profile
-      const profile = encodingProfile || '1080p60';
-      const profiles: Record<string, string[]> = {
-        '1080p60': [
-          '-preset veryfast', '-tune zerolatency', '-threads 0',
-          '-g 120', '-keyint_min 120', '-sc_threshold 0',
-          '-b:v 6000k', '-maxrate 6000k', '-bufsize 12000k',
-          '-pix_fmt yuv420p', '-profile:v high', '-level 4.2',
-          '-r 60', '-b:a 160k', '-ar 44100'
-        ],
-        '1080p30': [
-          '-preset veryfast', '-tune zerolatency', '-threads 0',
-          '-g 60', '-keyint_min 60', '-sc_threshold 0',
-          '-b:v 4500k', '-maxrate 4500k', '-bufsize 9000k',
-          '-pix_fmt yuv420p', '-profile:v high', '-level 4.1',
-          '-r 30', '-b:a 160k', '-ar 44100'
-        ],
-        '720p30': [
-          '-preset veryfast', '-tune zerolatency', '-threads 0',
-          '-g 60', '-keyint_min 60', '-sc_threshold 0',
-          '-b:v 2500k', '-maxrate 2500k', '-bufsize 5000k',
-          '-pix_fmt yuv420p', '-profile:v main', '-level 3.1',
-          '-vf scale=1280:720', '-r 30', '-b:a 128k', '-ar 44100'
-        ],
-        '480p30': [
-          '-preset veryfast', '-tune zerolatency', '-threads 0',
-          '-g 60', '-keyint_min 60', '-sc_threshold 0',
-          '-b:v 1000k', '-maxrate 1000k', '-bufsize 2000k',
-          '-pix_fmt yuv420p', '-profile:v baseline', '-level 3.0',
-          '-vf scale=854:480', '-r 30', '-b:a 96k', '-ar 44100'
-        ],
-      };
-      const encOpts = profiles[profile] || profiles['1080p60'];
-
       // Check if browser is sending H.264 (can be copied without re-encoding)
       const browserH264 = (data as any).browserH264 === true;
-      const inputMime = (data as any).mimeType || 'video/webm';
-      const inputFormat = inputMime.startsWith('video/mp4') ? 'mp4' : 'webm';
-
-      let command;
+      const outputArgs = buildOutputArgs(rtmpDests, srtDests, ristDests);
 
       if (browserH264) {
-        // H.264 from browser — COPY the video codec (zero CPU cost!)
-        console.log('[stream] Browser sent H.264 — using codec copy (zero CPU)');
+        // ═══════════════════════════════════════════════════════════════
+        // H.264 CODEC COPY PATH
+        //
+        // Chrome sends fMP4 (fragmented MP4) from MediaRecorder.
+        // FFmpeg's MP4 demuxer crashes reading fMP4 from pipe (it seeks).
+        //
+        // Fix: Parse fMP4 in Node.js → extract raw H.264 NAL units
+        // (Annex B) → feed to FFmpeg as -f h264. The raw H.264 parser
+        // is simple and works perfectly with pipes.
+        //
+        // Pipeline: fMP4 chunks → FMP4Demuxer → Annex B H.264 → FFmpeg
+        //           → codec copy to FLV → RTMP (zero CPU encoding)
+        // ═══════════════════════════════════════════════════════════════
+        console.log('[stream] Browser sent H.264 — using fMP4 demuxer + codec copy (zero CPU)');
         socket.emit('server-log', { message: 'Using codec copy — zero CPU encoding', type: 'success' });
 
-        command = ffmpeg(inputStream)
-          .inputFormat(inputFormat)
-          .videoCodec('copy')  // No re-encoding! Just remux to FLV
-          .noAudio()
-          .outputOptions(['-flvflags no_duration_filesize']);
+        // Create fMP4 demuxer (with cached SPS/PPS for watchdog restarts)
+        fmp4Demuxer = new FMP4Demuxer(cachedSPS, cachedPPS);
+        fmp4Demuxer.on('codec-data', (data: { sps: Buffer; pps: Buffer }) => {
+          cachedSPS = data.sps;
+          cachedPPS = data.pps;
+        });
+
+        const args = [
+          '-y', '-hide_banner', '-loglevel', 'warning',
+          // Raw H.264 Annex B input from pipe (output of our fMP4 demuxer)
+          '-f', 'h264',
+          '-framerate', '30',  // MediaRecorder captures at 30fps from captureStream(30)
+          '-i', 'pipe:0',
+          // Silent audio source — YouTube/Twitch require an audio track
+          '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
+          // Map video and audio
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-c:v', 'copy',       // Zero CPU — just remux the H.264 NAL units
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-ar', '44100',
+          '-shortest',
+          '-flags', '+global_header',
+          '-flvflags', 'no_duration_filesize',
+          ...outputArgs,
+        ];
+
+        console.log(`FFmpeg command: ${resolvedFFmpegPath} ${args.join(' ')}`);
+        socket.emit('server-log', { message: 'FFmpeg started (H.264 codec copy via fMP4 demuxer)', type: 'success' });
+
+        const proc = spawn(resolvedFFmpegPath, args, {
+          stdio: ['pipe', 'ignore', 'pipe'],
+        });
+
+        // Pipeline: inputStream → fMP4Demuxer → FFmpeg stdin
+        // fMP4Demuxer converts fragmented MP4 to raw H.264 Annex B
+        inputStream.pipe(fmp4Demuxer).pipe(proc.stdin!);
+
+        proc.stdin!.on('error', (err) => {
+          if ((err as any).code !== 'EPIPE') {
+            console.error('FFmpeg stdin error:', err.message);
+          }
+        });
+
+        fmp4Demuxer.on('error', (err) => {
+          console.error('[fMP4] Demuxer error:', err.message);
+        });
+
+        attachFFmpegHandlers(proc);
+        ffmpegProcess = proc;
+
+        if (srtDests.length > 0) socket.emit('server-log', { message: `SRT: ${srtDests.length} destination(s) connected`, type: 'info' });
+        if (ristDests.length > 0) socket.emit('server-log', { message: `RIST: ${ristDests.length} destination(s) connected`, type: 'info' });
+
       } else {
-        // VP8 from browser — must re-encode to H.264 for RTMP
-        // Use absolute minimum settings to prevent server CPU overload
+        // ═══════════════════════════════════════════════════════════════
+        // VP8 RE-ENCODE PATH — uses fluent-ffmpeg (unchanged)
+        // Server must transcode VP8→H.264, limited to 480p15 on weak CPU
+        // ═══════════════════════════════════════════════════════════════
         console.log('[stream] Browser sent VP8 — re-encoding to H.264 (CPU intensive)');
         socket.emit('server-log', { message: 'Re-encoding VP8→H.264 (CPU intensive)', type: 'warning' });
 
-        command = ffmpeg(inputStream)
+        let command = ffmpeg(inputStream)
           .inputFormat('webm')
           .videoCodec('libx264')
-          .noAudio()
           .outputOptions([
             '-preset ultrafast',
             '-tune zerolatency',
@@ -367,107 +623,63 @@ async function startServer() {
             '-threads 1',
             '-profile:v baseline',
           ]);
-      }
 
-      // Build tee output string for multi-destination
-      const teeSegments: string[] = [];
-
-      // RTMP destinations
-      for (const dest of rtmpDests) {
-        const url = `${(dest.rtmpUrl || dest.url).replace(/\/$/, '')}/${dest.streamKey}`;
-        teeSegments.push(`[f=flv:onfail=ignore]${url}`);
-      }
-
-      // SRT destinations — uses MPEG-TS over SRT
-      for (const dest of srtDests) {
-        let srtUrl = dest.url || dest.rtmpUrl;
-        // Append SRT options if not already present
-        if (!srtUrl.includes('mode=')) {
-          srtUrl += (srtUrl.includes('?') ? '&' : '?') + 'mode=caller';
-        }
-        if (dest.streamKey) {
-          srtUrl += `&passphrase=${dest.streamKey}`;
-        }
-        if (!srtUrl.includes('latency=')) {
-          srtUrl += '&latency=200000'; // 200ms default latency
-        }
-        teeSegments.push(`[f=mpegts:onfail=ignore]${srtUrl}`);
-      }
-
-      // RIST destinations — uses MPEG-TS over RIST
-      for (const dest of ristDests) {
-        const ristUrl = dest.url || dest.rtmpUrl;
-        teeSegments.push(`[f=mpegts:onfail=ignore]${ristUrl}`);
-      }
-
-      // For single destination: output directly (more reliable than tee muxer)
-      // For multiple destinations: use tee muxer with failure isolation
-      if (teeSegments.length === 1) {
-        // Single destination — direct output
-        const segment = teeSegments[0];
-        // Parse format and URL from tee segment: [f=flv:onfail=ignore]rtmp://...
-        const formatMatch = segment.match(/\[f=(\w+)/);
-        const urlMatch = segment.match(/\](.+)$/);
-        const format = formatMatch?.[1] || 'flv';
-        const url = urlMatch?.[1] || '';
-
+        // Add silent audio for RTMP compatibility
         command = command
-          .format(format)
-          .outputOptions(['-map 0:v', '-map 0:a?', '-flags +global_header'])
-          .output(url);
+          .input('anullsrc=r=44100:cl=stereo')
+          .inputFormat('lavfi')
+          .audioCodec('aac')
+          .audioBitrate('96k')
+          .outputOptions(['-ar 44100', '-shortest']);
 
-        socket.emit('server-log', { message: `Direct output: ${format} → ${url.substring(0, 40)}...`, type: 'info' });
-      } else {
-        // Multiple destinations — use tee muxer
-        const teeOutputs = teeSegments.join('|');
-        command = command
-          .format('tee')
-          .outputOptions(['-map 0:v', '-map 0:a?', '-flags +global_header'])
-          .output(teeOutputs);
+        if (outputArgs[1] === 'tee') {
+          command = command
+            .format('tee')
+            .outputOptions(['-map 0:v', '-map 1:a', '-flags +global_header'])
+            .output(outputArgs[2]);
+        } else {
+          command = command
+            .format(outputArgs[1])
+            .outputOptions(['-map 0:v', '-map 1:a', '-flags +global_header'])
+            .output(outputArgs[2]);
+        }
+
+        ffmpegProcess = command
+          .on('start', (commandLine) => {
+            console.log('FFmpeg started with command: ' + commandLine);
+            socket.emit('server-log', { message: 'FFmpeg started successfully', type: 'success' });
+            if (srtDests.length > 0) socket.emit('server-log', { message: `SRT: ${srtDests.length} destination(s) connected`, type: 'info' });
+            if (ristDests.length > 0) socket.emit('server-log', { message: `RIST: ${ristDests.length} destination(s) connected`, type: 'info' });
+          })
+          .on('stderr', (stderrLine: string) => {
+            console.log('FFmpeg:', stderrLine);
+            parseStderrLine(stderrLine);
+          })
+          .on('error', (err: Error) => {
+            console.error('FFmpeg error:', err.message);
+            socket.emit('server-log', { message: `FFmpeg Error: ${err.message}`, type: 'error' });
+            if (currentSession) {
+              currentSession.errors.push({ time: Date.now(), message: err.message });
+            }
+            ffmpegProcess = null;
+            if (inputStream) { inputStream.destroy(); inputStream = null; }
+            if (!intentionallyStopped && lastStartData) {
+              attemptRestart();
+            }
+          })
+          .on('end', () => {
+            console.log('FFmpeg process ended');
+            socket.emit('server-log', { message: 'FFmpeg process ended', type: 'info' });
+            ffmpegProcess = null;
+            if (inputStream) { inputStream.destroy(); inputStream = null; }
+            if (!intentionallyStopped && lastStartData) {
+              attemptRestart();
+            }
+          });
+
+        ffmpegProcess.run();
       }
 
-      ffmpegProcess = command
-        .on('start', (commandLine) => {
-          console.log('FFmpeg started with command: ' + commandLine);
-          socket.emit('server-log', { message: 'FFmpeg started successfully', type: 'success' });
-          // Log protocol breakdown
-          if (srtDests.length > 0) socket.emit('server-log', { message: `SRT: ${srtDests.length} destination(s) connected`, type: 'info' });
-          if (ristDests.length > 0) socket.emit('server-log', { message: `RIST: ${ristDests.length} destination(s) connected`, type: 'info' });
-        })
-        .on('stderr', (stderrLine: string) => {
-          // Log all FFmpeg output to console for debugging
-          console.log('FFmpeg:', stderrLine);
-          parseStderrLine(stderrLine);
-        })
-        .on('error', (err: Error) => {
-          console.error('FFmpeg error:', err.message);
-          socket.emit('server-log', { message: `FFmpeg Error: ${err.message}`, type: 'error' });
-          if (currentSession) {
-            currentSession.errors.push({ time: Date.now(), message: err.message });
-          }
-
-          ffmpegProcess = null;
-          if (inputStream) { inputStream.destroy(); inputStream = null; }
-
-          // Watchdog: attempt restart if not intentionally stopped
-          if (!intentionallyStopped && lastStartData) {
-            attemptRestart();
-          }
-        })
-        .on('end', () => {
-          console.log('FFmpeg process ended');
-          socket.emit('server-log', { message: 'FFmpeg process ended', type: 'info' });
-
-          ffmpegProcess = null;
-          if (inputStream) { inputStream.destroy(); inputStream = null; }
-
-          // Watchdog: if not intentionally stopped, treat as unexpected death
-          if (!intentionallyStopped && lastStartData) {
-            attemptRestart();
-          }
-        });
-
-      ffmpegProcess.run();
       return true;
     }
 
@@ -570,8 +782,14 @@ async function startServer() {
       backpressureActive = false;
       destinationHealthMap.clear();
 
-      // Store config for watchdog restarts
-      lastStartData = { destinations, encodingProfile: encodingProfile || '1080p60' };
+      // Store config for watchdog restarts — include browserH264 and mimeType so
+      // restarts use the same codec path
+      lastStartData = {
+        destinations,
+        encodingProfile: encodingProfile || '1080p60',
+        browserH264: data.browserH264,
+        mimeType: data.mimeType,
+      };
 
       // Initialize stream session
       currentSession = {
@@ -681,13 +899,22 @@ async function startServer() {
       }
     });
 
+    // Helper to kill FFmpeg regardless of whether it's a ChildProcess or fluent-ffmpeg instance
+    function killFFmpeg() {
+      if (!ffmpegProcess) return;
+      try {
+        if (typeof ffmpegProcess.kill === 'function') {
+          ffmpegProcess.kill('SIGINT');
+        }
+      } catch { /* already dead */ }
+      ffmpegProcess = null;
+    }
+
     socket.on("stop-stream", () => {
       intentionallyStopped = true;
       if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
-      if (ffmpegProcess) {
-        ffmpegProcess.kill('SIGINT');
-        ffmpegProcess = null;
-      }
+      killFFmpeg();
+      if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
       if (inputStream) { inputStream.destroy(); inputStream = null; }
       console.log('Streaming stopped');
       finalizeSession();
@@ -699,13 +926,30 @@ async function startServer() {
       chunkLimiter.remove(socket.id);
       intentionallyStopped = true;
       if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
-      if (ffmpegProcess) {
-        ffmpegProcess.kill('SIGINT');
-        ffmpegProcess = null;
-      }
+      killFFmpeg();
+      if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
       if (inputStream) { inputStream.destroy(); inputStream = null; }
       finalizeSession();
     });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────────
+  // Local network IP — used by QR modal so phones can reach this server
+  // ──────────────────────────────────────────────────────────────────────────────
+
+  app.get('/api/local-ip', (_req, res) => {
+    const nets = os.networkInterfaces();
+    let localIp = '127.0.0.1';
+    for (const iface of Object.values(nets)) {
+      for (const alias of iface ?? []) {
+        if (alias.family === 'IPv4' && !alias.internal) {
+          localIp = alias.address;
+          break;
+        }
+      }
+      if (localIp !== '127.0.0.1') break;
+    }
+    res.json({ ip: localIp, port: PORT });
   });
 
   // ──────────────────────────────────────────────────────────────────────────────
