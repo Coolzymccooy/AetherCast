@@ -6,6 +6,8 @@ import android.content.Intent;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 
+import androidx.activity.result.ActivityResult;
+
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -36,7 +38,7 @@ public class ScreenCapturePlugin extends Plugin {
     }
 
     @ActivityCallback
-    private void handleMediaProjectionResult(PluginCall call, com.getcapacitor.ActivityResult result) {
+    private void handleMediaProjectionResult(PluginCall call, ActivityResult result) {
         if (result.getResultCode() != Activity.RESULT_OK) {
             call.reject("Screen capture permission denied");
             return;
