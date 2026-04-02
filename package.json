@@ -15,9 +15,16 @@
     "docker:build": "docker build -t aether-studio .",
     "docker:run": "docker run -p 3001:3001 --env-file .env aether-studio",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "mobile:init": "npx cap add android",
+    "mobile:sync": "npm run build && npx cap sync android",
+    "mobile:open": "npx cap open android",
+    "mobile:build": "npm run build && npx cap sync android && npx cap build android"
   },
   "dependencies": {
+    "@capacitor/android": "^8.3.0",
+    "@capacitor/cli": "^8.3.0",
+    "@capacitor/core": "^8.3.0",
     "@google/genai": "^1.29.0",
     "@tailwindcss/vite": "^4.1.14",
     "@tauri-apps/api": "^2.10.1",

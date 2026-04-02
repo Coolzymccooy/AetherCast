@@ -934,6 +934,30 @@ async function startServer() {
   });
 
   // ──────────────────────────────────────────────────────────────────────────────
+  // Android App Links verification — allows the AetherCast APK to intercept
+  // QR code links directly (no "Open with Chrome/AetherCast" chooser dialog).
+  // Android fetches this file when the APK is installed to verify ownership.
+  // Replace the sha256_cert_fingerprints value with your APK's release signing
+  // certificate fingerprint (Android Studio → Build → Generate Signed APK,
+  // then: keytool -list -v -keystore your.keystore | grep SHA256)
+  // ──────────────────────────────────────────────────────────────────────────────
+
+  app.get('/.well-known/assetlinks.json', (_req, res) => {
+    res.json([{
+      relation: ['delegate_permission/common.handle_all_urls'],
+      target: {
+        namespace: 'android_app',
+        package_name: 'com.selton.studio',
+        // TODO: replace with your actual APK release signing certificate SHA256
+        // Get it with: keytool -list -v -keystore release.keystore | grep SHA256
+        sha256_cert_fingerprints: [
+          process.env.APK_CERT_FINGERPRINT ?? 'REPLACE_WITH_YOUR_SHA256_CERT_FINGERPRINT',
+        ],
+      },
+    }]);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────────
   // Local network IP — used by QR modal so phones can reach this server
   // ──────────────────────────────────────────────────────────────────────────────
 
