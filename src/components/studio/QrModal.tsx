@@ -47,11 +47,11 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
   useEffect(() => {
     fetch('/api/local-ip')
       .then(r => r.json())
-      .then(({ ip, port }: { ip: string; port: number }) => {
-        setServerUrl(`http://${ip}:${port}`);
+      .then(({ ip, port, publicUrl }: { ip: string; port: number; publicUrl?: string }) => {
+        // Cloud deployments return publicUrl (e.g. https://aethercast.tiwaton.co.uk)
+        setServerUrl(publicUrl ?? `http://${ip}:${port}`);
       })
       .catch(() => {
-        // Fallback to window.location origin (works when accessed directly on same machine)
         setServerUrl(window.location.origin);
       });
   }, []);

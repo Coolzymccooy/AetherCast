@@ -76,6 +76,7 @@ Annex B, and feeds `-f h264` input to FFmpeg directly.
 PORT=3001
 SOCKET_AUTH_TOKEN=   # auto-generated if not set
 GEMINI_API_KEY=      # for AI background generation
+PUBLIC_URL=          # cloud only — set to https://aethercast.tiwaton.co.uk so QR codes point to the public domain instead of LAN IP
 ```
 
 ## How to Run Locally

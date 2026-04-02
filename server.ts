@@ -938,6 +938,13 @@ async function startServer() {
   // ──────────────────────────────────────────────────────────────────────────────
 
   app.get('/api/local-ip', (_req, res) => {
+    // In cloud deployments set PUBLIC_URL=https://aethercast.tiwaton.co.uk
+    // so the QR code points to the public domain instead of the LAN IP.
+    if (process.env.PUBLIC_URL) {
+      const url = new URL(process.env.PUBLIC_URL);
+      const port = url.port ? parseInt(url.port) : (url.protocol === 'https:' ? 443 : 80);
+      return res.json({ ip: url.hostname, port, publicUrl: process.env.PUBLIC_URL });
+    }
     const nets = os.networkInterfaces();
     let localIp = '127.0.0.1';
     for (const iface of Object.values(nets)) {
