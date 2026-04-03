@@ -14,8 +14,8 @@ RUN npm run build
 # ── Stage 2: Production runtime ─────────────────────────────────────────────
 FROM node:22-alpine AS runtime
 
-# Install FFmpeg with full codec support (including lavfi for anullsrc)
-RUN apk add --no-cache ffmpeg ffmpeg-libs
+# Install FFmpeg plus curl for Coolify HTTP health checks
+RUN apk add --no-cache ffmpeg ffmpeg-libs curl
 
 WORKDIR /app
 

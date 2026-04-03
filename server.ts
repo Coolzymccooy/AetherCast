@@ -964,6 +964,14 @@ async function startServer() {
     }]);
   });
 
+  app.get('/health', (_req, res) => {
+    res.status(200).json({
+      ok: true,
+      service: 'aethercast',
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   // ──────────────────────────────────────────────────────────────────────────────
   // Local network IP — used by QR modal so phones can reach this server
   // ──────────────────────────────────────────────────────────────────────────────
