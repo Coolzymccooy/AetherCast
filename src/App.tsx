@@ -102,8 +102,6 @@ function StudioView() {
     else if (action === 'ops:emergency') studio.emergencyWide();
   });
 
-  const gpuStreaming = useGPUStreaming();
-
   const [showPeerSettings, setShowPeerSettings] = React.useState(false);
   const [showProjectDialog, setShowProjectDialog] = React.useState(false);
   const [showOutputQuality, setShowOutputQuality] = React.useState(false);
@@ -148,6 +146,15 @@ function StudioView() {
   // ── Telemetry ─────────────────────────────────────────────────────────────
   const { telemetry, setTelemetry } = useTelemetry(studio.isStreaming);
 
+  const gpuStreaming = useGPUStreaming({
+    setTelemetry,
+    setServerLogs: studio.setServerLogs,
+    onError: (msg) => {
+      studio.setIsStreaming(false);
+      notify(msg, 'error');
+    },
+  });
+
   // ── Hooks ─────────────────────────────────────────────────────────────────
   const webrtc = useWebRTC({
     scenes: studio.scenes, setActiveScene: studio.setActiveScene,
@@ -190,7 +197,10 @@ function StudioView() {
       case 'Add Screen Share': webrtc.startScreenShare(); break;
       case 'Exit': webrtc.stopCamera(); window.close(); break;
       case 'Start Streaming': studio.setShowStreamSettings(true); break;
-      case 'Stop Streaming': streaming.stopStreaming(); break;
+      case 'Stop Streaming':
+        if (gpuStreaming.isStreaming) gpuStreaming.stopGPUStream();
+        else streaming.stopStreaming();
+        break;
       case 'Stream Settings': studio.setShowStreamSettings(true); break;
       case 'Output Quality': setShowOutputQuality(true); break;
       case 'Save Project': setShowProjectDialog(true); break;
@@ -206,6 +216,12 @@ function StudioView() {
   };
 
   const activeScript = scriptRunner.activeScript || SAMPLE_SCRIPT;
+
+  useEffect(() => {
+    if (window.__TAURI_INTERNALS__) {
+      studio.setIsStreaming(gpuStreaming.isStreaming);
+    }
+  }, [gpuStreaming.isStreaming, studio.setIsStreaming]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -285,11 +301,8 @@ function StudioView() {
                   // No server-side FFmpeg needed; encoding happens locally with NVENC
                   const canvas = document.querySelector('canvas');
                   if (canvas) {
-                    const bitrate = streaming.encodingProfile === '1080p60' ? 6000 : streaming.encodingProfile === '720p30' ? 2500 : 4500;
                     gpuStreaming.startGPUStream(canvas as HTMLCanvasElement, activeDestinations, {
-                      // Width/height are set inside startGPUStream (640x360 for IPC)
-                      fps: 30,
-                      bitrate,
+                      encodingProfile: streaming.encodingProfile,
                     }).then((msg) => {
                       studio.setIsStreaming(true);
                       notify(`GPU Stream: ${msg}`, 'success');

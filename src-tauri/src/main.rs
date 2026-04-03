@@ -2,8 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,94 @@ fn replay_buffer() -> &'static Arc<Mutex<ReplayBuffer>> {
     INSTANCE.get_or_init(|| Arc::new(Mutex::new(ReplayBuffer::new())))
 }
 
+#[derive(Debug, Clone)]
+struct NativeStreamRuntime {
+    desired_active: bool,
+    active: bool,
+    restarting: bool,
+    restart_count: u32,
+    max_restarts: u32,
+    session_id: u64,
+    ffmpeg_path: String,
+    encoder: String,
+    is_gpu: bool,
+    config: Option<GPUStreamConfig>,
+    lavfi_enabled: bool,
+    last_error: Option<String>,
+    last_exit_status: Option<String>,
+    started_at_ms: u64,
+    last_restart_at_ms: u64,
+    last_frame_at_ms: u64,
+    bytes_written: u64,
+    write_failures: u64,
+    keepalive_frames: u64,
+    last_frame: Option<Vec<u8>>,
+}
+
+impl Default for NativeStreamRuntime {
+    fn default() -> Self {
+        Self {
+            desired_active: false,
+            active: false,
+            restarting: false,
+            restart_count: 0,
+            max_restarts: 5,
+            session_id: 0,
+            ffmpeg_path: String::new(),
+            encoder: String::new(),
+            is_gpu: false,
+            config: None,
+            lavfi_enabled: true,
+            last_error: None,
+            last_exit_status: None,
+            started_at_ms: 0,
+            last_restart_at_ms: 0,
+            last_frame_at_ms: 0,
+            bytes_written: 0,
+            write_failures: 0,
+            keepalive_frames: 0,
+            last_frame: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct NativeStreamStats {
+    frames: u64,
+    active: bool,
+    desired_active: bool,
+    restarting: bool,
+    restart_count: u32,
+    max_restarts: u32,
+    encoder: String,
+    is_gpu: bool,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
+    bytes_written: u64,
+    write_failures: u64,
+    keepalive_frames: u64,
+    last_error: Option<String>,
+    last_exit_status: Option<String>,
+    ffmpeg_path: String,
+    last_frame_age_ms: u64,
+    uptime_ms: u64,
+    lavfi_enabled: bool,
+}
+
+fn stream_runtime() -> &'static Mutex<NativeStreamRuntime> {
+    static INSTANCE: OnceLock<Mutex<NativeStreamRuntime>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(NativeStreamRuntime::default()))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 // ---------------------------------------------------------------------------
 // GPU Encoder Detection
 // ---------------------------------------------------------------------------
@@ -179,6 +268,19 @@ fn probe_encoder(ffmpeg_bin: &str, encoder: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn supports_lavfi(ffmpeg_bin: &str) -> bool {
+    Command::new(ffmpeg_bin)
+        .args(["-hide_banner", "-filters"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains("anullsrc")
+        })
+        .unwrap_or(false)
+}
+
 fn destination_to_output(dest: &StreamDestination) -> (String, String) {
     let url = if let Some(ref rtmp_url) = dest.rtmp_url {
         if !rtmp_url.is_empty() { rtmp_url.clone() } else { dest.url.clone() }
@@ -212,6 +314,396 @@ fn destination_to_output(dest: &StreamDestination) -> (String, String) {
     }
 }
 
+fn build_ffmpeg_args(
+    config: &GPUStreamConfig,
+    active: &[&StreamDestination],
+    encoder: &str,
+    is_gpu: bool,
+    lavfi_enabled: bool,
+) -> Vec<String> {
+    let is_jpeg_mode = config.mode == "jpeg";
+    let mut args: Vec<String> = Vec::new();
+
+    args.extend([
+        "-y".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "warning".into(),
+    ]);
+
+    if is_jpeg_mode {
+        args.extend([
+            "-fflags".into(), "+genpts+discardcorrupt+nobuffer".into(),
+            "-thread_queue_size".into(), "4096".into(),
+            "-f".into(), "image2pipe".into(),
+            "-c:v".into(), "mjpeg".into(),
+            "-framerate".into(), config.fps.to_string(),
+            "-i".into(), "pipe:0".into(),
+        ]);
+    } else {
+        args.extend([
+            "-fflags".into(), "+genpts+discardcorrupt+nobuffer".into(),
+            "-thread_queue_size".into(), "4096".into(),
+            "-f".into(), "rawvideo".into(),
+            "-pixel_format".into(), "rgba".into(),
+            "-video_size".into(), format!("{}x{}", config.width, config.height),
+            "-framerate".into(), config.fps.to_string(),
+            "-i".into(), "pipe:0".into(),
+        ]);
+    }
+
+    if lavfi_enabled {
+        args.extend([
+            "-f".into(), "lavfi".into(),
+            "-i".into(), "anullsrc=r=44100:cl=stereo".into(),
+        ]);
+    }
+
+    args.extend(["-map".into(), "0:v".into()]);
+    if lavfi_enabled {
+        args.extend([
+            "-map".into(), "1:a".into(),
+            "-c:a".into(), "aac".into(),
+            "-b:a".into(), "128k".into(),
+            "-ar".into(), "44100".into(),
+            "-shortest".into(),
+        ]);
+    } else {
+        args.push("-an".into());
+    }
+
+    if is_gpu {
+        args.extend(["-c:v".into(), encoder.to_string()]);
+        match encoder {
+            "h264_nvenc" => {
+                args.extend([
+                    "-preset".into(), "p4".into(),
+                    "-tune".into(), "ll".into(),
+                    "-rc".into(), "cbr".into(),
+                    "-b:v".into(), format!("{}k", config.bitrate),
+                    "-maxrate".into(), format!("{}k", config.bitrate),
+                    "-bufsize".into(), format!("{}k", config.bitrate * 2),
+                    "-profile:v".into(), "high".into(),
+                    "-g".into(), (config.fps * 2).to_string(),
+                    "-keyint_min".into(), (config.fps * 2).to_string(),
+                    "-sc_threshold".into(), "0".into(),
+                    "-pix_fmt".into(), "yuv420p".into(),
+                ]);
+            }
+            "h264_qsv" => {
+                args.extend([
+                    "-preset".into(), "fast".into(),
+                    "-b:v".into(), format!("{}k", config.bitrate),
+                    "-maxrate".into(), format!("{}k", config.bitrate),
+                    "-bufsize".into(), format!("{}k", config.bitrate * 2),
+                    "-profile:v".into(), "high".into(),
+                    "-g".into(), (config.fps * 2).to_string(),
+                    "-keyint_min".into(), (config.fps * 2).to_string(),
+                    "-sc_threshold".into(), "0".into(),
+                    "-pix_fmt".into(), "nv12".into(),
+                ]);
+            }
+            "h264_amf" => {
+                args.extend([
+                    "-usage".into(), "ultralowlatency".into(),
+                    "-rc".into(), "cbr".into(),
+                    "-b:v".into(), format!("{}k", config.bitrate),
+                    "-maxrate".into(), format!("{}k", config.bitrate),
+                    "-bufsize".into(), format!("{}k", config.bitrate * 2),
+                    "-profile:v".into(), "high".into(),
+                    "-g".into(), (config.fps * 2).to_string(),
+                    "-keyint_min".into(), (config.fps * 2).to_string(),
+                    "-sc_threshold".into(), "0".into(),
+                    "-pix_fmt".into(), "yuv420p".into(),
+                ]);
+            }
+            "h264_videotoolbox" => {
+                args.extend([
+                    "-b:v".into(), format!("{}k", config.bitrate),
+                    "-profile:v".into(), "high".into(),
+                    "-g".into(), (config.fps * 2).to_string(),
+                    "-keyint_min".into(), (config.fps * 2).to_string(),
+                    "-sc_threshold".into(), "0".into(),
+                    "-pix_fmt".into(), "yuv420p".into(),
+                ]);
+            }
+            _ => {
+                args.extend([
+                    "-pix_fmt".into(), "yuv420p".into(),
+                    "-b:v".into(), format!("{}k", config.bitrate),
+                ]);
+            }
+        }
+    } else {
+        args.extend([
+            "-c:v".into(), "libx264".into(),
+            "-preset".into(), "veryfast".into(),
+            "-tune".into(), "zerolatency".into(),
+            "-b:v".into(), format!("{}k", config.bitrate),
+            "-maxrate".into(), format!("{}k", config.bitrate),
+            "-bufsize".into(), format!("{}k", config.bitrate * 2),
+            "-pix_fmt".into(), "yuv420p".into(),
+            "-profile:v".into(), "high".into(),
+            "-g".into(), (config.fps * 2).to_string(),
+            "-keyint_min".into(), (config.fps * 2).to_string(),
+            "-sc_threshold".into(), "0".into(),
+        ]);
+    }
+
+    args.extend([
+        "-max_interleave_delta".into(), "0".into(),
+        "-flags".into(), "+global_header".into(),
+        "-flvflags".into(), "no_duration_filesize".into(),
+    ]);
+
+    if active.len() == 1 {
+        let (fmt, url) = destination_to_output(active[0]);
+        args.extend(["-f".into(), fmt, url]);
+    } else {
+        let tee: Vec<String> = active
+            .iter()
+            .map(|d| {
+                let (fmt, url) = destination_to_output(d);
+                format!("[f={}:onfail=ignore]{}", fmt, url)
+            })
+            .collect();
+        args.extend(["-f".into(), "tee".into(), tee.join("|")]);
+    }
+
+    args
+}
+
+fn start_keepalive_loop(session_id: u64) {
+    std::thread::spawn(move || {
+        loop {
+            let (should_run, current_session_id, fps, last_frame, last_frame_at_ms) = {
+                let state = match stream_runtime().lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                (
+                    state.desired_active,
+                    state.session_id,
+                    state.config.as_ref().map(|cfg| cfg.fps).unwrap_or(30),
+                    state.last_frame.clone(),
+                    state.last_frame_at_ms,
+                )
+            };
+
+            if !should_run || current_session_id != session_id {
+                return;
+            }
+
+            let frame_interval_ms = u64::from(1000 / fps.max(1));
+            let now = now_ms();
+            let should_duplicate = last_frame.is_some()
+                && now.saturating_sub(last_frame_at_ms) >= frame_interval_ms.saturating_mul(2);
+
+            if should_duplicate {
+                let bytes = last_frame.unwrap_or_default();
+                let write_result = {
+                    let mut guard = match ffmpeg_stdin().lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return,
+                    };
+                    if let Some(ref mut stdin) = *guard {
+                        stdin.write_all(&bytes)
+                    } else {
+                        Ok(())
+                    }
+                };
+
+                match write_result {
+                    Ok(()) => {
+                        if let Ok(mut counter) = frame_counter().lock() {
+                            *counter += 1;
+                        }
+                        if let Ok(mut state) = stream_runtime().lock() {
+                            if state.session_id != session_id || !state.desired_active {
+                                return;
+                            }
+                            state.keepalive_frames += 1;
+                            state.bytes_written += bytes.len() as u64;
+                        }
+                    }
+                    Err(_) => {
+                        if let Ok(mut state) = stream_runtime().lock() {
+                            if state.session_id != session_id {
+                                return;
+                            }
+                            state.write_failures += 1;
+                        }
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(frame_interval_ms.max(16)));
+        }
+    });
+}
+
+fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
+    let (config, ffmpeg_bin, encoder, is_gpu, lavfi_enabled, restart_count) = {
+        let state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        if !state.desired_active {
+            return Err("Stream is not marked active".into());
+        }
+        (
+            state.config.clone().ok_or("Missing stream config")?,
+            state.ffmpeg_path.clone(),
+            state.encoder.clone(),
+            state.is_gpu,
+            state.lavfi_enabled,
+            state.restart_count,
+        )
+    };
+
+    let active: Vec<&StreamDestination> = config.destinations.iter().filter(|d| d.enabled).collect();
+    if active.is_empty() {
+        return Err("No enabled destinations".into());
+    }
+
+    let args = build_ffmpeg_args(&config, &active, &encoder, is_gpu, lavfi_enabled);
+    println!("[aether] FFmpeg command: {} {}", ffmpeg_bin, args.join(" "));
+
+    let mut cmd = Command::new(&ffmpeg_bin);
+    cmd.args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn FFmpeg: {}", e))?;
+    let child_pid = child.id();
+    let stdin_handle = child.stdin.take().ok_or("Failed to capture FFmpeg stdin")?;
+    let stderr_handle = child.stderr.take();
+
+    *ffmpeg_stdin().lock().map_err(|e| e.to_string())? = Some(stdin_handle);
+    *ffmpeg_process().lock().map_err(|e| e.to_string())? = Some(child);
+
+    {
+        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.active = true;
+        state.restarting = false;
+        state.last_error = None;
+        state.last_exit_status = None;
+        if state.started_at_ms == 0 {
+            state.started_at_ms = now_ms();
+        }
+        println!(
+            "[aether] Native stream active: encoder={} lavfi={} restart={}",
+            state.encoder,
+            state.lavfi_enabled,
+            restart_count
+        );
+    }
+
+    spawn_ffmpeg_monitor(child_pid, stderr_handle);
+    Ok(())
+}
+
+fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+
+        let mut last_error_line: Option<String> = None;
+
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        println!("[ffmpeg] {}", trimmed);
+                        let lowered = trimmed.to_ascii_lowercase();
+                        if lowered.contains("error")
+                            || lowered.contains("failed")
+                            || lowered.contains("invalid")
+                            || lowered.contains("timed out")
+                        {
+                            last_error_line = Some(trimmed.to_string());
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        let status_text = {
+            let mut process_guard = match ffmpeg_process().lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+
+            let Some(process) = process_guard.as_ref() else {
+                return;
+            };
+
+            if process.id() != child_pid {
+                return;
+            }
+
+            let mut child = process_guard.take().expect("child existed above");
+            match child.wait() {
+                Ok(status) => format!("{status}"),
+                Err(err) => format!("wait failed: {err}"),
+            }
+        };
+
+        if let Ok(mut stdin_guard) = ffmpeg_stdin().lock() {
+            *stdin_guard = None;
+        }
+
+        let mut should_restart = false;
+        {
+            let mut state = match stream_runtime().lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            state.active = false;
+            state.last_exit_status = Some(status_text.clone());
+            if let Some(line) = last_error_line.clone() {
+                state.last_error = Some(line);
+            }
+
+            if state.desired_active {
+                if state.restart_count < state.max_restarts {
+                    state.restart_count += 1;
+                    state.restarting = true;
+                    state.last_restart_at_ms = now_ms();
+                    should_restart = true;
+                } else {
+                    state.desired_active = false;
+                    state.restarting = false;
+                    state.last_error = Some(
+                        state
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| "Native stream restart limit reached".into()),
+                    );
+                }
+            }
+        }
+
+        if should_restart {
+            std::thread::sleep(Duration::from_secs(2));
+            if let Err(err) = spawn_ffmpeg_from_runtime() {
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.desired_active = false;
+                    state.active = false;
+                    state.restarting = false;
+                    state.last_error = Some(err);
+                }
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tauri Commands
 // ---------------------------------------------------------------------------
@@ -224,10 +716,9 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         return Err("No enabled destinations".into());
     }
 
-    // Check no stream is running
     {
-        let guard = ffmpeg_process().lock().map_err(|e| e.to_string())?;
-        if guard.is_some() {
+        let guard = stream_runtime().lock().map_err(|e| e.to_string())?;
+        if guard.desired_active {
             return Err("Stream already running. Stop it first.".into());
         }
     }
@@ -244,205 +735,74 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     };
 
     let is_gpu = encoder != "libx264";
-    let is_jpeg_mode = config.mode == "jpeg";
+    let lavfi_enabled = supports_lavfi(&ffmpeg_bin);
+    let session_id = now_ms();
 
-    println!("[aether] Starting stream: {}x{} @{}fps {}kbps encoder={} mode={}",
-             config.width, config.height, config.fps, config.bitrate, encoder,
-             if is_jpeg_mode { "jpeg" } else { "raw" });
-
-    let mut args: Vec<String> = Vec::new();
-
-    // Global flags
-    args.extend(["-y".into(), "-hide_banner".into(), "-loglevel".into(), "warning".into()]);
-
-    if is_jpeg_mode {
-        // JPEG mode: receive JPEG frames via image2pipe (from browser canvas.toBlob)
-        // Each frame is a complete JPEG file written sequentially to stdin
-        args.extend([
-            "-f".into(), "image2pipe".into(),
-            "-c:v".into(), "mjpeg".into(),
-            "-framerate".into(), config.fps.to_string(),
-            "-i".into(), "pipe:0".into(),
-        ]);
-    } else {
-        // Raw mode: receive raw RGBA video from stdin (legacy path)
-        args.extend([
-            "-f".into(), "rawvideo".into(),
-            "-pixel_format".into(), "rgba".into(),
-            "-video_size".into(), format!("{}x{}", config.width, config.height),
-            "-framerate".into(), config.fps.to_string(),
-            "-i".into(), "pipe:0".into(),
-        ]);
+    if let Ok(mut counter) = frame_counter().lock() {
+        *counter = 0;
     }
 
-    // Input 1: silent audio (required by YouTube/Twitch — they won't start without an audio track)
-    args.extend([
-        "-f".into(), "lavfi".into(),
-        "-i".into(), "anullsrc=r=44100:cl=stereo".into(),
-    ]);
-
-    // Map both inputs and add AAC audio encoding
-    args.extend([
-        "-map".into(), "0:v".into(),   // video from stdin
-        "-map".into(), "1:a".into(),   // audio from anullsrc
-        "-c:a".into(), "aac".into(),
-        "-b:a".into(), "128k".into(),
-        "-ar".into(), "44100".into(),
-        "-shortest".into(),            // stop when video stops
-    ]);
-
-    // Encoder-specific options
-    if is_gpu {
-        args.extend(["-c:v".into(), encoder.clone()]);
-
-        match encoder.as_str() {
-            "h264_nvenc" => {
-                args.extend([
-                    "-preset".into(), "p4".into(),        // balanced quality/speed
-                    "-tune".into(), "ll".into(),           // low latency
-                    "-rc".into(), "cbr".into(),            // constant bitrate for RTMP
-                    "-b:v".into(), format!("{}k", config.bitrate),
-                    "-maxrate".into(), format!("{}k", config.bitrate),
-                    "-bufsize".into(), format!("{}k", config.bitrate * 2),
-                    "-profile:v".into(), "high".into(),
-                    "-g".into(), (config.fps * 2).to_string(), // 2-second keyframe
-                    "-pix_fmt".into(), "yuv420p".into(),
-                ]);
-            }
-            "h264_qsv" => {
-                args.extend([
-                    "-preset".into(), "fast".into(),
-                    "-b:v".into(), format!("{}k", config.bitrate),
-                    "-maxrate".into(), format!("{}k", config.bitrate),
-                    "-bufsize".into(), format!("{}k", config.bitrate * 2),
-                    "-profile:v".into(), "high".into(),
-                    "-g".into(), (config.fps * 2).to_string(),
-                    "-pix_fmt".into(), "nv12".into(),
-                ]);
-            }
-            "h264_amf" => {
-                args.extend([
-                    "-usage".into(), "ultralowlatency".into(),
-                    "-rc".into(), "cbr".into(),
-                    "-b:v".into(), format!("{}k", config.bitrate),
-                    "-maxrate".into(), format!("{}k", config.bitrate),
-                    "-bufsize".into(), format!("{}k", config.bitrate * 2),
-                    "-profile:v".into(), "high".into(),
-                    "-g".into(), (config.fps * 2).to_string(),
-                    "-pix_fmt".into(), "yuv420p".into(),
-                ]);
-            }
-            "h264_videotoolbox" => {
-                args.extend([
-                    "-b:v".into(), format!("{}k", config.bitrate),
-                    "-profile:v".into(), "high".into(),
-                    "-g".into(), (config.fps * 2).to_string(),
-                    "-pix_fmt".into(), "yuv420p".into(),
-                ]);
-            }
-            _ => {
-                args.extend([
-                    "-pix_fmt".into(), "yuv420p".into(),
-                    "-b:v".into(), format!("{}k", config.bitrate),
-                ]);
-            }
-        }
-    } else {
-        // Software fallback
-        args.extend([
-            "-c:v".into(), "libx264".into(),
-            "-preset".into(), "veryfast".into(),
-            "-tune".into(), "zerolatency".into(),
-            "-b:v".into(), format!("{}k", config.bitrate),
-            "-maxrate".into(), format!("{}k", config.bitrate),
-            "-bufsize".into(), format!("{}k", config.bitrate * 2),
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-profile:v".into(), "high".into(),
-            "-g".into(), (config.fps * 2).to_string(),
-        ]);
-    }
-
-    // Output — maps are already set above (0:v for video, 1:a for audio)
-    if active.len() == 1 {
-        let (fmt, url) = destination_to_output(active[0]);
-        args.extend(["-f".into(), fmt, url]);
-    } else {
-        let tee: Vec<String> = active.iter().map(|d| {
-            let (fmt, url) = destination_to_output(d);
-            format!("[f={}:onfail=ignore]{}", fmt, url)
-        }).collect();
-        args.extend(["-f".into(), "tee".into(), tee.join("|")]);
-    }
-
-    println!("[aether] FFmpeg command: ffmpeg {}", args.join(" "));
-
-    let mut cmd = Command::new(&ffmpeg_bin);
-    cmd.args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-
-    #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.desired_active = true;
+        state.active = false;
+        state.restarting = false;
+        state.restart_count = 0;
+        state.session_id = session_id;
+        state.ffmpeg_path = ffmpeg_bin.clone();
+        state.encoder = encoder.clone();
+        state.is_gpu = is_gpu;
+        state.config = Some(config.clone());
+        state.lavfi_enabled = lavfi_enabled;
+        state.last_error = None;
+        state.last_exit_status = None;
+        state.started_at_ms = now_ms();
+        state.last_restart_at_ms = 0;
+        state.last_frame_at_ms = 0;
+        state.bytes_written = 0;
+        state.write_failures = 0;
+        state.keepalive_frames = 0;
+        state.last_frame = None;
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn FFmpeg: {}", e))?;
-    let stdin_handle = child.stdin.take().ok_or("Failed to capture FFmpeg stdin")?;
-
-    // Read FFmpeg stderr on a background thread so we can see why it crashes
-    if let Some(stderr) = child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => {
-                        if !l.trim().is_empty() {
-                            println!("[ffmpeg] {}", l);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            println!("[ffmpeg] stderr stream ended");
-
-            // FFmpeg has exited — clear stdin so write_frame stops immediately
-            // instead of getting OS error 232 on every frame
-            if let Ok(mut guard) = ffmpeg_stdin().lock() {
-                *guard = None;
-            }
-            if let Ok(mut guard) = ffmpeg_process().lock() {
-                if let Some(mut child) = guard.take() {
-                    let status = child.wait();
-                    println!("[ffmpeg] Process exited: {:?}", status);
-                }
-            }
-        });
-    }
-
-    // Reset frame counter
-    if let Ok(mut counter) = frame_counter().lock() { *counter = 0; }
-
-    // Store handles
-    *ffmpeg_stdin().lock().map_err(|e| e.to_string())? = Some(stdin_handle);
-    *ffmpeg_process().lock().map_err(|e| e.to_string())? = Some(child);
+    start_keepalive_loop(session_id);
+    spawn_ffmpeg_from_runtime()?;
 
     let encoder_label = if is_gpu { format!("GPU ({})", encoder) } else { "Software (libx264)".into() };
-    let mode_label = if is_jpeg_mode { "JPEG→image2pipe" } else { "Raw RGBA" };
-    Ok(format!("Streaming via {} [{}] to {} destination(s)", encoder_label, mode_label, active.len()))
+    let mode_label = if config.mode == "jpeg" { "JPEG->image2pipe" } else { "Raw RGBA" };
+    let audio_label = if lavfi_enabled { "with silent audio keepalive" } else { "without synthetic audio fallback" };
+    return Ok(format!(
+        "Streaming via {} [{}] {} at {}x{} @{}fps to {} destination(s)",
+        encoder_label,
+        mode_label,
+        audio_label,
+        config.width,
+        config.height,
+        config.fps,
+        active.len()
+    ));
 }
+
 
 #[tauri::command]
 async fn stop_stream() -> Result<String, String> {
+    {
+        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.desired_active = false;
+        state.active = false;
+        state.restarting = false;
+        state.last_frame = None;
+    }
+
     { *ffmpeg_stdin().lock().map_err(|e| e.to_string())? = None; }
     let mut guard = ffmpeg_process().lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
         let _ = child.wait();
-        let frames = frame_counter().lock().map(|c| *c).unwrap_or(0);
-        Ok(format!("Stream stopped ({} frames encoded)", frames))
-    } else {
-        Ok("No active stream".into())
     }
+
+    let frames = frame_counter().lock().map(|c| *c).unwrap_or(0);
+    return Ok(format!("Stream stopped ({} frames encoded)", frames));
 }
 
 /// Write a base64-encoded JPEG frame to FFmpeg stdin (used in jpeg mode)
@@ -468,24 +828,45 @@ async fn write_frame(data: String) -> Result<(), String> {
         }
     }
 
+    {
+        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.last_frame_at_ms = now_ms();
+        state.last_frame = Some(bytes.clone());
+    }
+
     // Write to FFmpeg stdin
     let mut guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
     if let Some(ref mut stdin) = *guard {
         match stdin.write_all(&bytes) {
             Ok(()) => {
                 if let Ok(mut c) = frame_counter().lock() { *c += 1; }
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.bytes_written += bytes.len() as u64;
+                }
                 Ok(())
             }
             Err(e) => {
                 // Pipe broken — FFmpeg has died. Clear stdin to prevent further attempts.
                 println!("[aether] FFmpeg stdin write failed: {} — clearing stream", e);
                 *guard = None;
-                // Use a recognizable error so JS can stop the frame loop
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.write_failures += 1;
+                    state.last_error = Some(format!("FFmpeg stdin write failed: {}", e));
+                    if state.desired_active {
+                        state.restarting = true;
+                        return Err("STREAM_RESTARTING".into());
+                    }
+                }
                 Err("STREAM_DEAD".into())
             }
         }
     } else {
-        Err("STREAM_DEAD".into())
+        let state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        if state.desired_active {
+            Err("STREAM_RESTARTING".into())
+        } else {
+            Err("STREAM_DEAD".into())
+        }
     }
 }
 
@@ -515,15 +896,43 @@ async fn encode_frame(frame_data: Vec<u8>, width: u32, height: u32) -> Result<()
         }
     }
 
-    // Write to FFmpeg
-    let mut guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
-    if let Some(ref mut stdin) = *guard {
-        stdin.write_all(&frame_data).map_err(|e| format!("Write failed: {}", e))?;
-        // Don't flush every frame — let the OS buffer handle it for throughput
-        if let Ok(mut c) = frame_counter().lock() { *c += 1; }
-        Ok(())
-    } else {
-        Err("No active stream".into())
+    {
+        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.last_frame_at_ms = now_ms();
+        state.last_frame = Some(frame_data.clone());
+    }
+
+    {
+        let mut guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
+        if let Some(ref mut stdin) = *guard {
+            match stdin.write_all(&frame_data) {
+                Ok(()) => {
+                    if let Ok(mut c) = frame_counter().lock() { *c += 1; }
+                    if let Ok(mut state) = stream_runtime().lock() {
+                        state.bytes_written += frame_data.len() as u64;
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    *guard = None;
+                    if let Ok(mut state) = stream_runtime().lock() {
+                        state.write_failures += 1;
+                        state.last_error = Some(format!("FFmpeg stdin write failed: {}", e));
+                        if state.desired_active {
+                            state.restarting = true;
+                            return Err("STREAM_RESTARTING".into());
+                        }
+                    }
+                    return Err(format!("Write failed: {}", e));
+                }
+            }
+        } else {
+            let state = stream_runtime().lock().map_err(|e| e.to_string())?;
+            if state.desired_active {
+                return Err("STREAM_RESTARTING".into());
+            }
+            return Err("No active stream".into());
+        }
     }
 }
 
@@ -531,11 +940,46 @@ async fn encode_frame(frame_data: Vec<u8>, width: u32, height: u32) -> Result<()
 #[tauri::command]
 async fn get_stream_stats() -> Result<String, String> {
     let frames = frame_counter().lock().map(|c| *c).unwrap_or(0);
-    let is_active = ffmpeg_process().lock().map(|g| g.is_some()).unwrap_or(false);
-    Ok(serde_json::json!({
-        "frames": frames,
-        "active": is_active,
-    }).to_string())
+    let state = stream_runtime().lock().map_err(|e| e.to_string())?.clone();
+    let (width, height, fps, bitrate_kbps) = state
+        .config
+        .as_ref()
+        .map(|cfg| (cfg.width, cfg.height, cfg.fps, cfg.bitrate))
+        .unwrap_or((0, 0, 0, 0));
+    let last_frame_age_ms = if state.last_frame_at_ms > 0 {
+        now_ms().saturating_sub(state.last_frame_at_ms)
+    } else {
+        0
+    };
+    let uptime_ms = if state.started_at_ms > 0 {
+        now_ms().saturating_sub(state.started_at_ms)
+    } else {
+        0
+    };
+
+    return Ok(serde_json::to_string(&NativeStreamStats {
+        frames,
+        active: state.active,
+        desired_active: state.desired_active,
+        restarting: state.restarting,
+        restart_count: state.restart_count,
+        max_restarts: state.max_restarts,
+        encoder: state.encoder,
+        is_gpu: state.is_gpu,
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+        bytes_written: state.bytes_written,
+        write_failures: state.write_failures,
+        keepalive_frames: state.keepalive_frames,
+        last_error: state.last_error,
+        last_exit_status: state.last_exit_status,
+        ffmpeg_path: state.ffmpeg_path,
+        last_frame_age_ms,
+        uptime_ms,
+        lavfi_enabled: state.lavfi_enabled,
+    }).map_err(|e| e.to_string())?);
 }
 
 /// Detect available GPU encoder
