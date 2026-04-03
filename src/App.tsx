@@ -55,6 +55,9 @@ import PhoneScreenView from './components/PhoneScreenView';
 // --- App Download Page ---
 import AppDownload from './components/AppDownload';
 
+// --- Mobile Home (APK default screen) ---
+import MobileHome from './components/MobileHome';
+
 // --- Tauri type augmentation ---
 declare global {
   interface Window {
@@ -73,6 +76,7 @@ export default function App() {
   if (urlMode === 'screen') return <PhoneScreenView />;
   if (urlMode === 'audience') return <AudienceLanding />;
   if (urlMode === 'download') return <AppDownload />;
+  if (urlMode === 'app') return <MobileHome />;
   return <StudioView />;
 }
 
