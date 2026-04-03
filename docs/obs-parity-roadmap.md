@@ -13,7 +13,7 @@ The current stack has improved materially, but it still falls short of broadcast
 - Browser mode still depends on `MediaRecorder -> Socket.io -> server FFmpeg` in [useStreaming.ts](/c:/Users/segun/source/repos/aether2/src/hooks/useStreaming.ts) and [server.ts](/c:/Users/segun/source/repos/aether2/server.ts).
 - Desktop mode still originates frames from the web compositor canvas in [useGPUStreaming.ts](/c:/Users/segun/source/repos/aether2/src/hooks/useGPUStreaming.ts).
 - Desktop frames still enter FFmpeg as JPEG/image pipe in [main.rs](/c:/Users/segun/source/repos/aether2/src-tauri/src/main.rs).
-- Desktop audio is not yet a real native broadcast mixer. Synthetic fallback is still present in [main.rs](/c:/Users/segun/source/repos/aether2/src-tauri/src/main.rs).
+- Desktop audio no longer relies only on blind synthetic fallback. Native device-backed audio planning now lives in `src-tauri/src/engine/audio.rs`, but full broadcast-mixer parity is still outstanding.
 - The Tauri app is stronger than the browser path, but it is still a custom encoder path rather than a full native media runtime.
 
 ## Implementation Progress
@@ -29,8 +29,12 @@ The current stack has improved materially, but it still falls short of broadcast
   - output runtime state now carries per-output worker ids, restart counts, and targeted FFmpeg error attribution instead of treating every destination as one blob.
   - live desktop streaming now fans frames out to actual per-destination worker processes instead of relying only on a single shared tee output process.
   - `get_stream_stats` now returns structured output/archive health, not only flat FFmpeg counters and error strings.
+- Phase 3 has started:
+  - `src-tauri/src/engine/audio.rs` now owns native audio device discovery, source selection, capture planning, and audio runtime state transitions.
+  - desktop streaming now starts with an explicit native audio plan instead of hardcoding `anullsrc` in FFmpeg worker arguments.
+  - native stream stats now surface audio backend, source summary, selected inputs, and live audio health.
 - Still outstanding before real OBS-class parity:
-  - native audio graph
+  - native audio bus graph, monitoring, delay, and metering parity
   - native video/compositor ownership
   - output manager split beyond inline FFmpeg session control
   - long-lived native worker/service outside the UI process
@@ -269,14 +273,15 @@ Duration:
 
 Deliverables:
 
-- WASAPI input capture.
+- Native input capture authority.
+- Native source selection for microphone/system/virtual inputs.
 - Native bus mixing and metering.
 - Monitor and delay controls.
 - Audio/video sync handling.
 
 Acceptance criteria:
 
-- No dependence on `anullsrc` for steady operation.
+- No dependence on hardcoded `anullsrc` for steady operation.
 - Stable sync over 2-hour sessions.
 
 ### Phase 4. Native Video Path

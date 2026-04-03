@@ -11,6 +11,12 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::audio::{
+    append_audio_input_args, append_audio_output_args, apply_audio_runtime_signal,
+    build_audio_plan, build_audio_status, describe_audio_plan, detect_audio_engine,
+    set_audio_state,
+    NativeAudioPlan,
+};
 use super::output::{
     append_output_args, append_worker_output_args, apply_output_runtime_signal,
     build_archive_pattern, build_output_manager_plan, build_output_statuses,
@@ -18,8 +24,8 @@ use super::output::{
     OutputWorkerPlan, DEFAULT_ARCHIVE_SEGMENT_SECONDS,
 };
 use super::state::{
-    EngineHealthState, FrameBridgeRuntime, GPUStreamConfig, NativeStreamRuntime, NativeStreamStats,
-    StartStreamResponse,
+    EngineHealthState, FrameBridgeRuntime, GPUStreamConfig, NativeAudioDiscovery,
+    NativeStreamRuntime, NativeStreamStats, StartStreamResponse,
 };
 use super::telemetry::{build_archive_status, now_ms, set_archive_state};
 
@@ -533,7 +539,7 @@ fn build_ffmpeg_args(
     output_plan: &OutputManagerPlan,
     encoder: &str,
     is_gpu: bool,
-    lavfi_enabled: bool,
+    audio_plan: &NativeAudioPlan,
 ) -> Vec<String> {
     let is_jpeg_mode = config.mode == "jpeg";
     let mut args: Vec<String> = Vec::new();
@@ -579,31 +585,8 @@ fn build_ffmpeg_args(
         ]);
     }
 
-    if lavfi_enabled {
-        args.extend([
-            "-f".into(),
-            "lavfi".into(),
-            "-i".into(),
-            "anullsrc=r=44100:cl=stereo".into(),
-        ]);
-    }
-
-    args.extend(["-map".into(), "0:v".into()]);
-    if lavfi_enabled {
-        args.extend([
-            "-map".into(),
-            "1:a".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "128k".into(),
-            "-ar".into(),
-            "44100".into(),
-            "-shortest".into(),
-        ]);
-    } else {
-        args.push("-an".into());
-    }
+    append_audio_input_args(&mut args, audio_plan);
+    append_audio_output_args(&mut args, audio_plan);
 
     if is_gpu {
         args.extend(["-c:v".into(), encoder.to_string()]);
@@ -752,8 +735,8 @@ struct WorkerLaunchContext {
     ffmpeg_bin: String,
     encoder: String,
     is_gpu: bool,
-    lavfi_enabled: bool,
     config: GPUStreamConfig,
+    audio_plan: NativeAudioPlan,
     worker: OutputWorkerPlan,
 }
 
@@ -762,7 +745,7 @@ fn build_worker_ffmpeg_args(
     worker: &OutputWorkerPlan,
     encoder: &str,
     is_gpu: bool,
-    lavfi_enabled: bool,
+    audio_plan: &NativeAudioPlan,
 ) -> Vec<String> {
     let is_jpeg_mode = config.mode == "jpeg";
     let mut args: Vec<String> = Vec::new();
@@ -808,31 +791,8 @@ fn build_worker_ffmpeg_args(
         ]);
     }
 
-    if lavfi_enabled {
-        args.extend([
-            "-f".into(),
-            "lavfi".into(),
-            "-i".into(),
-            "anullsrc=r=44100:cl=stereo".into(),
-        ]);
-    }
-
-    args.extend(["-map".into(), "0:v".into()]);
-    if lavfi_enabled {
-        args.extend([
-            "-map".into(),
-            "1:a".into(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            "128k".into(),
-            "-ar".into(),
-            "44100".into(),
-            "-shortest".into(),
-        ]);
-    } else {
-        args.push("-an".into());
-    }
+    append_audio_input_args(&mut args, audio_plan);
+    append_audio_output_args(&mut args, audio_plan);
 
     if is_gpu {
         args.extend(["-c:v".into(), encoder.to_string()]);
@@ -975,7 +935,7 @@ fn build_worker_ffmpeg_args(
 }
 
 fn worker_launch_contexts_from_runtime() -> Result<Vec<WorkerLaunchContext>, String> {
-    let (config, ffmpeg_bin, encoder, is_gpu, lavfi_enabled, archive_path_pattern, session_id) = {
+    let (config, ffmpeg_bin, encoder, is_gpu, archive_path_pattern, session_id, lavfi_enabled) = {
         let state = stream_runtime().lock().map_err(|e| e.to_string())?;
         if !state.desired_active {
             return Err("Stream is not marked active".into());
@@ -985,11 +945,12 @@ fn worker_launch_contexts_from_runtime() -> Result<Vec<WorkerLaunchContext>, Str
             state.ffmpeg_path.clone(),
             state.encoder.clone(),
             state.is_gpu,
-            state.lavfi_enabled,
             state.archive_path_pattern.clone(),
             state.session_id,
+            state.lavfi_enabled,
         )
     };
+    let audio_plan = build_audio_plan(&ffmpeg_bin, &config, lavfi_enabled);
 
     let output_plan = build_output_manager_plan(&config, archive_path_pattern.as_deref())?;
     Ok(output_plan
@@ -1000,8 +961,8 @@ fn worker_launch_contexts_from_runtime() -> Result<Vec<WorkerLaunchContext>, Str
             ffmpeg_bin: ffmpeg_bin.clone(),
             encoder: encoder.clone(),
             is_gpu,
-            lavfi_enabled,
             config: config.clone(),
+            audio_plan: audio_plan.clone(),
             worker,
         })
         .collect())
@@ -1013,7 +974,7 @@ fn spawn_output_worker(context: WorkerLaunchContext) -> Result<(), String> {
         &context.worker,
         &context.encoder,
         context.is_gpu,
-        context.lavfi_enabled,
+        &context.audio_plan,
     );
     println!(
         "[aether] Output worker {} [{} {} -> {}] command: {} {}",
@@ -1070,6 +1031,12 @@ fn spawn_output_worker(context: WorkerLaunchContext) -> Result<(), String> {
         state.last_error = None;
         state.last_exit_status = None;
         state.last_spawn_at_ms = now_ms();
+        set_audio_state(
+            &mut state.audio_status,
+            EngineHealthState::Active,
+            None,
+            Some(format!("Worker {} active", context.worker.worker_id)),
+        );
         match context.worker.kind {
             OutputWorkerKind::Destination => {
                 set_output_state_by_worker_id(
@@ -1111,10 +1078,12 @@ fn spawn_output_worker_monitor(
                         println!("[ffmpeg:{}] {}", context.worker.worker_id, trimmed);
                         if let Ok(mut state) = stream_runtime().lock() {
                             let NativeStreamRuntime {
+                                audio_status,
                                 output_statuses,
                                 archive_status,
                                 ..
                             } = &mut *state;
+                            apply_audio_runtime_signal(trimmed, audio_status);
                             apply_output_runtime_signal(
                                 &context.worker.worker_id,
                                 context.worker.kind.clone(),
@@ -1184,6 +1153,15 @@ fn spawn_output_worker_monitor(
                 state.last_restart_delay_ms = context.worker.recovery_delay_ms;
                 should_restart = true;
                 let last_error = state.last_error.clone();
+                set_audio_state(
+                    &mut state.audio_status,
+                    EngineHealthState::Recovering,
+                    last_error.clone(),
+                    Some(format!(
+                        "Restarting audio with worker {}",
+                        context.worker.worker_id
+                    )),
+                );
                 match context.worker.kind {
                     OutputWorkerKind::Destination => {
                         set_output_state_by_worker_id(
@@ -1210,6 +1188,16 @@ fn spawn_output_worker_monitor(
                     state.desired_active = remaining_workers > 0;
                     state.restarting = false;
                 }
+                set_audio_state(
+                    &mut state.audio_status,
+                    if desired_active {
+                        EngineHealthState::Error
+                    } else {
+                        EngineHealthState::Stopped
+                    },
+                    last_error.clone(),
+                    Some(format!("Worker {} exited", context.worker.worker_id)),
+                );
                 match context.worker.kind {
                     OutputWorkerKind::Destination => {
                         set_output_state_by_worker_id(
@@ -1330,7 +1318,7 @@ fn start_keepalive_loop(session_id: u64) {
 
 #[allow(dead_code)]
 fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
-    let (config, ffmpeg_bin, encoder, is_gpu, lavfi_enabled, restart_count, archive_path_pattern) = {
+    let (config, ffmpeg_bin, encoder, is_gpu, restart_count, archive_path_pattern, lavfi_enabled) = {
         let state = stream_runtime().lock().map_err(|e| e.to_string())?;
         if !state.desired_active {
             return Err("Stream is not marked active".into());
@@ -1340,15 +1328,16 @@ fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
             state.ffmpeg_path.clone(),
             state.encoder.clone(),
             state.is_gpu,
-            state.lavfi_enabled,
             state.restart_count,
             state.archive_path_pattern.clone(),
+            state.lavfi_enabled,
         )
     };
+    let audio_plan = build_audio_plan(&ffmpeg_bin, &config, lavfi_enabled);
 
     let output_plan = build_output_manager_plan(&config, archive_path_pattern.as_deref())?;
 
-    let args = build_ffmpeg_args(&config, &output_plan, &encoder, is_gpu, lavfi_enabled);
+    let args = build_ffmpeg_args(&config, &output_plan, &encoder, is_gpu, &audio_plan);
     println!("[aether] FFmpeg command: {} {}", ffmpeg_bin, args.join(" "));
 
     let mut cmd = Command::new(&ffmpeg_bin);
@@ -1379,6 +1368,12 @@ fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
         state.restarting = false;
         state.last_error = None;
         state.last_exit_status = None;
+        set_audio_state(
+            &mut state.audio_status,
+            EngineHealthState::Active,
+            None,
+            Some("Legacy native audio active".into()),
+        );
         set_output_states(&mut state.output_statuses, EngineHealthState::Active, None);
         set_archive_state(&mut state.archive_status, EngineHealthState::Active, None);
         if state.started_at_ms == 0 {
@@ -1414,10 +1409,12 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
                         println!("[ffmpeg] {}", trimmed);
                         if let Ok(mut state) = stream_runtime().lock() {
                             let NativeStreamRuntime {
+                                audio_status,
                                 output_statuses,
                                 archive_status,
                                 ..
                             } = &mut *state;
+                            apply_audio_runtime_signal(trimmed, audio_status);
                             apply_output_runtime_signal(
                                 "legacy:shared",
                                 OutputWorkerKind::Archive,
@@ -1494,6 +1491,12 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
                     delay_before_restart_ms = restart_delay_ms(state.restart_count);
                     state.last_restart_delay_ms = delay_before_restart_ms;
                     let error_message = state.last_error.clone();
+                    set_audio_state(
+                        &mut state.audio_status,
+                        EngineHealthState::Recovering,
+                        error_message.clone(),
+                        Some("Legacy native audio restarting".into()),
+                    );
                     set_output_states(
                         &mut state.output_statuses,
                         EngineHealthState::Recovering,
@@ -1516,6 +1519,12 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
                             .unwrap_or_else(|| "Native stream restart limit reached".into()),
                     );
                     let error_message = state.last_error.clone();
+                    set_audio_state(
+                        &mut state.audio_status,
+                        EngineHealthState::Error,
+                        error_message.clone(),
+                        Some("Legacy native audio restart limit reached".into()),
+                    );
                     set_output_states(
                         &mut state.output_statuses,
                         EngineHealthState::Error,
@@ -1528,6 +1537,12 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
                     );
                 }
             } else {
+                set_audio_state(
+                    &mut state.audio_status,
+                    EngineHealthState::Stopped,
+                    None,
+                    Some("Legacy native audio stopped".into()),
+                );
                 set_output_states(&mut state.output_statuses, EngineHealthState::Stopped, None);
                 set_archive_state(&mut state.archive_status, EngineHealthState::Stopped, None);
             }
@@ -1542,6 +1557,12 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
                     state.restarting = false;
                     state.last_restart_delay_ms = 0;
                     state.last_error = Some(err.clone());
+                    set_audio_state(
+                        &mut state.audio_status,
+                        EngineHealthState::Error,
+                        Some(err.clone()),
+                        Some("Legacy native audio failed to recover".into()),
+                    );
                     set_output_states(
                         &mut state.output_statuses,
                         EngineHealthState::Error,
@@ -1588,6 +1609,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     let session_id = now_ms();
     let archive_path_pattern = build_archive_pattern(session_id)?;
     let output_plan = build_output_manager_plan(&config, Some(&archive_path_pattern))?;
+    let audio_plan = build_audio_plan(&ffmpeg_bin, &config, lavfi_enabled);
     let output_statuses = build_output_statuses(&output_plan);
     let archive_status = build_archive_status(
         output_plan
@@ -1596,6 +1618,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         output_plan.archive_segment_seconds(),
         EngineHealthState::Starting,
     );
+    let audio_status = build_audio_status(&audio_plan, EngineHealthState::Starting);
 
     if let Ok(mut counter) = frame_counter().lock() {
         *counter = 0;
@@ -1628,6 +1651,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         state.write_failures = 0;
         state.keepalive_frames = 0;
         state.last_frame = None;
+        state.audio_status = audio_status;
         state.output_statuses = output_statuses;
         state.archive_status = archive_status;
     }
@@ -1639,6 +1663,12 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
             state.active = false;
             state.restarting = false;
             state.last_error = Some(err.clone());
+            set_audio_state(
+                &mut state.audio_status,
+                EngineHealthState::Error,
+                Some(err.clone()),
+                Some("Native audio worker failed to start".into()),
+            );
             set_output_states(
                 &mut state.output_statuses,
                 EngineHealthState::Error,
@@ -1675,13 +1705,9 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     } else {
         "Software (libx264)".into()
     };
-    let audio_label = if lavfi_enabled {
-        "with silent audio keepalive"
-    } else {
-        "without synthetic audio fallback"
-    };
+    let audio_label = describe_audio_plan(&audio_plan);
     let message = format!(
-        "Streaming via {} [native workers] {} at {}x{} @{}fps to {} destination worker(s); archive: {}",
+        "Streaming via {} [native workers] audio: {} at {}x{} @{}fps to {} destination worker(s); archive: {}",
         encoder_label,
         audio_label,
         config.width,
@@ -1721,6 +1747,12 @@ pub async fn stop_stream() -> Result<String, String> {
         state.restarting = false;
         state.last_frame = None;
         state.last_restart_delay_ms = 0;
+        set_audio_state(
+            &mut state.audio_status,
+            EngineHealthState::Stopped,
+            None,
+            Some("Native audio stopped".into()),
+        );
         set_output_states(&mut state.output_statuses, EngineHealthState::Stopped, None);
         set_archive_state(&mut state.archive_status, EngineHealthState::Stopped, None);
     }
@@ -1834,6 +1866,7 @@ pub async fn get_stream_stats() -> Result<String, String> {
         bridge_frames_received: bridge.frames_received,
         bridge_bytes_received: bridge.bytes_received,
         bridge_last_error: bridge.last_error,
+        audio_status: state.audio_status,
         output_statuses: state.output_statuses,
         archive_status: state.archive_status,
     })
@@ -1852,6 +1885,13 @@ pub async fn detect_encoder() -> Result<String, String> {
         "ffmpegPath": ffmpeg_bin,
     })
     .to_string())
+}
+
+#[tauri::command]
+pub async fn list_audio_devices() -> Result<String, String> {
+    let ffmpeg_bin = find_ffmpeg();
+    let discovery: NativeAudioDiscovery = detect_audio_engine(&ffmpeg_bin, supports_lavfi(&ffmpeg_bin));
+    serde_json::to_string(&discovery).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -33,6 +33,18 @@ fn default_fps() -> u32 {
 fn default_bitrate() -> u32 {
     6000
 }
+fn default_audio_mode() -> String {
+    "auto".into()
+}
+fn default_audio_sample_rate() -> u32 {
+    48_000
+}
+fn default_audio_channels() -> u32 {
+    2
+}
+fn default_audio_bitrate() -> u32 {
+    160
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GPUStreamConfig {
@@ -49,6 +61,20 @@ pub struct GPUStreamConfig {
     pub encoder: String,
     #[serde(default)]
     pub mode: String,
+    #[serde(default = "default_audio_mode", alias = "audioMode")]
+    pub audio_mode: String,
+    #[serde(default, alias = "audioDevice")]
+    pub audio_device: String,
+    #[serde(default = "default_audio_sample_rate", alias = "audioSampleRate")]
+    pub audio_sample_rate: u32,
+    #[serde(default = "default_audio_channels", alias = "audioChannels")]
+    pub audio_channels: u32,
+    #[serde(default = "default_audio_bitrate", alias = "audioBitrate")]
+    pub audio_bitrate: u32,
+    #[serde(default = "default_true", alias = "includeMicrophone")]
+    pub include_microphone: bool,
+    #[serde(default = "default_true", alias = "includeSystemAudio")]
+    pub include_system_audio: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +87,41 @@ pub enum EngineHealthState {
     Degraded,
     Error,
     Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeAudioSourceKind {
+    Microphone,
+    System,
+    Virtual,
+    Synthetic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeAudioInput {
+    pub name: String,
+    pub alternative_name: Option<String>,
+    pub kind: NativeAudioSourceKind,
+    pub backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeAudioStatus {
+    pub state: EngineHealthState,
+    pub mode: String,
+    pub backend: String,
+    pub input_count: u32,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub bitrate_kbps: u32,
+    pub source_summary: String,
+    pub inputs: Vec<NativeAudioInput>,
+    pub using_synthetic: bool,
+    pub last_error: Option<String>,
+    pub last_event: Option<String>,
+    pub last_update_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +173,7 @@ pub struct NativeStreamRuntime {
     pub write_failures: u64,
     pub keepalive_frames: u64,
     pub last_frame: Option<Vec<u8>>,
+    pub audio_status: NativeAudioStatus,
     pub output_statuses: Vec<OutputStatus>,
     pub archive_status: ArchiveStatus,
 }
@@ -142,6 +204,21 @@ impl Default for NativeStreamRuntime {
             write_failures: 0,
             keepalive_frames: 0,
             last_frame: None,
+            audio_status: NativeAudioStatus {
+                state: EngineHealthState::Inactive,
+                mode: "silent".into(),
+                backend: "none".into(),
+                input_count: 0,
+                sample_rate: default_audio_sample_rate(),
+                channels: default_audio_channels(),
+                bitrate_kbps: default_audio_bitrate(),
+                source_summary: "No native audio input".into(),
+                inputs: Vec::new(),
+                using_synthetic: false,
+                last_error: None,
+                last_event: None,
+                last_update_ms: 0,
+            },
             output_statuses: Vec::new(),
             archive_status: ArchiveStatus {
                 state: EngineHealthState::Inactive,
@@ -186,8 +263,18 @@ pub struct NativeStreamStats {
     pub bridge_frames_received: u64,
     pub bridge_bytes_received: u64,
     pub bridge_last_error: Option<String>,
+    pub audio_status: NativeAudioStatus,
     pub output_statuses: Vec<OutputStatus>,
     pub archive_status: ArchiveStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeAudioDiscovery {
+    pub ffmpeg_path: String,
+    pub supports_dshow: bool,
+    pub supports_lavfi: bool,
+    pub devices: Vec<NativeAudioInput>,
+    pub suggested_status: NativeAudioStatus,
 }
 
 #[derive(Debug, Clone)]

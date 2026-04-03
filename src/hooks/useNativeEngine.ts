@@ -18,6 +18,13 @@ type NativeHealthState =
   | 'error'
   | 'stopped';
 
+type NativeAudioKind =
+  | 'microphone'
+  | 'system'
+  | 'virtual'
+  | 'synthetic'
+  | 'unknown';
+
 interface NativeOutputStatus {
   worker_id: string;
   name: string;
@@ -38,6 +45,37 @@ interface NativeArchiveStatus {
   segment_seconds: number;
   last_error?: string | null;
   last_update_ms: number;
+}
+
+interface NativeAudioInput {
+  name: string;
+  alternative_name?: string | null;
+  kind: NativeAudioKind;
+  backend: string;
+}
+
+interface NativeAudioStatus {
+  state: NativeHealthState;
+  mode: string;
+  backend: string;
+  input_count: number;
+  sample_rate: number;
+  channels: number;
+  bitrate_kbps: number;
+  source_summary: string;
+  inputs: NativeAudioInput[];
+  using_synthetic: boolean;
+  last_error?: string | null;
+  last_event?: string | null;
+  last_update_ms: number;
+}
+
+interface NativeAudioDiscovery {
+  ffmpeg_path: string;
+  supports_dshow: boolean;
+  supports_lavfi: boolean;
+  devices: NativeAudioInput[];
+  suggested_status: NativeAudioStatus;
 }
 
 interface NativeStreamStats {
@@ -71,6 +109,7 @@ interface NativeStreamStats {
   bridge_frames_received: number;
   bridge_bytes_received: number;
   bridge_last_error?: string | null;
+  audio_status: NativeAudioStatus;
   output_statuses: NativeOutputStatus[];
   archive_status: NativeArchiveStatus;
 }
@@ -100,6 +139,7 @@ interface GPUStreamStats {
   lastRestartDelayMs: number;
   lastError: string | null;
   uptimeMs: number;
+  audioStatus: NativeAudioStatus | null;
   outputStatuses: NativeOutputStatus[];
   archiveStatus: NativeArchiveStatus | null;
 }
@@ -229,10 +269,12 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     lastRestartDelayMs: 0,
     lastError: null,
     uptimeMs: 0,
+    audioStatus: null,
     outputStatuses: [],
     archiveStatus: null,
   });
   const [encoderInfo, setEncoderInfo] = useState<{ encoder: string; isGPU: boolean; ffmpegPath: string } | null>(null);
+  const [audioInfo, setAudioInfo] = useState<NativeAudioDiscovery | null>(null);
 
   const frameLoopRef = useRef<number | null>(null);
   const statsPollRef = useRef<number | null>(null);
@@ -369,6 +411,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastRestartDelayMs: native.last_restart_delay_ms,
       lastError: native.last_error || null,
       uptimeMs: native.uptime_ms,
+      audioStatus: native.audio_status || null,
       outputStatuses: native.output_statuses || [],
       archiveStatus: native.archive_status || null,
     });
@@ -379,6 +422,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       fps: native.fps || prev.fps,
       droppedFrames: droppedRef.current + native.write_failures,
       network: resolveNativeNetworkState(native),
+      nativeAudioState: native.audio_status?.state || prev.nativeAudioState,
+      nativeAudioSource: native.audio_status?.source_summary || prev.nativeAudioSource,
       nativeOutputHealth: native.output_statuses?.map((output) => ({
         name: output.name,
         state: output.state,
@@ -394,6 +439,21 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       const result = await invokeRef.current('get_stream_stats');
       const parsed = JSON.parse(result as string) as Partial<NativeStreamStats>;
       const native = {
+        audio_status: {
+          state: 'inactive',
+          mode: 'silent',
+          backend: 'none',
+          input_count: 0,
+          sample_rate: 48000,
+          channels: 2,
+          bitrate_kbps: 160,
+          source_summary: 'No native audio input',
+          inputs: [],
+          using_synthetic: false,
+          last_error: null,
+          last_event: null,
+          last_update_ms: 0,
+        },
         output_statuses: [],
         archive_status: {
           state: 'inactive',
@@ -419,6 +479,25 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
       if (native.archive_path_pattern && native.archive_path_pattern !== previous?.archive_path_pattern) {
         addServerLog(`Local safety archive enabled: ${native.archive_path_pattern}`, 'info');
+      }
+
+      if (!previous?.audio_status) {
+        addServerLog(
+          `[audio] ${native.audio_status.state} (${native.audio_status.source_summary})`,
+          healthStateLogType(native.audio_status.state),
+        );
+      } else if (
+        native.audio_status.state !== previous.audio_status.state ||
+        native.audio_status.last_error !== previous.audio_status.last_error ||
+        native.audio_status.source_summary !== previous.audio_status.source_summary
+      ) {
+        const detail = native.audio_status.last_error || native.audio_status.last_event
+          ? `: ${native.audio_status.last_error || native.audio_status.last_event}`
+          : '';
+        addServerLog(
+          `[audio] ${native.audio_status.state} (${native.audio_status.source_summary})${detail}`,
+          healthStateLogType(native.audio_status.state),
+        );
       }
 
       for (const output of native.output_statuses || []) {
@@ -555,13 +634,27 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           // Ignore JSON parse issues here.
         }
       }).catch((err) => console.log('[GPU] Encoder detection failed:', err));
+
+      invoke('list_audio_devices').then((result: any) => {
+        if (disposed) return;
+        try {
+          const info = JSON.parse(result as string) as NativeAudioDiscovery;
+          setAudioInfo(info);
+          addServerLog(
+            `[audio] native engine ready: ${info.suggested_status.source_summary} (${info.devices.length} device${info.devices.length === 1 ? '' : 's'})`,
+            healthStateLogType(info.suggested_status.state),
+          );
+        } catch {
+          // Ignore JSON parse issues here.
+        }
+      }).catch((err) => console.log('[GPU] Audio detection failed:', err));
     });
 
     return () => {
       disposed = true;
       stopStatsPolling();
     };
-  }, [stopStatsPolling]);
+  }, [addServerLog, stopStatsPolling]);
 
   const captureAndSendFrame = useCallback(async (
     canvas: HTMLCanvasElement,
@@ -666,7 +759,18 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   const startStream = useCallback(async (
     canvas: HTMLCanvasElement,
     destinations: StreamDestination[],
-    startOptions?: { width?: number; height?: number; fps?: number; bitrate?: number; encoder?: string; encodingProfile?: EncodingProfile },
+    startOptions?: {
+      width?: number;
+      height?: number;
+      fps?: number;
+      bitrate?: number;
+      encoder?: string;
+      encodingProfile?: EncodingProfile;
+      audioMode?: 'auto' | 'hybrid' | 'system' | 'microphone' | 'device' | 'silent';
+      audioDevice?: string;
+      includeMicrophone?: boolean;
+      includeSystemAudio?: boolean;
+    },
   ) => {
     if (!window.__TAURI_INTERNALS__) {
       throw new Error('GPU streaming requires Tauri desktop app');
@@ -713,6 +817,13 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           bitrate: nativeProfile.bitrate,
           encoder: startOptions?.encoder || 'auto',
           mode: 'jpeg',
+          audio_mode: startOptions?.audioMode || 'auto',
+          audio_device: startOptions?.audioDevice || '',
+          audio_sample_rate: 48000,
+          audio_channels: 2,
+          audio_bitrate: 160,
+          include_microphone: startOptions?.includeMicrophone ?? true,
+          include_system_audio: startOptions?.includeSystemAudio ?? true,
         },
       });
 
@@ -808,13 +919,14 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     }
 
     setIsStreaming(false);
-    setStats((prev) => ({
-      ...prev,
-      isActive: false,
-      restarting: false,
-      outputStatuses: [],
-      archiveStatus: null,
-    }));
+      setStats((prev) => ({
+        ...prev,
+        isActive: false,
+        restarting: false,
+        audioStatus: null,
+        outputStatuses: [],
+        archiveStatus: null,
+      }));
   }, [addServerLog, closeBridgeSocket, stopStatsPolling]);
 
   useEffect(() => {
@@ -834,6 +946,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     isStreaming,
     stats,
     encoderInfo,
+    audioInfo,
     startStream,
     stopStream,
     // Transitional aliases while the app migrates off the old hook name.

@@ -301,8 +301,13 @@ function StudioView() {
                   // No server-side FFmpeg needed; encoding happens locally with NVENC
                   const canvas = document.querySelector('canvas');
                   if (canvas) {
+                    const micChannels = studio.audioChannels.filter((channel) => /^Mic/i.test(channel.name));
+                    const systemChannel = studio.audioChannels.find((channel) => channel.name === 'System');
                     nativeEngine.startStream(canvas as HTMLCanvasElement, activeDestinations, {
                       encodingProfile: streaming.encodingProfile,
+                      audioMode: 'auto',
+                      includeMicrophone: micChannels.some((channel) => !channel.muted && channel.volume > 0),
+                      includeSystemAudio: systemChannel ? !systemChannel.muted && systemChannel.volume > 0 : true,
                     }).then((msg) => {
                       studio.setIsStreaming(true);
                       notify(`GPU Stream: ${msg}`, 'success');
