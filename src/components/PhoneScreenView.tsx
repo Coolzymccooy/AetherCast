@@ -1,15 +1,33 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { Capacitor } from '@capacitor/core';
 import Peer, { MediaConnection } from 'peerjs';
 import { Monitor, Wifi, WifiOff, Share2 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { hostPeerId, clientPeerId } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
 import { useScreenCapture } from '../hooks/useScreenCapture';
+import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
+import { resolveRoomId } from '../utils/roomId';
 
-/** True when running inside the Capacitor Android APK */
-const isNativeAndroid = (): boolean =>
-  typeof (window as Window & { Capacitor?: { isNative?: boolean; platform?: string } }).Capacitor !== 'undefined' &&
-  !!(window as Window & { Capacitor?: { isNative?: boolean } }).Capacitor?.isNative;
+interface NativeRuntimeInfo {
+  hasWindowBridge: boolean;
+  isNative: boolean;
+  platform: string;
+}
+
+const getNativeRuntimeInfo = (): NativeRuntimeInfo => {
+  const windowCapacitor = (window as Window & { Capacitor?: { isNative?: boolean; platform?: string } }).Capacitor;
+  const helperPlatform = typeof Capacitor.getPlatform === 'function' ? Capacitor.getPlatform() : 'web';
+  const platform = windowCapacitor?.platform || helperPlatform || 'web';
+  const nativeByHelper = typeof Capacitor.isNativePlatform === 'function' ? Capacitor.isNativePlatform() : false;
+  const nativeByWindow = !!windowCapacitor?.isNative;
+
+  return {
+    hasWindowBridge: typeof windowCapacitor !== 'undefined',
+    isNative: nativeByHelper || nativeByWindow,
+    platform,
+  };
+};
 
 /**
  * PhoneScreenView — renders when `?mode=screen` is in the URL.
@@ -21,12 +39,20 @@ const isNativeAndroid = (): boolean =>
  * Both paths hand a MediaStream to PeerJS for WebRTC delivery to the Studio.
  */
 export default function PhoneScreenView() {
-  const roomId = new URLSearchParams(window.location.search).get('room') ?? 'SLTN-1234';
-  const isNative = isNativeAndroid();
+  const roomId = resolveRoomId(new URLSearchParams(window.location.search).get('room'));
+  const [runtime, setRuntime] = useState<NativeRuntimeInfo>(() => getNativeRuntimeInfo());
+  const isNative = runtime.isNative;
 
   const [status, setStatus] = useState<'idle' | 'requesting' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [logs, setLogs] = useState<string[]>([]);
+  const [searchSecs, setSearchSecs] = useState(0);
+  const [debugInfo, setDebugInfo] = useState({
+    hostId: hostPeerId(roomId),
+    clientId: '',
+    peerServer: '',
+    lastEvent: 'idle',
+  });
 
   const peerRef = useRef<Peer | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
@@ -42,7 +68,7 @@ export default function PhoneScreenView() {
   }, []);
 
   const cleanup = useCallback(() => {
-    if (hostCheckTimerRef.current) clearTimeout(hostCheckTimerRef.current);
+    if (hostCheckTimerRef.current) { clearTimeout(hostCheckTimerRef.current); hostCheckTimerRef.current = null; }
     callRef.current?.close();
     peerRef.current?.destroy();
     if (!isNative) {
@@ -55,6 +81,37 @@ export default function PhoneScreenView() {
   }, [isNative]);
 
   useEffect(() => () => cleanup(), [cleanup]);
+
+  useEffect(() => {
+    if (status === 'connecting') {
+      setSearchSecs(0);
+      const timer = setInterval(() => setSearchSecs((secs) => secs + 1), 1000);
+      return () => clearInterval(timer);
+    }
+
+    setSearchSecs(0);
+    return undefined;
+  }, [status]);
+
+  useEffect(() => {
+    const refreshRuntime = () => setRuntime(getNativeRuntimeInfo());
+    refreshRuntime();
+
+    const timers = [
+      window.setTimeout(refreshRuntime, 250),
+      window.setTimeout(refreshRuntime, 1000),
+      window.setTimeout(refreshRuntime, 2500),
+    ];
+
+    window.addEventListener('focus', refreshRuntime);
+    document.addEventListener('visibilitychange', refreshRuntime);
+
+    return () => {
+      timers.forEach(window.clearTimeout);
+      window.removeEventListener('focus', refreshRuntime);
+      document.removeEventListener('visibilitychange', refreshRuntime);
+    };
+  }, []);
 
   // When native stream becomes available, connect to Studio
   useEffect(() => {
@@ -73,6 +130,7 @@ export default function PhoneScreenView() {
     if (captureError) {
       setStatus('error');
       setErrorMsg(captureError);
+      setDebugInfo(prev => ({ ...prev, lastEvent: `capture-error:${captureError}` }));
     }
   }, [captureError]);
 
@@ -82,23 +140,33 @@ export default function PhoneScreenView() {
 
     const myId = clientPeerId(roomId);
     const peerEnv = getPeerEnv();
+    const peerServer = `${peerEnv.secure ? 'https' : 'http'}://${peerEnv.host}:${peerEnv.port}${peerEnv.path}`;
+    setDebugInfo({
+      hostId: hostPeerId(roomId),
+      clientId: myId,
+      peerServer,
+      lastEvent: 'connecting-peerjs',
+    });
     const peer = new Peer(myId, {
       host: peerEnv.host, port: peerEnv.port, path: peerEnv.path, secure: peerEnv.secure, debug: 0,
-      config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] },
+      config: { iceServers: DEFAULT_ICE_SERVERS },
     });
     peerRef.current = peer;
 
     peer.on('open', () => {
       addLog('Cloud ready');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-open' }));
       startHostChecker(peer, stream);
     });
     peer.on('disconnected', () => {
       addLog('Cloud disconnected, reconnecting...');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-disconnected' }));
       try { (peer as unknown as { reconnect?: () => void }).reconnect?.(); } catch { /* ok */ }
     });
     peer.on('error', (err: unknown) => {
       const e = err as { type?: string; message?: string };
       addLog(`Peer error: ${e.type ?? e.message ?? 'unknown'}`);
+      setDebugInfo(prev => ({ ...prev, lastEvent: `peer-error:${e.type ?? e.message ?? 'unknown'}` }));
       if (e.type !== 'peer-unavailable') {
         setStatus('error');
         setErrorMsg(`PeerJS error: ${e.type ?? e.message ?? 'unknown'}`);
@@ -111,10 +179,12 @@ export default function PhoneScreenView() {
 
     const attempt = () => {
       addLog('Searching for Studio...');
+      setDebugInfo(prev => ({ ...prev, hostId, lastEvent: 'probing-studio-host' }));
       const conn = peer.connect(hostId, { reliable: true });
 
       const timeout = setTimeout(() => {
         try { conn.close(); } catch { /* ok */ }
+        setDebugInfo(prev => ({ ...prev, lastEvent: 'host-probe-timeout' }));
         hostCheckTimerRef.current = setTimeout(attempt, 1500);
       }, 2000);
 
@@ -122,6 +192,7 @@ export default function PhoneScreenView() {
         clearTimeout(timeout);
         try { conn.close(); } catch { /* ok */ }
         addLog('Studio found — calling...');
+        setDebugInfo(prev => ({ ...prev, lastEvent: 'studio-host-ready' }));
 
         const call = peer.call(hostId, stream, { metadata: { role: 'screen', room: roomId } });
         callRef.current = call;
@@ -132,18 +203,39 @@ export default function PhoneScreenView() {
             if (peerConn.connectionState === 'connected') {
               setStatus('connected');
               addLog('Connected!');
+              setDebugInfo(prev => ({ ...prev, lastEvent: 'webrtc-connected' }));
               peerConn.removeEventListener('connectionstatechange', onConnState);
             }
           };
           peerConn.addEventListener('connectionstatechange', onConnState);
         }
 
-        call.on('stream', () => { setStatus('connected'); addLog('Connected!'); });
-        call.on('close', () => { setStatus('connecting'); addLog('Call ended, retrying...'); hostCheckTimerRef.current = setTimeout(attempt, 2000); });
-        call.on('error', (err) => { setStatus('connecting'); addLog(`Call error: ${err.message}`); hostCheckTimerRef.current = setTimeout(attempt, 2000); });
+        call.on('stream', () => {
+          setStatus('connected');
+          addLog('Connected!');
+          setDebugInfo(prev => ({ ...prev, lastEvent: 'remote-stream-active' }));
+        });
+        call.on('close', () => {
+          setStatus('connecting');
+          addLog('Call ended, retrying...');
+          callRef.current = null;
+          setDebugInfo(prev => ({ ...prev, lastEvent: 'call-closed-retrying' }));
+          hostCheckTimerRef.current = setTimeout(attempt, 2000);
+        });
+        call.on('error', (err) => {
+          setStatus('connecting');
+          addLog(`Call error: ${err.message}`);
+          callRef.current = null;
+          setDebugInfo(prev => ({ ...prev, lastEvent: `call-error:${err.message}` }));
+          hostCheckTimerRef.current = setTimeout(attempt, 2000);
+        });
       });
 
-      conn.on('error', () => { clearTimeout(timeout); hostCheckTimerRef.current = setTimeout(attempt, 1500); });
+      conn.on('error', () => {
+        clearTimeout(timeout);
+        setDebugInfo(prev => ({ ...prev, lastEvent: 'host-probe-retrying' }));
+        hostCheckTimerRef.current = setTimeout(attempt, 1500);
+      });
     };
 
     attempt();
@@ -153,9 +245,12 @@ export default function PhoneScreenView() {
     cleanup();
     setStatus('requesting');
     setErrorMsg('');
+    const nextRuntime = getNativeRuntimeInfo();
+    setRuntime(nextRuntime);
 
-    if (isNative) {
+    if (nextRuntime.isNative) {
       // Trigger native MediaProjection permission — the useEffect above picks up the stream
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'requesting-native-capture' }));
       await startCapture();
       return;
     }
@@ -164,6 +259,7 @@ export default function PhoneScreenView() {
     if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
       setStatus('error');
       setErrorMsg('DOWNLOAD_PROMPT');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'display-media-unavailable' }));
       return;
     }
 
@@ -176,6 +272,7 @@ export default function PhoneScreenView() {
     } catch (err: unknown) {
       setStatus('error');
       const msg = err instanceof Error ? err.message : '';
+      setDebugInfo(prev => ({ ...prev, lastEvent: `display-media-error:${msg || 'unknown'}` }));
       if (msg.toLowerCase().includes('permission') || msg.toLowerCase().includes('denied') || msg.toLowerCase().includes('not allowed')) {
         setErrorMsg('Screen share was denied. Please allow it and try again.');
       } else if (msg.toLowerCase().includes('not supported') || msg.toLowerCase().includes('not implemented')) {
@@ -250,6 +347,11 @@ export default function PhoneScreenView() {
             {logs.map((l, i) => (
               <span key={i} className="text-[10px] text-white/50 font-mono">{l}</span>
             ))}
+            {searchSecs >= 10 && (
+              <span className="text-[10px] text-yellow-400/80 font-mono text-center px-4">
+                Make sure AetherCast Studio is open and waiting for the room on desktop.
+              </span>
+            )}
           </div>
         )}
 
@@ -296,6 +398,17 @@ export default function PhoneScreenView() {
             Stop Sharing
           </button>
         ) : null}
+
+        <div className="rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-[10px] font-mono text-white/55 space-y-1">
+          <div>Native: {runtime.isNative ? 'yes' : 'no'}</div>
+          <div>Platform: {runtime.platform}</div>
+          <div>Bridge: {runtime.hasWindowBridge ? 'present' : 'missing'}</div>
+          <div>Capture: {isCapturing ? 'active' : 'idle'}</div>
+          <div>Host: {debugInfo.hostId}</div>
+          <div>Client: {debugInfo.clientId || 'pending'}</div>
+          <div>Peer server: {debugInfo.peerServer || 'pending'}</div>
+          <div>State: {debugInfo.lastEvent}</div>
+        </div>
 
         <p className="text-[11px] text-gray-600 text-center">Room: {roomId}</p>
       </motion.div>

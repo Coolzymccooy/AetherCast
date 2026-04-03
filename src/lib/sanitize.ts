@@ -1,3 +1,5 @@
+import { isValidRoomId as isValidNormalizedRoomId } from '../utils/roomId';
+
 /** Sanitize user-supplied strings to prevent XSS injection */
 export function sanitizeText(input: string, maxLength = 500): string {
   if (typeof input !== 'string') return '';
@@ -11,7 +13,7 @@ export function sanitizeText(input: string, maxLength = 500): string {
 
 /** Validate a room ID: alphanumeric + hyphens/underscores, max 64 chars */
 export function isValidRoomId(roomId: unknown): roomId is string {
-  return typeof roomId === 'string' && roomId.length > 0 && roomId.length <= 64 && /^[\w-]+$/.test(roomId);
+  return isValidNormalizedRoomId(roomId);
 }
 
 /** Validate RTMP URL format */

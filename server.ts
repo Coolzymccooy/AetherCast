@@ -11,6 +11,7 @@ import { spawn, ChildProcess } from "child_process";
 import crypto from "crypto";
 import os from "os";
 import dotenv from "dotenv";
+import { isValidRoomId, resolveRoomId } from "./src/utils/roomId";
 
 dotenv.config();
 
@@ -749,20 +750,22 @@ async function startServer() {
 
     socket.on("join-room", (roomId) => {
       // Validate room ID format
-      if (typeof roomId !== 'string' || roomId.length > 64 || !/^[\w-]+$/.test(roomId)) {
+      if (!isValidRoomId(roomId)) {
         socket.emit('server-log', { message: 'Invalid room ID', type: 'error' });
         return;
       }
-      socket.join(roomId);
-      console.log(`User ${socket.id} joined room ${roomId}`);
-      socket.to(roomId).emit("user-joined", socket.id);
+      const normalizedRoomId = resolveRoomId(roomId);
+      socket.join(normalizedRoomId);
+      console.log(`User ${socket.id} joined room ${normalizedRoomId}`);
+      socket.to(normalizedRoomId).emit("user-joined", socket.id);
     });
 
     socket.on("signal", (data) => {
       if (data.to) {
         io.to(data.to).emit("signal", { from: socket.id, signal: data.signal });
-      } else if (data.roomId && typeof data.roomId === 'string') {
-        socket.to(data.roomId).emit("signal", { from: socket.id, signal: data.signal });
+      } else if (isValidRoomId(data.roomId)) {
+        const normalizedRoomId = resolveRoomId(data.roomId);
+        socket.to(normalizedRoomId).emit("signal", { from: socket.id, signal: data.signal });
       }
     });
 
@@ -832,7 +835,8 @@ async function startServer() {
           return;
         }
 
-        if (data.roomId && typeof data.roomId === 'string') {
+        if (isValidRoomId(data.roomId)) {
+          const normalizedRoomId = resolveRoomId(data.roomId);
           // Sanitize message fields before relaying
           const sanitizedMessage = {
             ...data.message,
@@ -845,7 +849,10 @@ async function startServer() {
             timestamp: data.message.timestamp,
             visible: false,
           };
-          socket.to(data.roomId).emit("audience-message", sanitizedMessage);
+          socket.to(normalizedRoomId).emit("audience-message", sanitizedMessage);
+        } else {
+          if (typeof callback === 'function') callback({ ok: false, error: 'Invalid room ID' });
+          return;
         }
         if (typeof callback === 'function') callback({ ok: true });
       } catch (e) {

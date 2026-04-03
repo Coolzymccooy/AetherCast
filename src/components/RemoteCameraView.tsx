@@ -4,6 +4,8 @@ import { Wifi, WifiOff, Mic, MicOff, Sun, Moon, RefreshCcw, ZoomIn, ZoomOut } fr
 import { motion } from 'motion/react';
 import { hostPeerId, clientPeerId } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
+import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
+import { resolveRoomId } from '../utils/roomId';
 
 type Resolution = '720p' | '1080p';
 const RESOLUTIONS: Record<Resolution, { width: number; height: number }> = {
@@ -24,7 +26,8 @@ const RESOLUTIONS: Record<Resolution, { width: number; height: number }> = {
  *   4. Call host with stream → host answers → WebRTC connected
  */
 export default function RemoteCameraView() {
-  const roomId = new URLSearchParams(window.location.search).get('room') ?? 'SLTN-1234';
+  const roomId = resolveRoomId(new URLSearchParams(window.location.search).get('room'));
+  const initialHostId = hostPeerId(roomId);
 
   const [status, setStatus] = useState<'idle' | 'camera' | 'connecting' | 'ready' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
@@ -35,6 +38,12 @@ export default function RemoteCameraView() {
   const [zoom, setZoom] = useState(1);
   const [maxZoom, setMaxZoom] = useState(1);
   const [logs, setLogs] = useState<string[]>([]);
+  const [debugInfo, setDebugInfo] = useState({
+    hostId: initialHostId,
+    clientId: '',
+    peerServer: '',
+    lastEvent: 'idle',
+  });
 
   const searchTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const broadcastFnRef = useRef<(() => void) | null>(null);
@@ -49,8 +58,8 @@ export default function RemoteCameraView() {
   }, []);
 
   const cleanup = useCallback(() => {
-    if (hostCheckTimerRef.current) clearTimeout(hostCheckTimerRef.current);
-    if (searchTimerRef.current) clearInterval(searchTimerRef.current);
+    if (hostCheckTimerRef.current) { clearTimeout(hostCheckTimerRef.current); hostCheckTimerRef.current = null; }
+    if (searchTimerRef.current) { clearInterval(searchTimerRef.current); searchTimerRef.current = null; }
     callRef.current?.close();
     peerRef.current?.destroy();
     streamRef.current?.getTracks().forEach(t => t.stop());
@@ -77,6 +86,7 @@ export default function RemoteCameraView() {
 
   const doCall = useCallback((peer: Peer, stream: MediaStream, attempt: () => void) => {
     const hostId = hostPeerId(roomId);
+    setDebugInfo(prev => ({ ...prev, hostId, lastEvent: 'calling-host' }));
     addLog('Calling Studio...');
 
     const call = peer.call(hostId, stream, { metadata: { role: 'camera', room: roomId } });
@@ -88,22 +98,31 @@ export default function RemoteCameraView() {
         if (peerConn.connectionState === 'connected') {
           setStatus('connected');
           addLog('Connected!');
+          setDebugInfo(prev => ({ ...prev, lastEvent: 'webrtc-connected' }));
           peerConn.removeEventListener('connectionstatechange', onConnState);
         }
       };
       peerConn.addEventListener('connectionstatechange', onConnState);
     }
-    call.on('stream', () => { setStatus('connected'); addLog('Connected!'); });
+    call.on('stream', () => {
+      setStatus('connected');
+      addLog('Connected!');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'remote-stream-active' }));
+    });
     call.on('close', () => {
       setStatus('connecting');
       addLog('Call ended, retrying...');
       broadcastFnRef.current = null;
+      callRef.current = null;
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'call-closed-retrying' }));
       hostCheckTimerRef.current = setTimeout(attempt, 2000);
     });
     call.on('error', (err) => {
       setStatus('connecting');
       addLog(`Call error: ${err.message}`);
       broadcastFnRef.current = null;
+      callRef.current = null;
+      setDebugInfo(prev => ({ ...prev, lastEvent: `call-error:${err.message}` }));
       hostCheckTimerRef.current = setTimeout(attempt, 2000);
     });
   }, [roomId, addLog]);
@@ -113,10 +132,12 @@ export default function RemoteCameraView() {
 
     const attempt = () => {
       addLog('Searching for Studio...');
+      setDebugInfo(prev => ({ ...prev, hostId, lastEvent: 'probing-studio-host' }));
       const conn = peer.connect(hostId, { reliable: true });
 
       const timeout = setTimeout(() => {
         try { conn.close(); } catch { /* ok */ }
+        setDebugInfo(prev => ({ ...prev, lastEvent: 'host-probe-timeout' }));
         hostCheckTimerRef.current = setTimeout(attempt, 1500);
       }, 2000);
 
@@ -124,6 +145,7 @@ export default function RemoteCameraView() {
         clearTimeout(timeout);
         try { conn.close(); } catch { /* ok */ }
         addLog('Studio found!');
+        setDebugInfo(prev => ({ ...prev, lastEvent: 'studio-host-ready' }));
         // Park here — wait for user to tap "Start Broadcasting"
         setStatus('ready');
         broadcastFnRef.current = () => doCall(peer, stream, attempt);
@@ -131,6 +153,7 @@ export default function RemoteCameraView() {
 
       conn.on('error', () => {
         clearTimeout(timeout);
+        setDebugInfo(prev => ({ ...prev, lastEvent: 'host-probe-retrying' }));
         hostCheckTimerRef.current = setTimeout(attempt, 1500);
       });
     };
@@ -216,15 +239,31 @@ export default function RemoteCameraView() {
 
     const myId = clientPeerId(roomId);
     const peerEnv = getPeerEnv();
+    const peerServer = `${peerEnv.secure ? 'https' : 'http'}://${peerEnv.host}:${peerEnv.port}${peerEnv.path}`;
+    setDebugInfo({
+      hostId: hostPeerId(roomId),
+      clientId: myId,
+      peerServer,
+      lastEvent: 'connecting-peerjs',
+    });
     const peer = new Peer(myId, {
       host: peerEnv.host, port: peerEnv.port, path: peerEnv.path, secure: peerEnv.secure, debug: 0,
-      config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] },
+      config: { iceServers: DEFAULT_ICE_SERVERS },
     });
     peerRef.current = peer;
-    peer.on('open', () => { addLog('Cloud ready'); startHostChecker(peer, stream); });
-    peer.on('disconnected', () => { addLog('Cloud disconnected, reconnecting...'); try { (peer as any).reconnect?.(); } catch { /* ok */ } });
+    peer.on('open', () => {
+      addLog('Cloud ready');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-open' }));
+      startHostChecker(peer, stream);
+    });
+    peer.on('disconnected', () => {
+      addLog('Cloud disconnected, reconnecting...');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-disconnected' }));
+      try { (peer as any).reconnect?.(); } catch { /* ok */ }
+    });
     peer.on('error', (err: any) => {
       addLog(`Peer error: ${err.type || err.message}`);
+      setDebugInfo(prev => ({ ...prev, lastEvent: `peer-error:${err.type || err.message}` }));
       if (err.type !== 'peer-unavailable') { setStatus('error'); setErrorMsg(`PeerJS error: ${err.type || err.message}`); }
     });
   }, [acquireStream, applyStreamLocally, cleanup, addLog, startHostChecker, roomId, isMuted]);
@@ -399,6 +438,13 @@ export default function RemoteCameraView() {
         Your phone is broadcasting to Aether Studio.<br />
         Keep this screen open to stay connected.
       </p>
+
+      <div className="mt-3 w-full max-w-sm rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-[10px] font-mono text-white/55 space-y-1">
+        <div>Host: {debugInfo.hostId}</div>
+        <div>Client: {debugInfo.clientId || 'pending'}</div>
+        <div>Peer server: {debugInfo.peerServer || 'pending'}</div>
+        <div>State: {debugInfo.lastEvent}</div>
+      </div>
 
       {status === 'error' && (
         <div className="mt-4 text-center space-y-3">

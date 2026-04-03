@@ -29,6 +29,7 @@ export function useScreenCapture(): UseScreenCaptureResult {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const listenerRef = useRef<{ remove: () => void } | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
   const ensureCanvas = useCallback((): HTMLCanvasElement => {
     if (!canvasRef.current) {
@@ -45,7 +46,11 @@ export function useScreenCapture(): UseScreenCaptureResult {
   const stopCapture = useCallback(() => {
     listenerRef.current?.remove();
     listenerRef.current = null;
+    ScreenCapture.removeAllListeners().catch(() => { /* ok if bridge is not ready */ });
     ScreenCapture.stopCapture().catch(() => { /* ok if already stopped */ });
+
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
 
     if (canvasRef.current) {
       document.body.removeChild(canvasRef.current);
@@ -58,13 +63,8 @@ export function useScreenCapture(): UseScreenCaptureResult {
   const startCapture = useCallback(async () => {
     setError(null);
     try {
-      await ScreenCapture.startCapture({ width: CAPTURE_WIDTH, height: CAPTURE_HEIGHT, fps: CAPTURE_FPS });
-
       const canvas = ensureCanvas();
       const ctx = canvas.getContext('2d')!;
-
-      // Capture MediaStream from canvas at the same fps
-      const mediaStream = canvas.captureStream(CAPTURE_FPS);
 
       // Reuse one Image element for decoding frames
       if (!imgRef.current) imgRef.current = new Image();
@@ -75,7 +75,12 @@ export function useScreenCapture(): UseScreenCaptureResult {
         img.src = `data:image/jpeg;base64,${jpeg}`;
       });
 
+      await ScreenCapture.startCapture({ width: CAPTURE_WIDTH, height: CAPTURE_HEIGHT, fps: CAPTURE_FPS });
+
+      // Capture MediaStream from canvas at the same fps after the listener is wired up
+      const mediaStream = canvas.captureStream(CAPTURE_FPS);
       listenerRef.current = listener;
+      streamRef.current = mediaStream;
       setStream(mediaStream);
       setIsCapturing(true);
     } catch (err: unknown) {
@@ -94,6 +99,8 @@ export function useScreenCapture(): UseScreenCaptureResult {
         canvasRef.current = null;
       }
       ScreenCapture.stopCapture().catch(() => { /* ok */ });
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     };
   }, []);
 

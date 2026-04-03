@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Camera, Monitor, MessageSquare, QrCode, ArrowRight, X } from 'lucide-react';
 import MobileOnboarding from './MobileOnboarding';
 import QrScanner from './QrScanner';
+import { DEFAULT_ROOM_ID, resolveRoomId } from '../utils/roomId';
 
 type Mode = 'remote' | 'screen' | 'audience';
 
@@ -62,7 +63,7 @@ export default function MobileHome() {
 
   const connect = () => {
     if (!selected) return;
-    const room = roomCode.trim().toUpperCase() || 'SLTN-1234';
+    const room = resolveRoomId(roomCode || DEFAULT_ROOM_ID);
     window.location.href = `/?mode=${selected.mode}&room=${room}`;
   };
 
@@ -72,9 +73,10 @@ export default function MobileHome() {
       // The QR contains a full URL like https://aethercast.../…?mode=remote&room=SLTN-1234
       const url = new URL(raw);
       const mode = url.searchParams.get('mode');
-      const room = url.searchParams.get('room') ?? 'SLTN-1234';
       if (mode && ['remote', 'screen', 'audience'].includes(mode)) {
-        window.location.href = `/?mode=${mode}&room=${room}`;
+        url.searchParams.set('mode', mode);
+        url.searchParams.set('room', resolveRoomId(url.searchParams.get('room')));
+        window.location.href = `/${url.search}`;
       }
     } catch {
       // Not a valid URL — ignore and let user try again

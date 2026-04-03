@@ -3,6 +3,7 @@ import { motion } from 'motion/react';
 import { io, Socket } from 'socket.io-client';
 import { MessageSquare, Heart, Send, Sparkles, User, CheckCircle2 } from 'lucide-react';
 import { AudienceMessage } from '../types';
+import { isValidRoomId, normalizeRoomId, resolveRoomId } from '../utils/roomId';
 
 export const AudienceLanding = () => {
   const [roomId, setRoomId] = useState<string>('');
@@ -10,31 +11,51 @@ export const AudienceLanding = () => {
   const [name, setName] = useState('');
   const [type, setType] = useState<'Q&A' | 'Prayer' | 'Testimony' | 'Welcome' | 'Poll'>('Q&A');
   const [status, setStatus] = useState<'idle' | 'sending' | 'success' | 'error'>('idle');
+  const [isSocketConnected, setIsSocketConnected] = useState(false);
   const socketRef = useRef<Socket | null>(null);
+  const resetStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const queueStatusReset = () => {
+    if (resetStatusTimerRef.current) clearTimeout(resetStatusTimerRef.current);
+    resetStatusTimerRef.current = setTimeout(() => setStatus('idle'), 3000);
+  };
 
   useEffect(() => {
     // Extract room ID from URL
     const params = new URLSearchParams(window.location.search);
-    const room = params.get('room');
-    if (room) {
-      setRoomId(room);
+    const rawRoom = params.get('room');
+    const normalizedRoom = rawRoom ? normalizeRoomId(rawRoom) : '';
+    if (!isValidRoomId(normalizedRoom)) {
+      setRoomId('');
+      return;
     }
+
+    const room = resolveRoomId(normalizedRoom);
+    setRoomId(room);
 
     const newSocket = io(window.location.origin);
     socketRef.current = newSocket;
 
-    if (room) {
+    newSocket.on('connect', () => {
+      setIsSocketConnected(true);
       newSocket.emit('join-room', room);
-    }
+    });
+    newSocket.on('disconnect', () => setIsSocketConnected(false));
+    newSocket.on('connect_error', () => setIsSocketConnected(false));
 
     return () => {
+      if (resetStatusTimerRef.current) clearTimeout(resetStatusTimerRef.current);
       newSocket.disconnect();
     };
   }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!message.trim() || !socketRef.current || !roomId) return;
+    if (!message.trim() || !socketRef.current || !roomId || !isSocketConnected) {
+      setStatus('error');
+      queueStatusReset();
+      return;
+    }
 
     setStatus('sending');
 
@@ -47,25 +68,27 @@ export const AudienceLanding = () => {
       visible: false
     };
 
-    socketRef.current.emit('audience-message', { roomId, message: newMsg }, (ack: { ok: boolean }) => {
-      if (ack?.ok) {
-        setStatus('success');
+    let settled = false;
+    const finish = (next: 'success' | 'error') => {
+      if (settled) return;
+      settled = true;
+      setStatus(next);
+      if (next === 'success') {
         setMessage('');
-        setTimeout(() => setStatus('idle'), 3000);
+      }
+      queueStatusReset();
+    };
+
+    const ackTimeout = setTimeout(() => finish('error'), 5000);
+
+    socketRef.current.emit('audience-message', { roomId, message: newMsg }, (ack: { ok: boolean }) => {
+      clearTimeout(ackTimeout);
+      if (ack?.ok) {
+        finish('success');
       } else {
-        setStatus('error');
-        setTimeout(() => setStatus('idle'), 3000);
+        finish('error');
       }
     });
-
-    // Fallback: if server doesn't support ack, resolve success after timeout
-    setTimeout(() => {
-      setStatus(prev => prev === 'sending' ? 'success' : prev);
-      if (status === 'sending') {
-        setMessage('');
-        setTimeout(() => setStatus('idle'), 3000);
-      }
-    }, 2000);
   };
 
   const typeOptions = [
@@ -96,6 +119,9 @@ export const AudienceLanding = () => {
           </div>
           <h1 className="text-2xl font-bold">Audience Portal</h1>
           <p className="text-gray-400 text-sm mt-2">Send a message directly to the studio.</p>
+          <p className={`text-xs mt-3 ${isSocketConnected ? 'text-green-400' : 'text-yellow-400'}`}>
+            {isSocketConnected ? 'Connected to studio audience room' : 'Connecting to studio...'}
+          </p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-6">
@@ -149,13 +175,13 @@ export const AudienceLanding = () => {
 
           {status === 'error' && (
             <div className="p-4 bg-accent-red/10 border border-accent-red/30 rounded-xl text-accent-red text-sm text-center">
-              Failed to send message. Please try again.
+              {isSocketConnected ? 'Failed to send message. Please try again.' : 'Still connecting to the studio. Try again in a moment.'}
             </div>
           )}
 
           <button
             type="submit"
-            disabled={status === 'sending' || !message.trim()}
+            disabled={status === 'sending' || !message.trim() || !isSocketConnected}
             className={`w-full py-4 rounded-xl font-bold text-lg transition-all flex items-center justify-center gap-2 ${
               status === 'success'
                 ? 'bg-green-500 text-white'

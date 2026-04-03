@@ -6,6 +6,7 @@ import { Scene, Source, ServerLog, AudioChannel } from '../types';
 import { ROOM_ID, CLOUD_URL } from '../constants';
 import { hostPeerId } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
+import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
 import { audioEngine } from '../lib/audioEngine';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'disconnected' | 'failed';
@@ -33,6 +34,7 @@ export function useWebRTC({
   onError,
   onPhoneConnected,
 }: UseWebRTCOptions) {
+  const roomId = ROOM_ID;
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
@@ -335,7 +337,7 @@ export function useWebRTC({
       hostPeerRef.current = null;
     }
 
-    const hostId = hostPeerId(ROOM_ID);
+    const hostId = hostPeerId(roomId);
     const peerEnv = getPeerEnv();
     const hostPeer = new PeerJS(hostId, {
       host: peerEnv.host,
@@ -344,10 +346,7 @@ export function useWebRTC({
       secure: peerEnv.secure,
       debug: 0,
       config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-        ],
+        iceServers: DEFAULT_ICE_SERVERS,
       },
     });
     hostPeerRef.current = hostPeer;
@@ -445,7 +444,9 @@ export function useWebRTC({
     if (serverUrl === 'http://localhost:3001') {
       const bridge = io(CLOUD_URL, { reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 3000 });
       audienceBridgeSocketRef.current = bridge;
-      bridge.emit('join-room', ROOM_ID);
+      bridge.on('connect', () => {
+        bridge.emit('join-room', roomId);
+      });
       bridge.on('audience-message', (message: any) => {
         setAudienceMessagesRef.current(prev => [message, ...prev].slice(0, 50));
       });
@@ -459,13 +460,15 @@ export function useWebRTC({
     });
     socketRef.current = socket;
 
-    socket.on('connect', () => setIsSocketConnected(true));
+    socket.on('connect', () => {
+      setIsSocketConnected(true);
+      socket.emit('join-room', roomId);
+    });
     socket.on('disconnect', () => {
       setIsSocketConnected(false);
       // Clean up peers on disconnect to prevent stale references
       destroyAllPeers();
     });
-    socket.emit('join-room', ROOM_ID);
 
     socket.on('signal', (data: { from: string; signal: any }) => {
       // Destroy existing peer for this remote user to prevent duplicates
@@ -481,7 +484,7 @@ export function useWebRTC({
       updatePeerState(data.from, 'connecting');
 
       peer.on('signal', (signal) => {
-        socket.emit('signal', { roomId: ROOM_ID, signal, to: data.from });
+        socket.emit('signal', { roomId, signal, to: data.from });
       });
       peer.on('stream', (stream) => {
         setRemoteStreams(prev => {

@@ -23,5 +23,10 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "exclude": ["**/*.test.ts", "**/*.test.tsx"]
+  "exclude": [
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "dist",
+    "src-tauri/target"
+  ]
 }

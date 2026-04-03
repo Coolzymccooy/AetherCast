@@ -1,4 +1,5 @@
 import { Scene, Source, AudioChannel, Script } from './types';
+import { DEFAULT_ROOM_ID, getRoomIdFromSearch } from './utils/roomId';
 
 export const SCENES: Scene[] = [
   { id: '1', name: 'Cam 1', type: 'CAM' },
@@ -50,16 +51,12 @@ export const DEFAULT_CAMO_SETTINGS = {
   removeBackground: false,
 };
 
-/** Room ID — reads from URL ?room= parameter, falls back to 'SLTN-1234' */
+/** Room ID — reads from URL ?room= parameter, falls back to the default room */
 export function getRoomId(): string {
   if (typeof window !== 'undefined') {
-    const params = new URLSearchParams(window.location.search);
-    const room = params.get('room');
-    if (room && /^[\w-]+$/.test(room) && room.length <= 64) {
-      return room;
-    }
+    return getRoomIdFromSearch(window.location.search);
   }
-  return 'SLTN-1234';
+  return DEFAULT_ROOM_ID;
 }
 
 /** @deprecated Use getRoomId() instead — retained for backward compatibility */
