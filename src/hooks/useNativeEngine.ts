@@ -21,7 +21,9 @@ type NativeHealthState =
 interface NativeOutputStatus {
   name: string;
   protocol: string;
+  muxer: string;
   target: string;
+  recovery_delay_ms: number;
   state: NativeHealthState;
   last_error?: string | null;
   last_update_ms: number;
@@ -423,7 +425,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
         if (!previousOutput) {
           addServerLog(
-            `[output:${output.name}] ${output.state} (${output.protocol} ${output.target})`,
+            `[output:${output.name}] ${output.state} (${output.protocol}/${output.muxer} ${output.target}, backoff ${output.recovery_delay_ms}ms)`,
             healthStateLogType(output.state),
           );
           continue;

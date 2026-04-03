@@ -1,8 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::state::{
-    ArchiveStatus, EngineHealthState, GPUStreamConfig, OutputStatus, StreamDestination,
-};
+use super::output::OutputManagerPlan;
+use super::state::{ArchiveStatus, EngineHealthState, OutputStatus};
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -11,13 +10,8 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub fn build_output_statuses(config: &GPUStreamConfig) -> Vec<OutputStatus> {
-    config
-        .destinations
-        .iter()
-        .filter(|destination| destination.enabled)
-        .map(build_output_status)
-        .collect()
+pub fn build_output_statuses(plan: &OutputManagerPlan) -> Vec<OutputStatus> {
+    plan.outputs.iter().map(build_output_status).collect()
 }
 
 pub fn build_archive_status(
@@ -98,43 +92,15 @@ pub fn apply_ffmpeg_signal(line: &str, outputs: &mut [OutputStatus], archive: &m
     }
 }
 
-fn build_output_status(destination: &StreamDestination) -> OutputStatus {
-    let url = destination
-        .rtmp_url
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or(destination.url.as_str());
-    let target = url
-        .split('?')
-        .next()
-        .unwrap_or(url)
-        .trim_end_matches('/')
-        .to_string();
-
+fn build_output_status(output: &super::output::OutputSessionPlan) -> OutputStatus {
     OutputStatus {
-        name: if destination.name.trim().is_empty() {
-            target.clone()
-        } else {
-            destination.name.trim().to_string()
-        },
-        protocol: if destination.protocol.trim().is_empty() {
-            infer_protocol(url).to_string()
-        } else {
-            destination.protocol.trim().to_string()
-        },
-        target,
+        name: output.name.clone(),
+        protocol: output.protocol.clone(),
+        muxer: output.muxer.clone(),
+        target: output.target.clone(),
+        recovery_delay_ms: output.recovery_delay_ms,
         state: EngineHealthState::Starting,
         last_error: None,
         last_update_ms: now_ms(),
-    }
-}
-
-fn infer_protocol(url: &str) -> &'static str {
-    if url.starts_with("srt://") {
-        "srt"
-    } else if url.starts_with("rist://") {
-        "rist"
-    } else {
-        "rtmp"
     }
 }

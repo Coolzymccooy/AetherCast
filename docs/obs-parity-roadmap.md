@@ -25,6 +25,7 @@ The current stack has improved materially, but it still falls short of broadcast
 - Phase 2 has started:
   - `src-tauri/src/engine/state.rs` now owns native runtime/output/archive state shapes.
   - `src-tauri/src/engine/telemetry.rs` now owns structured output/archive health transitions.
+  - `src-tauri/src/engine/output.rs` now owns protocol-aware output/archive planning and tee/fifo assembly.
   - `get_stream_stats` now returns structured output/archive health, not only flat FFmpeg counters and error strings.
 - Still outstanding before real OBS-class parity:
   - native audio graph

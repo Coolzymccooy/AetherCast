@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -11,9 +10,13 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::output::{
+    append_output_args, build_archive_pattern, build_output_manager_plan, OutputManagerPlan,
+    DEFAULT_ARCHIVE_SEGMENT_SECONDS,
+};
 use super::state::{
     EngineHealthState, FrameBridgeRuntime, GPUStreamConfig, NativeStreamRuntime, NativeStreamStats,
-    StartStreamResponse, StreamDestination,
+    StartStreamResponse,
 };
 use super::telemetry::{
     apply_ffmpeg_signal, build_archive_status, build_output_statuses, now_ms, set_archive_state,
@@ -22,8 +25,6 @@ use super::telemetry::{
 
 const DEFAULT_MAX_RESTARTS: u32 = 12;
 const RESTART_RESET_AFTER_MS: u64 = 180_000;
-const ARCHIVE_SEGMENT_SECONDS: u32 = 300;
-const FIFO_QUEUE_SIZE: i32 = 180;
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -98,54 +99,6 @@ fn restart_delay_ms(restart_count: u32) -> u64 {
         4 => 8_000,
         _ => 15_000,
     }
-}
-
-fn archive_root_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return PathBuf::from(profile)
-                .join("Videos")
-                .join("AetherCast")
-                .join("Archive");
-        }
-    }
-
-    if cfg!(target_os = "macos") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join("Movies")
-                .join("AetherCast")
-                .join("Archive");
-        }
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join("Videos")
-            .join("AetherCast")
-            .join("Archive");
-    }
-
-    std::env::current_dir()
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .join("aether-archive")
-}
-
-fn build_archive_pattern(session_id: u64) -> Result<String, String> {
-    let root = archive_root_dir();
-    std::fs::create_dir_all(&root).map_err(|e| {
-        format!(
-            "Failed to create archive directory {}: {}",
-            root.display(),
-            e
-        )
-    })?;
-
-    let pattern = root.join(format!(
-        "aethercast-session-{}-%Y%m%d-%H%M%S.mkv",
-        session_id
-    ));
-    Ok(pattern.to_string_lossy().replace('\\', "/"))
 }
 
 fn stop_frame_bridge() {
@@ -463,56 +416,12 @@ fn supports_lavfi(ffmpeg_bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn destination_to_output(dest: &StreamDestination) -> (String, String) {
-    let url = if let Some(ref rtmp_url) = dest.rtmp_url {
-        if !rtmp_url.is_empty() {
-            rtmp_url.clone()
-        } else {
-            dest.url.clone()
-        }
-    } else {
-        dest.url.clone()
-    };
-
-    let proto = if dest.protocol.is_empty() {
-        // Auto-detect from URL
-        if url.starts_with("srt://") {
-            "srt"
-        } else if url.starts_with("rist://") {
-            "rist"
-        } else {
-            "rtmp"
-        }
-    } else {
-        dest.protocol.as_str()
-    };
-
-    match proto {
-        "srt" => {
-            let sep = if url.contains('?') { "&" } else { "?" };
-            let full = format!("{}{}mode=caller&latency=200000", url, sep);
-            ("mpegts".into(), full)
-        }
-        "rist" => ("mpegts".into(), url),
-        _ => {
-            // RTMP/RTMPS
-            let full = if !dest.stream_key.is_empty() {
-                format!("{}/{}", url.trim_end_matches('/'), dest.stream_key)
-            } else {
-                url
-            };
-            ("flv".into(), full)
-        }
-    }
-}
-
 fn build_ffmpeg_args(
     config: &GPUStreamConfig,
-    active: &[&StreamDestination],
+    output_plan: &OutputManagerPlan,
     encoder: &str,
     is_gpu: bool,
     lavfi_enabled: bool,
-    archive_path_pattern: Option<&str>,
 ) -> Vec<String> {
     let is_jpeg_mode = config.mode == "jpeg";
     let mut args: Vec<String> = Vec::new();
@@ -720,35 +629,7 @@ fn build_ffmpeg_args(
         "no_duration_filesize".into(),
     ]);
 
-    let mut tee_outputs: Vec<String> = active
-        .iter()
-        .map(|d| {
-            let (fmt, url) = destination_to_output(d);
-            format!("[f={}:onfail=ignore]{}", fmt, url)
-        })
-        .collect();
-
-    if let Some(archive_path_pattern) = archive_path_pattern {
-        tee_outputs.push(format!(
-            "[f=segment:onfail=ignore:segment_format=matroska:segment_time={}:reset_timestamps=1:strftime=1]{}",
-            ARCHIVE_SEGMENT_SECONDS,
-            archive_path_pattern
-        ));
-    }
-
-    let fifo_options = format!(
-        "attempt_recovery=1:recover_any_error=1:drop_pkts_on_overflow=1:queue_size={}:max_recovery_attempts=0:recovery_wait_time=1:restart_with_keyframe=1",
-        FIFO_QUEUE_SIZE
-    );
-    args.extend([
-        "-f".into(),
-        "tee".into(),
-        "-use_fifo".into(),
-        "1".into(),
-        "-fifo_options".into(),
-        fifo_options,
-        tee_outputs.join("|"),
-    ]);
+    append_output_args(&mut args, output_plan);
 
     args
 }
@@ -837,20 +718,9 @@ fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
         )
     };
 
-    let active: Vec<&StreamDestination> =
-        config.destinations.iter().filter(|d| d.enabled).collect();
-    if active.is_empty() {
-        return Err("No enabled destinations".into());
-    }
+    let output_plan = build_output_manager_plan(&config, archive_path_pattern.as_deref())?;
 
-    let args = build_ffmpeg_args(
-        &config,
-        &active,
-        &encoder,
-        is_gpu,
-        lavfi_enabled,
-        archive_path_pattern.as_deref(),
-    );
+    let args = build_ffmpeg_args(&config, &output_plan, &encoder, is_gpu, lavfi_enabled);
     println!("[aether] FFmpeg command: {} {}", ffmpeg_bin, args.join(" "));
 
     let mut cmd = Command::new(&ffmpeg_bin);
@@ -1060,12 +930,6 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
 /// Start GPU-accelerated streaming pipeline
 #[tauri::command]
 pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
-    let active: Vec<&StreamDestination> =
-        config.destinations.iter().filter(|d| d.enabled).collect();
-    if active.is_empty() {
-        return Err("No enabled destinations".into());
-    }
-
     {
         let guard = stream_runtime().lock().map_err(|e| e.to_string())?;
         if guard.desired_active {
@@ -1088,10 +952,13 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     let lavfi_enabled = supports_lavfi(&ffmpeg_bin);
     let session_id = now_ms();
     let archive_path_pattern = build_archive_pattern(session_id)?;
-    let output_statuses = build_output_statuses(&config);
+    let output_plan = build_output_manager_plan(&config, Some(&archive_path_pattern))?;
+    let output_statuses = build_output_statuses(&output_plan);
     let archive_status = build_archive_status(
-        Some(archive_path_pattern.clone()),
-        ARCHIVE_SEGMENT_SECONDS,
+        output_plan
+            .archive_path_pattern()
+            .map(|path| path.to_string()),
+        output_plan.archive_segment_seconds(),
         EngineHealthState::Starting,
     );
 
@@ -1114,7 +981,9 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         state.is_gpu = is_gpu;
         state.config = Some(config.clone());
         state.lavfi_enabled = lavfi_enabled;
-        state.archive_path_pattern = Some(archive_path_pattern.clone());
+        state.archive_path_pattern = output_plan
+            .archive_path_pattern()
+            .map(|path| path.to_string());
         state.last_error = None;
         state.last_exit_status = None;
         state.started_at_ms = now_ms();
@@ -1189,8 +1058,10 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         config.width,
         config.height,
         config.fps,
-        active.len(),
-        archive_path_pattern
+        output_plan.destination_count(),
+        output_plan
+            .archive_path_pattern()
+            .unwrap_or(archive_path_pattern.as_str())
     );
 
     let response = StartStreamResponse {
@@ -1319,7 +1190,11 @@ pub async fn get_stream_stats() -> Result<String, String> {
         write_failures: state.write_failures,
         keepalive_frames: state.keepalive_frames,
         archive_path_pattern: state.archive_path_pattern,
-        archive_segment_seconds: ARCHIVE_SEGMENT_SECONDS,
+        archive_segment_seconds: if state.archive_status.segment_seconds > 0 {
+            state.archive_status.segment_seconds
+        } else {
+            DEFAULT_ARCHIVE_SEGMENT_SECONDS
+        },
         last_restart_delay_ms: state.last_restart_delay_ms,
         last_error: state.last_error,
         last_exit_status: state.last_exit_status,

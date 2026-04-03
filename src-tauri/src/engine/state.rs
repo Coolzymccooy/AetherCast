@@ -67,7 +67,9 @@ pub enum EngineHealthState {
 pub struct OutputStatus {
     pub name: String,
     pub protocol: String,
+    pub muxer: String,
     pub target: String,
+    pub recovery_delay_ms: u64,
     pub state: EngineHealthState,
     pub last_error: Option<String>,
     pub last_update_ms: u64,
