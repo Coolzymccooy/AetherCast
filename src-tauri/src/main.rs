@@ -8,7 +8,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::Message;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -186,6 +191,12 @@ struct NativeStreamStats {
     last_frame_age_ms: u64,
     uptime_ms: u64,
     lavfi_enabled: bool,
+    transport_mode: String,
+    bridge_url: Option<String>,
+    bridge_connected: bool,
+    bridge_frames_received: u64,
+    bridge_bytes_received: u64,
+    bridge_last_error: Option<String>,
 }
 
 fn stream_runtime() -> &'static Mutex<NativeStreamRuntime> {
@@ -198,6 +209,46 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[derive(Debug, Clone)]
+struct FrameBridgeRuntime {
+    session_id: u64,
+    url: Option<String>,
+    token: Option<String>,
+    connected: bool,
+    frames_received: u64,
+    bytes_received: u64,
+    shutdown_tx: Option<Arc<Mutex<Option<oneshot::Sender<()>>>>>,
+    last_error: Option<String>,
+}
+
+impl Default for FrameBridgeRuntime {
+    fn default() -> Self {
+        Self {
+            session_id: 0,
+            url: None,
+            token: None,
+            connected: false,
+            frames_received: 0,
+            bytes_received: 0,
+            shutdown_tx: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct StartStreamResponse {
+    message: String,
+    bridge_url: Option<String>,
+    bridge_token: Option<String>,
+    transport: String,
+}
+
+fn frame_bridge_runtime() -> &'static Mutex<FrameBridgeRuntime> {
+    static INSTANCE: OnceLock<Mutex<FrameBridgeRuntime>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(FrameBridgeRuntime::default()))
 }
 
 fn restart_delay_ms(restart_count: u32) -> u64 {
@@ -239,6 +290,209 @@ fn build_archive_pattern(session_id: u64) -> Result<String, String> {
 
     let pattern = root.join(format!("aethercast-session-{}-%Y%m%d-%H%M%S.mkv", session_id));
     Ok(pattern.to_string_lossy().replace('\\', "/"))
+}
+
+fn stop_frame_bridge() {
+    let shutdown = {
+        let mut bridge = match frame_bridge_runtime().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        bridge.connected = false;
+        bridge.url = None;
+        bridge.token = None;
+        bridge.frames_received = 0;
+        bridge.bytes_received = 0;
+        bridge.last_error = None;
+        bridge.shutdown_tx.take()
+    };
+
+    if let Some(shutdown) = shutdown {
+        if let Ok(mut tx_guard) = shutdown.lock() {
+            if let Some(tx) = tx_guard.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+}
+
+fn handle_frame_bytes(bytes: Vec<u8>) -> Result<(), String> {
+    {
+        if let Ok(mut rb) = replay_buffer().lock() {
+            if rb.active && rb.capacity > 0 {
+                let pos = rb.write_pos;
+                if pos < rb.frames.len() {
+                    rb.frames[pos] = bytes.clone();
+                } else {
+                    rb.frames.push(bytes.clone());
+                }
+                rb.write_pos = (pos + 1) % rb.capacity;
+                if rb.count < rb.capacity {
+                    rb.count += 1;
+                }
+            }
+        }
+    }
+
+    {
+        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.last_frame_at_ms = now_ms();
+        state.last_frame = Some(bytes.clone());
+    }
+
+    let mut guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
+    if let Some(ref mut stdin) = *guard {
+        match stdin.write_all(&bytes) {
+            Ok(()) => {
+                if let Ok(mut c) = frame_counter().lock() {
+                    *c += 1;
+                }
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.bytes_written += bytes.len() as u64;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                println!("[aether] FFmpeg stdin write failed: {} — clearing stream", e);
+                *guard = None;
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.write_failures += 1;
+                    state.last_error = Some(format!("FFmpeg stdin write failed: {}", e));
+                    if state.desired_active {
+                        state.restarting = true;
+                        return Err("STREAM_RESTARTING".into());
+                    }
+                }
+                Err("STREAM_DEAD".into())
+            }
+        }
+    } else {
+        let state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        if state.desired_active {
+            Err("STREAM_RESTARTING".into())
+        } else {
+            Err("STREAM_DEAD".into())
+        }
+    }
+}
+
+async fn start_frame_bridge(session_id: u64) -> Result<String, String> {
+    stop_frame_bridge();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("Failed to bind local frame bridge: {}", e))?;
+    let address = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to read frame bridge address: {}", e))?;
+    let bridge_url = format!("ws://127.0.0.1:{}/frames", address.port());
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let shutdown_tx = Arc::new(Mutex::new(Some(shutdown_tx)));
+
+    {
+        let mut bridge = frame_bridge_runtime().lock().map_err(|e| e.to_string())?;
+        bridge.session_id = session_id;
+        bridge.url = Some(bridge_url.clone());
+        bridge.token = None;
+        bridge.connected = false;
+        bridge.frames_received = 0;
+        bridge.bytes_received = 0;
+        bridge.shutdown_tx = Some(shutdown_tx.clone());
+        bridge.last_error = None;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    break;
+                }
+                accept_result = listener.accept() => {
+                    let (stream, _) = match accept_result {
+                        Ok(parts) => parts,
+                        Err(err) => {
+                            if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+                                if bridge.session_id == session_id {
+                                    bridge.last_error = Some(format!("Frame bridge accept failed: {}", err));
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                    let mut websocket = match accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(err) => {
+                            if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+                                if bridge.session_id == session_id {
+                                    bridge.last_error = Some(format!("Frame bridge handshake failed: {}", err));
+                                }
+                            }
+                            continue;
+                        }
+                    };
+
+                    if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+                        if bridge.session_id == session_id {
+                            bridge.connected = true;
+                            bridge.last_error = None;
+                        }
+                    }
+
+                    while let Some(message_result) = websocket.next().await {
+                        match message_result {
+                            Ok(Message::Binary(bytes)) => {
+                                if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+                                    if bridge.session_id == session_id {
+                                        bridge.frames_received += 1;
+                                        bridge.bytes_received += bytes.len() as u64;
+                                    }
+                                }
+
+                                if let Err(err) = handle_frame_bytes(bytes.to_vec()) {
+                                    if err != "STREAM_RESTARTING" {
+                                        if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+                                            if bridge.session_id == session_id {
+                                                bridge.last_error = Some(err);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Message::Close(_)) => break,
+                            Ok(Message::Ping(_))
+                            | Ok(Message::Pong(_))
+                            | Ok(Message::Text(_))
+                            | Ok(Message::Frame(_)) => {}
+                            Err(err) => {
+                                if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+                                    if bridge.session_id == session_id {
+                                        bridge.last_error = Some(format!("Frame bridge read failed: {}", err));
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+                        if bridge.session_id == session_id {
+                            bridge.connected = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Ok(mut bridge) = frame_bridge_runtime().lock() {
+            if bridge.session_id == session_id {
+                bridge.connected = false;
+                bridge.shutdown_tx = None;
+            }
+        }
+    });
+
+    Ok(bridge_url)
 }
 
 // ---------------------------------------------------------------------------
@@ -867,10 +1121,21 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     start_keepalive_loop(session_id);
     spawn_ffmpeg_from_runtime()?;
 
+    let bridge_url = match start_frame_bridge(session_id).await {
+        Ok(url) => Some(url),
+        Err(err) => {
+            println!("[aether] Frame bridge unavailable, using invoke fallback: {}", err);
+            if let Ok(mut state) = stream_runtime().lock() {
+                state.last_error = Some(format!("Frame bridge unavailable, using invoke fallback: {}", err));
+            }
+            None
+        }
+    };
+
     let encoder_label = if is_gpu { format!("GPU ({})", encoder) } else { "Software (libx264)".into() };
     let mode_label = if config.mode == "jpeg" { "JPEG->image2pipe" } else { "Raw RGBA" };
     let audio_label = if lavfi_enabled { "with silent audio keepalive" } else { "without synthetic audio fallback" };
-    return Ok(format!(
+    let message = format!(
         "Streaming via {} [{}] {} at {}x{} @{}fps to {} destination(s); archive segments: {}",
         encoder_label,
         mode_label,
@@ -880,7 +1145,16 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         config.fps,
         active.len(),
         archive_path_pattern
-    ));
+    );
+
+    let response = StartStreamResponse {
+        message,
+        bridge_url: bridge_url.clone(),
+        bridge_token: None,
+        transport: if bridge_url.is_some() { "bridge".into() } else { "invoke".into() },
+    };
+
+    serde_json::to_string(&response).map_err(|e| e.to_string())
 }
 
 
@@ -900,6 +1174,7 @@ async fn stop_stream() -> Result<String, String> {
         state.last_restart_delay_ms = 0;
     }
 
+    stop_frame_bridge();
     { *ffmpeg_stdin().lock().map_err(|e| e.to_string())? = None; }
     let mut guard = ffmpeg_process().lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = guard.take() {
@@ -921,62 +1196,7 @@ async fn write_frame(data: String) -> Result<(), String> {
         .decode(&data)
         .map_err(|e| format!("Base64 decode failed: {}", e))?;
 
-    // Push to replay buffer if active
-    {
-        if let Ok(mut rb) = replay_buffer().lock() {
-            if rb.active && rb.capacity > 0 {
-                let pos = rb.write_pos;
-                if pos < rb.frames.len() {
-                    rb.frames[pos] = bytes.clone();
-                } else {
-                    rb.frames.push(bytes.clone());
-                }
-                rb.write_pos = (pos + 1) % rb.capacity;
-                if rb.count < rb.capacity { rb.count += 1; }
-            }
-        }
-    }
-
-    {
-        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
-        state.last_frame_at_ms = now_ms();
-        state.last_frame = Some(bytes.clone());
-    }
-
-    // Write to FFmpeg stdin
-    let mut guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
-    if let Some(ref mut stdin) = *guard {
-        match stdin.write_all(&bytes) {
-            Ok(()) => {
-                if let Ok(mut c) = frame_counter().lock() { *c += 1; }
-                if let Ok(mut state) = stream_runtime().lock() {
-                    state.bytes_written += bytes.len() as u64;
-                }
-                Ok(())
-            }
-            Err(e) => {
-                // Pipe broken — FFmpeg has died. Clear stdin to prevent further attempts.
-                println!("[aether] FFmpeg stdin write failed: {} — clearing stream", e);
-                *guard = None;
-                if let Ok(mut state) = stream_runtime().lock() {
-                    state.write_failures += 1;
-                    state.last_error = Some(format!("FFmpeg stdin write failed: {}", e));
-                    if state.desired_active {
-                        state.restarting = true;
-                        return Err("STREAM_RESTARTING".into());
-                    }
-                }
-                Err("STREAM_DEAD".into())
-            }
-        }
-    } else {
-        let state = stream_runtime().lock().map_err(|e| e.to_string())?;
-        if state.desired_active {
-            Err("STREAM_RESTARTING".into())
-        } else {
-            Err("STREAM_DEAD".into())
-        }
-    }
+    handle_frame_bytes(bytes)
 }
 
 /// Receive raw RGBA frame and write to FFmpeg stdin (legacy raw mode)
@@ -987,62 +1207,14 @@ async fn encode_frame(frame_data: Vec<u8>, width: u32, height: u32) -> Result<()
         return Err(format!("Frame size mismatch: {} vs expected {}", frame_data.len(), expected));
     }
 
-    // Push to replay buffer if active
     {
         if let Ok(mut rb) = replay_buffer().lock() {
-            if rb.active && rb.capacity > 0 {
-                rb.width = width;
-                rb.height = height;
-                let pos = rb.write_pos;
-                if pos < rb.frames.len() {
-                    rb.frames[pos] = frame_data.clone();
-                } else {
-                    rb.frames.push(frame_data.clone());
-                }
-                rb.write_pos = (pos + 1) % rb.capacity;
-                if rb.count < rb.capacity { rb.count += 1; }
-            }
+            rb.width = width;
+            rb.height = height;
         }
     }
 
-    {
-        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
-        state.last_frame_at_ms = now_ms();
-        state.last_frame = Some(frame_data.clone());
-    }
-
-    {
-        let mut guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
-        if let Some(ref mut stdin) = *guard {
-            match stdin.write_all(&frame_data) {
-                Ok(()) => {
-                    if let Ok(mut c) = frame_counter().lock() { *c += 1; }
-                    if let Ok(mut state) = stream_runtime().lock() {
-                        state.bytes_written += frame_data.len() as u64;
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    *guard = None;
-                    if let Ok(mut state) = stream_runtime().lock() {
-                        state.write_failures += 1;
-                        state.last_error = Some(format!("FFmpeg stdin write failed: {}", e));
-                        if state.desired_active {
-                            state.restarting = true;
-                            return Err("STREAM_RESTARTING".into());
-                        }
-                    }
-                    return Err(format!("Write failed: {}", e));
-                }
-            }
-        } else {
-            let state = stream_runtime().lock().map_err(|e| e.to_string())?;
-            if state.desired_active {
-                return Err("STREAM_RESTARTING".into());
-            }
-            return Err("No active stream".into());
-        }
-    }
+    handle_frame_bytes(frame_data)
 }
 
 /// Get streaming stats
@@ -1050,6 +1222,7 @@ async fn encode_frame(frame_data: Vec<u8>, width: u32, height: u32) -> Result<()
 async fn get_stream_stats() -> Result<String, String> {
     let frames = frame_counter().lock().map(|c| *c).unwrap_or(0);
     let state = stream_runtime().lock().map_err(|e| e.to_string())?.clone();
+    let bridge = frame_bridge_runtime().lock().map_err(|e| e.to_string())?.clone();
     let (width, height, fps, bitrate_kbps) = state
         .config
         .as_ref()
@@ -1091,6 +1264,12 @@ async fn get_stream_stats() -> Result<String, String> {
         last_frame_age_ms,
         uptime_ms,
         lavfi_enabled: state.lavfi_enabled,
+        transport_mode: if bridge.url.is_some() { "bridge".into() } else { "invoke".into() },
+        bridge_url: bridge.url,
+        bridge_connected: bridge.connected,
+        bridge_frames_received: bridge.frames_received,
+        bridge_bytes_received: bridge.bytes_received,
+        bridge_last_error: bridge.last_error,
     }).map_err(|e| e.to_string())?);
 }
 

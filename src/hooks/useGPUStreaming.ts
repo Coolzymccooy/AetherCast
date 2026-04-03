@@ -34,6 +34,19 @@ interface NativeStreamStats {
   last_frame_age_ms: number;
   uptime_ms: number;
   lavfi_enabled: boolean;
+  transport_mode: 'bridge' | 'invoke';
+  bridge_url?: string | null;
+  bridge_connected: boolean;
+  bridge_frames_received: number;
+  bridge_bytes_received: number;
+  bridge_last_error?: string | null;
+}
+
+interface NativeStartStreamResponse {
+  message: string;
+  bridge_url?: string | null;
+  bridge_token?: string | null;
+  transport?: 'bridge' | 'invoke';
 }
 
 interface GPUStreamStats {
@@ -65,6 +78,8 @@ type NativeCaptureProfile = {
 };
 
 const STATS_POLL_MS = 1500;
+const BRIDGE_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
+const BRIDGE_RECONNECT_MS = 1000;
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
@@ -148,6 +163,10 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
   const invokeRef = useRef<any>(null);
   const isStreamingRef = useRef(false);
   const lastNativeStateRef = useRef<NativeStreamStats | null>(null);
+  const bridgeSocketRef = useRef<WebSocket | null>(null);
+  const bridgeUrlRef = useRef<string | null>(null);
+  const bridgeReconnectTimerRef = useRef<number | null>(null);
+  const transportModeRef = useRef<'bridge' | 'invoke'>('invoke');
 
   const addServerLog = useCallback((message: string, type: ServerLog['type']) => {
     if (!options.setServerLogs) return;
@@ -164,8 +183,88 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
     }
   }, []);
 
+  const clearBridgeReconnectTimer = useCallback(() => {
+    if (bridgeReconnectTimerRef.current !== null) {
+      window.clearTimeout(bridgeReconnectTimerRef.current);
+      bridgeReconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const closeBridgeSocket = useCallback((reason?: string) => {
+    clearBridgeReconnectTimer();
+
+    const socket = bridgeSocketRef.current;
+    bridgeSocketRef.current = null;
+    if (!socket) return;
+
+    socket.onopen = null;
+    socket.onclose = null;
+    socket.onerror = null;
+
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      try {
+        socket.close(1000, reason || 'closing');
+      } catch {
+        // Ignore close failures during teardown.
+      }
+    }
+  }, [clearBridgeReconnectTimer]);
+
+  const connectBridgeSocket = useCallback(async (
+    url: string,
+    reconnectReason?: string,
+  ): Promise<boolean> => {
+    closeBridgeSocket('reconnect');
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const socket = new WebSocket(url);
+      socket.binaryType = 'arraybuffer';
+      bridgeSocketRef.current = socket;
+
+      const finish = (connected: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(connected);
+      };
+
+      socket.onopen = () => {
+        addServerLog(
+          reconnectReason ? `Native frame bridge recovered (${reconnectReason})` : 'Native frame bridge connected',
+          'info',
+        );
+        finish(true);
+      };
+
+      socket.onerror = () => {
+        finish(false);
+      };
+
+      socket.onclose = () => {
+        if (bridgeSocketRef.current === socket) {
+          bridgeSocketRef.current = null;
+        }
+        const reconnectUrl = bridgeUrlRef.current;
+        if (isStreamingRef.current && transportModeRef.current === 'bridge' && reconnectUrl) {
+          clearBridgeReconnectTimer();
+          bridgeReconnectTimerRef.current = window.setTimeout(() => {
+            bridgeReconnectTimerRef.current = null;
+            const nextUrl = bridgeUrlRef.current || reconnectUrl;
+            if (!isStreamingRef.current || transportModeRef.current !== 'bridge' || !nextUrl) {
+              return;
+            }
+            void connectBridgeSocket(nextUrl, 'socket closed');
+          }, BRIDGE_RECONNECT_MS);
+        }
+        finish(false);
+      };
+    });
+  }, [addServerLog, clearBridgeReconnectTimer, closeBridgeSocket]);
+
   const applyNativeStats = useCallback((native: NativeStreamStats) => {
     lastNativeStateRef.current = native;
+    transportModeRef.current = native.transport_mode || 'invoke';
+    bridgeUrlRef.current = native.bridge_url || null;
     setStats({
       framesEncoded: native.frames,
       isActive: native.active,
@@ -222,7 +321,38 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
         addServerLog(`[native] ${native.last_error}`, 'error');
       }
 
+      if (native.bridge_last_error && native.bridge_last_error !== previous?.bridge_last_error) {
+        addServerLog(`[bridge] ${native.bridge_last_error}`, 'warning');
+      }
+
+      if (native.transport_mode === 'bridge' && native.bridge_connected && !previous?.bridge_connected) {
+        addServerLog('Native frame bridge is live', 'success');
+      }
+
+      if (native.transport_mode === 'bridge' && previous?.bridge_connected && !native.bridge_connected) {
+        addServerLog('Native frame bridge disconnected, falling back while reconnecting', 'warning');
+      }
+
       applyNativeStats(native);
+
+      if (
+        isStreamingRef.current &&
+        native.transport_mode === 'bridge' &&
+        native.bridge_url &&
+        !native.bridge_connected &&
+        !bridgeSocketRef.current &&
+        bridgeReconnectTimerRef.current === null
+      ) {
+        const reconnectUrl = native.bridge_url;
+        bridgeReconnectTimerRef.current = window.setTimeout(() => {
+          bridgeReconnectTimerRef.current = null;
+          const nextUrl = bridgeUrlRef.current || reconnectUrl;
+          if (!isStreamingRef.current || transportModeRef.current !== 'bridge' || !nextUrl) {
+            return;
+          }
+          void connectBridgeSocket(nextUrl, 'stats sync');
+        }, BRIDGE_RECONNECT_MS);
+      }
 
       if (
         isStreamingRef.current &&
@@ -250,7 +380,7 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
       addServerLog(`Native stats polling failed: ${message}`, 'warning');
       return null;
     }
-  }, [addServerLog, applyNativeStats, options, stopStatsPolling]);
+  }, [addServerLog, applyNativeStats, connectBridgeSocket, options, stopStatsPolling]);
 
   const startStatsPolling = useCallback(() => {
     stopStatsPolling();
@@ -313,9 +443,43 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
       if (!blob) return;
 
       const buffer = await blob.arrayBuffer();
-      const base64 = arrayBufferToBase64(buffer);
+      const bridgeSocket = bridgeSocketRef.current;
+      const wantsBridge = transportModeRef.current === 'bridge';
 
-      await invokeRef.current('write_frame', { data: base64 });
+      if (
+        wantsBridge &&
+        bridgeSocket &&
+        bridgeSocket.readyState === WebSocket.OPEN &&
+        bridgeSocket.bufferedAmount < BRIDGE_BACKPRESSURE_BYTES
+      ) {
+        bridgeSocket.send(buffer);
+      } else {
+        if (wantsBridge) {
+          if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+            droppedRef.current++;
+            return;
+          }
+
+          if (
+            bridgeUrlRef.current &&
+            bridgeReconnectTimerRef.current === null &&
+            (!bridgeSocket || bridgeSocket.readyState === WebSocket.CLOSED || bridgeSocket.readyState === WebSocket.CLOSING)
+          ) {
+            const reconnectUrl = bridgeUrlRef.current;
+            bridgeReconnectTimerRef.current = window.setTimeout(() => {
+              bridgeReconnectTimerRef.current = null;
+              const nextUrl = bridgeUrlRef.current || reconnectUrl;
+              if (!isStreamingRef.current || transportModeRef.current !== 'bridge' || !nextUrl) {
+                return;
+              }
+              void connectBridgeSocket(nextUrl, 'send path');
+            }, BRIDGE_RECONNECT_MS);
+          }
+        }
+
+        const base64 = arrayBufferToBase64(buffer);
+        await invokeRef.current('write_frame', { data: base64 });
+      }
 
       frameCountRef.current++;
       if (frameCountRef.current % 30 === 0) {
@@ -352,7 +516,7 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
     } finally {
       sendingRef.current = false;
     }
-  }, [addServerLog, options, stopStatsPolling]);
+  }, [addServerLog, connectBridgeSocket, options, stopStatsPolling]);
 
   const startGPUStream = useCallback(async (
     canvas: HTMLCanvasElement,
@@ -407,6 +571,35 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
         },
       });
 
+      let startResponse: NativeStartStreamResponse = {
+        message: typeof result === 'string' ? result : 'Native stream started',
+        transport: 'invoke',
+      };
+
+      if (typeof result === 'string') {
+        try {
+          startResponse = {
+            ...startResponse,
+            ...(JSON.parse(result) as NativeStartStreamResponse),
+          };
+        } catch {
+          // Older desktop builds return a plain string.
+        }
+      }
+
+      transportModeRef.current = startResponse.transport || 'invoke';
+      bridgeUrlRef.current = startResponse.bridge_url || null;
+      closeBridgeSocket('starting stream');
+
+      if (transportModeRef.current === 'bridge' && bridgeUrlRef.current) {
+        const bridgeConnected = await connectBridgeSocket(bridgeUrlRef.current, 'initial connect');
+        if (!bridgeConnected) {
+          addServerLog('Native frame bridge unavailable, using invoke fallback', 'warning');
+          transportModeRef.current = 'invoke';
+          bridgeUrlRef.current = null;
+        }
+      }
+
       frameCountRef.current = 0;
       droppedRef.current = 0;
       lastFrameTimeRef.current = 0;
@@ -432,15 +625,16 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
       };
 
       frameLoopRef.current = requestAnimationFrame(captureLoop);
-      options.onSuccess?.(result as string);
-      return result as string;
+      options.onSuccess?.(startResponse.message);
+      return startResponse.message;
     } catch (err) {
+      closeBridgeSocket('start failed');
       canvasRef.current = null;
       isStreamingRef.current = false;
       setIsStreaming(false);
       throw err;
     }
-  }, [addServerLog, captureAndSendFrame, encoderInfo, options, startStatsPolling]);
+  }, [addServerLog, captureAndSendFrame, closeBridgeSocket, connectBridgeSocket, encoderInfo, options, startStatsPolling]);
 
   const stopGPUStream = useCallback(async () => {
     if (frameLoopRef.current !== null) {
@@ -450,6 +644,9 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
     canvasRef.current = null;
     isStreamingRef.current = false;
     stopStatsPolling();
+    closeBridgeSocket('stop streaming');
+    transportModeRef.current = 'invoke';
+    bridgeUrlRef.current = null;
 
     if (!window.__TAURI_INTERNALS__ || !invokeRef.current) {
       setIsStreaming(false);
@@ -470,16 +667,17 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
       isActive: false,
       restarting: false,
     }));
-  }, [addServerLog, stopStatsPolling]);
+  }, [addServerLog, closeBridgeSocket, stopStatsPolling]);
 
   useEffect(() => {
     return () => {
       stopStatsPolling();
+      closeBridgeSocket('unmount');
       if (frameLoopRef.current !== null) {
         cancelAnimationFrame(frameLoopRef.current);
       }
     };
-  }, [stopStatsPolling]);
+  }, [closeBridgeSocket, stopStatsPolling]);
 
   const isAvailable = !!window.__TAURI_INTERNALS__;
 
