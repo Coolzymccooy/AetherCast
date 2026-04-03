@@ -8,6 +8,8 @@ import { getPeerEnv } from '../utils/peerEnv';
 import { useScreenCapture } from '../hooks/useScreenCapture';
 import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
 import { resolveRoomId } from '../utils/roomId';
+import { useKeepAwake } from '../hooks/useKeepAwake';
+import { MobileModeBar } from './MobileModeBar';
 
 interface NativeRuntimeInfo {
   hasWindowBridge: boolean;
@@ -42,6 +44,7 @@ export default function PhoneScreenView() {
   const roomId = resolveRoomId(new URLSearchParams(window.location.search).get('room'));
   const [runtime, setRuntime] = useState<NativeRuntimeInfo>(() => getNativeRuntimeInfo());
   const isNative = runtime.isNative;
+  useKeepAwake(true);
 
   const [status, setStatus] = useState<'idle' | 'requesting' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
@@ -59,9 +62,10 @@ export default function PhoneScreenView() {
   const streamRef = useRef<MediaStream | null>(null);
   const previewRef = useRef<HTMLVideoElement>(null);
   const hostCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Native screen capture hook — only active inside the APK
-  const { stream: nativeStream, isCapturing, error: captureError, startCapture, stopCapture } = useScreenCapture();
+  const { stream: nativeStream, isCapturing, error: captureError, framesRendered, startCapture, stopCapture } = useScreenCapture();
 
   const addLog = useCallback((msg: string) => {
     setLogs(prev => [msg, ...prev].slice(0, 3));
@@ -69,6 +73,7 @@ export default function PhoneScreenView() {
 
   const cleanup = useCallback(() => {
     if (hostCheckTimerRef.current) { clearTimeout(hostCheckTimerRef.current); hostCheckTimerRef.current = null; }
+    if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
     callRef.current?.close();
     peerRef.current?.destroy();
     if (!isNative) {
@@ -138,7 +143,7 @@ export default function PhoneScreenView() {
     setStatus('connecting');
     addLog('Connecting to PeerJS cloud...');
 
-    const myId = clientPeerId(roomId);
+    const myId = clientPeerId(roomId, 'screen');
     const peerEnv = getPeerEnv();
     const peerServer = `${peerEnv.secure ? 'https' : 'http'}://${peerEnv.host}:${peerEnv.port}${peerEnv.path}`;
     setDebugInfo({
@@ -167,6 +172,21 @@ export default function PhoneScreenView() {
       const e = err as { type?: string; message?: string };
       addLog(`Peer error: ${e.type ?? e.message ?? 'unknown'}`);
       setDebugInfo(prev => ({ ...prev, lastEvent: `peer-error:${e.type ?? e.message ?? 'unknown'}` }));
+      if (e.type === 'network' || e.type === 'disconnected') {
+        setStatus('connecting');
+        setErrorMsg('');
+        if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = setTimeout(() => {
+          const existingStream = streamRef.current;
+          if (existingStream) {
+            cleanup();
+            streamRef.current = existingStream;
+            connectToStudio(existingStream);
+          }
+        }, 1500);
+        return;
+      }
+
       if (e.type !== 'peer-unavailable') {
         setStatus('error');
         setErrorMsg(`PeerJS error: ${e.type ?? e.message ?? 'unknown'}`);
@@ -298,6 +318,34 @@ export default function PhoneScreenView() {
     setStatus('idle');
   };
 
+  const returnHome = () => {
+    stopSharing();
+    window.location.href = '/?mode=app';
+  };
+
+  useEffect(() => {
+    const handleResume = () => {
+      if (document.visibilityState === 'hidden') return;
+      const existingStream = streamRef.current;
+      if (!existingStream || status === 'connected' || status === 'requesting') return;
+      cleanup();
+      streamRef.current = existingStream;
+      connectToStudio(existingStream);
+    };
+
+    window.addEventListener('online', handleResume);
+    window.addEventListener('focus', handleResume);
+    window.addEventListener('pageshow', handleResume);
+    document.addEventListener('visibilitychange', handleResume);
+
+    return () => {
+      window.removeEventListener('online', handleResume);
+      window.removeEventListener('focus', handleResume);
+      window.removeEventListener('pageshow', handleResume);
+      document.removeEventListener('visibilitychange', handleResume);
+    };
+  }, [cleanup, connectToStudio, status]);
+
   const statusLabel = {
     idle: isNative ? 'Ready to share screen' : 'Not sharing',
     requesting: isNative ? 'Requesting permission...' : 'Requesting permission...',
@@ -313,6 +361,8 @@ export default function PhoneScreenView() {
         animate={{ opacity: 1, y: 0 }}
         className="max-w-sm w-full space-y-6"
       >
+        <MobileModeBar roomId={roomId} onHome={returnHome} />
+
         <div className="text-center">
           <div className="w-16 h-16 bg-blue-500/10 rounded-full flex items-center justify-center mx-auto mb-4 border border-blue-500/30">
             <Monitor size={32} className="text-blue-400" />
@@ -404,6 +454,7 @@ export default function PhoneScreenView() {
           <div>Platform: {runtime.platform}</div>
           <div>Bridge: {runtime.hasWindowBridge ? 'present' : 'missing'}</div>
           <div>Capture: {isCapturing ? 'active' : 'idle'}</div>
+          <div>Frames: {framesRendered}</div>
           <div>Host: {debugInfo.hostId}</div>
           <div>Client: {debugInfo.clientId || 'pending'}</div>
           <div>Peer server: {debugInfo.peerServer || 'pending'}</div>

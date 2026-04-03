@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
@@ -82,8 +83,13 @@ public class ScreenCaptureService extends Service {
                 .setContentText("Screen sharing to Studio…")
                 .setSmallIcon(android.R.drawable.ic_menu_share)
                 .setOngoing(true)
+                .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
                 .build();
-        startForeground(NOTIF_ID, notif);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(NOTIF_ID, notif);
+        }
 
         int    resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
         Intent resultData = intent.getParcelableExtra(EXTRA_RESULT_DATA);
@@ -91,7 +97,19 @@ public class ScreenCaptureService extends Service {
         int    height     = intent.getIntExtra(EXTRA_HEIGHT, 720);
         int    fps        = intent.getIntExtra(EXTRA_FPS,    15);
 
-        startCapture(resultCode, resultData, width, height, fps);
+        if (resultData == null) {
+            stopCapture();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        try {
+            startCapture(resultCode, resultData, width, height, fps);
+        } catch (Exception e) {
+            stopCapture();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         return START_STICKY;
     }
 
@@ -130,7 +148,7 @@ public class ScreenCaptureService extends Service {
         );
 
         running = true;
-        long intervalMs = 1000L / fps;
+        long intervalMs = 1000L / Math.max(1, fps);
         scheduleFrame(intervalMs);
     }
 
@@ -143,7 +161,7 @@ public class ScreenCaptureService extends Service {
     }
 
     private void captureFrame() {
-        if (imageReader == null) return;
+        if (imageReader == null || frameCallback == null) return;
         Image image = imageReader.acquireLatestImage();
         if (image == null) return;
 
@@ -165,11 +183,11 @@ public class ScreenCaptureService extends Service {
             bitmap.recycle();
 
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            cropped.compress(Bitmap.CompressFormat.JPEG, 60, baos);
+            cropped.compress(Bitmap.CompressFormat.JPEG, 40, baos);
             cropped.recycle();
 
             String base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
-            if (frameCallback != null) frameCallback.onFrame(base64);
+            frameCallback.onFrame(base64);
         } finally {
             image.close();
         }
@@ -182,6 +200,7 @@ public class ScreenCaptureService extends Service {
         if (imageReader     != null) { imageReader.close();        imageReader     = null; }
         if (handlerThread   != null) { handlerThread.quitSafely(); handlerThread   = null; }
         handler = null;
+        stopForeground(STOP_FOREGROUND_REMOVE);
     }
 
     // ── Notification channel ───────────────────────────────────────────────────

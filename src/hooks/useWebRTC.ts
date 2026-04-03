@@ -4,7 +4,7 @@ import Peer from 'simple-peer';
 import PeerJS, { MediaConnection } from 'peerjs';
 import { Scene, Source, ServerLog, AudioChannel } from '../types';
 import { ROOM_ID, CLOUD_URL } from '../constants';
-import { hostPeerId } from '../utils/peerId';
+import { hostPeerId, inferPeerRole } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
 import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
 import { audioEngine } from '../lib/audioEngine';
@@ -54,6 +54,8 @@ export function useWebRTC({
   const audienceBridgeSocketRef = useRef<Socket | null>(null);
   const peersRef = useRef<Map<string, Peer.Instance>>(new Map());
   const iceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const phonePeerRolesRef = useRef<Map<string, string>>(new Map());
+  const screenPeerIdRef = useRef<string | null>(null);
 
   // Stable refs for callbacks used inside reconnectSocket to avoid stale closures
   // without adding them as dependencies (which would cause reconnect loops)
@@ -330,6 +332,20 @@ export function useWebRTC({
     iceTimersRef.current.clear();
   }, []);
 
+  const clearPhoneScreen = useCallback((peerId?: string) => {
+    if (!screenPeerIdRef.current) return;
+    if (peerId && screenPeerIdRef.current !== peerId) return;
+
+    screenPeerIdRef.current = null;
+    setScreenStream(current => {
+      if (peerId && current === null) return current;
+      return null;
+    });
+    setSources(prev => prev.map(source =>
+      source.name === 'Screen Share' ? { ...source, status: 'standby' as const } : source
+    ));
+  }, [setSources]);
+
   // --- PeerJS Host (answers calls from phone camera / phone screen) ---
   const setupHostPeer = useCallback(() => {
     if (hostPeerRef.current) {
@@ -361,15 +377,28 @@ export function useWebRTC({
     hostPeer.on('call', (call: MediaConnection) => {
       call.answer(); // answer without sending a stream back
       const peerId = call.peer;
+      const role = call.metadata?.role ?? inferPeerRole(peerId) ?? 'camera';
+      phonePeerRolesRef.current.set(peerId, role);
 
       call.on('stream', (stream: MediaStream) => {
-        setRemoteStreams(prev => {
-          const next = new Map(prev);
-          next.set(peerId, stream);
-          return next;
-        });
+        if (role === 'screen') {
+          screenPeerIdRef.current = peerId;
+          setScreenStream(stream);
+          setSources(prev => prev.map(source =>
+            source.name === 'Screen Share' ? { ...source, status: 'active' as const } : source
+          ));
+
+          const screenScene = scenes.find(scene => scene.type === 'SCREEN');
+          if (screenScene) setActiveScene(screenScene);
+        } else {
+          setRemoteStreams(prev => {
+            const next = new Map(prev);
+            next.set(peerId, stream);
+            return next;
+          });
+        }
+
         setIsRemoteConnected(true);
-        const role = call.metadata?.role ?? 'camera';
         setServerLogsRef.current(prev => [
           { message: `Phone connected: ${role} (${peerId.slice(-8)})`, type: 'info', id: Date.now() } as ServerLog,
           ...prev,
@@ -382,16 +411,26 @@ export function useWebRTC({
       });
 
       call.on('close', () => {
-        setRemoteStreams(prev => {
-          const next = new Map(prev);
-          next.delete(peerId);
-          return next;
-        });
+        if (phonePeerRolesRef.current.get(peerId) === 'screen') {
+          clearPhoneScreen(peerId);
+        } else {
+          setRemoteStreams(prev => {
+            const next = new Map(prev);
+            next.delete(peerId);
+            return next;
+          });
+        }
+
+        phonePeerRolesRef.current.delete(peerId);
         // Clear notification guard on disconnect so genuine reconnects notify again
         notifiedPeersRef.current.delete(peerId);
       });
 
       call.on('error', (err: Error) => {
+        if (phonePeerRolesRef.current.get(peerId) === 'screen') {
+          clearPhoneScreen(peerId);
+        }
+        phonePeerRolesRef.current.delete(peerId);
         console.error('PeerJS call error:', err);
       });
     });
@@ -468,6 +507,8 @@ export function useWebRTC({
       setIsSocketConnected(false);
       // Clean up peers on disconnect to prevent stale references
       destroyAllPeers();
+      phonePeerRolesRef.current.clear();
+      clearPhoneScreen();
     });
 
     socket.on('signal', (data: { from: string; signal: any }) => {
@@ -536,6 +577,8 @@ export function useWebRTC({
     setupHostPeer();
     return () => {
       destroyAllPeers();
+      phonePeerRolesRef.current.clear();
+      clearPhoneScreen();
       if (socketRef.current) socketRef.current.disconnect();
       if (audienceBridgeSocketRef.current) audienceBridgeSocketRef.current.disconnect();
       if (hostPeerRef.current) { hostPeerRef.current.destroy(); hostPeerRef.current = null; }

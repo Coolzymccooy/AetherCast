@@ -117,3 +117,42 @@ npm run lint       # TypeScript type-check only (no emit)
 - Node.js 18+: `node -v`
 - FFmpeg at `C:\ffmpeg\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe` or `C:\ffmpeg\bin\ffmpeg.exe`
 - (Tauri only) Rust: `rustup update stable`
+
+## Android APK Signing — MANDATORY
+
+**STOP before any Android build.** Read this section first.
+
+The release keystore is committed at:
+```
+android/app/aethercast-release.keystore
+  alias:    aethercast
+  password: aethercast123
+  validity: 10,000 days (generated 2026-04-03)
+```
+
+**Every APK release MUST use this exact keystore.** If you sign with a different
+keystore, all existing users must manually uninstall the app before they can upgrade.
+The keystore in `android/app/build.gradle` is already wired to this file — do not change it.
+
+**Keep a backup** of `aethercast-release.keystore` outside the repo (USB drive, password manager).
+
+**`android/local.properties`** is gitignored (machine-specific). If it is missing, create it:
+```
+sdk.dir=C\:\\Users\\segun\\AppData\\Local\\Android\\Sdk
+```
+
+**Full APK rebuild sequence — run from repo root `C:\Users\segun\source\repos\aether2`:**
+
+> PowerShell does not support `&&`. Run each command separately.
+
+```powershell
+npm run build
+npx cap sync android
+cd android
+./gradlew assembleRelease
+cd ..
+cp android/app/build/outputs/apk/release/app-release.apk public/downloads/aethercast-camera.apk
+```
+
+Web/React changes do NOT require a new APK — the APK loads the live production URL and auto-updates.
+Only native Java plugin changes, manifest changes, or `capacitor.config.ts` changes require a rebuild.

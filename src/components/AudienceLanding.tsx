@@ -4,8 +4,11 @@ import { io, Socket } from 'socket.io-client';
 import { MessageSquare, Heart, Send, Sparkles, User, CheckCircle2 } from 'lucide-react';
 import { AudienceMessage } from '../types';
 import { isValidRoomId, normalizeRoomId, resolveRoomId } from '../utils/roomId';
+import { useKeepAwake } from '../hooks/useKeepAwake';
+import { MobileModeBar } from './MobileModeBar';
 
 export const AudienceLanding = () => {
+  useKeepAwake(true);
   const [roomId, setRoomId] = useState<string>('');
   const [message, setMessage] = useState('');
   const [name, setName] = useState('');
@@ -113,6 +116,8 @@ export const AudienceLanding = () => {
   return (
     <div className="h-screen overflow-y-auto bg-bg text-white">
       <div className="max-w-md w-full mx-auto p-4 md:p-8 pb-12 space-y-6">
+        <MobileModeBar roomId={roomId} onHome={() => { window.location.href = '/?mode=app'; }} />
+
         <div className="text-center mb-8">
           <div className="w-16 h-16 bg-accent-cyan/10 rounded-full flex items-center justify-center mx-auto mb-4 border border-accent-cyan/30">
             <MessageSquare size={32} className="text-accent-cyan" />

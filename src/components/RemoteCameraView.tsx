@@ -6,6 +6,8 @@ import { hostPeerId, clientPeerId } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
 import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
 import { resolveRoomId } from '../utils/roomId';
+import { useKeepAwake } from '../hooks/useKeepAwake';
+import { MobileModeBar } from './MobileModeBar';
 
 type Resolution = '720p' | '1080p';
 const RESOLUTIONS: Record<Resolution, { width: number; height: number }> = {
@@ -28,6 +30,7 @@ const RESOLUTIONS: Record<Resolution, { width: number; height: number }> = {
 export default function RemoteCameraView() {
   const roomId = resolveRoomId(new URLSearchParams(window.location.search).get('room'));
   const initialHostId = hostPeerId(roomId);
+  useKeepAwake(true);
 
   const [status, setStatus] = useState<'idle' | 'camera' | 'connecting' | 'ready' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
@@ -52,21 +55,28 @@ export default function RemoteCameraView() {
   const streamRef = useRef<MediaStream | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hostCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shouldAutoBroadcastRef = useRef(false);
 
   const addLog = useCallback((msg: string) => {
     setLogs(prev => [msg, ...prev].slice(0, 3));
   }, []);
 
-  const cleanup = useCallback(() => {
+  const resetTransport = useCallback(() => {
     if (hostCheckTimerRef.current) { clearTimeout(hostCheckTimerRef.current); hostCheckTimerRef.current = null; }
     if (searchTimerRef.current) { clearInterval(searchTimerRef.current); searchTimerRef.current = null; }
+    if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
     callRef.current?.close();
     peerRef.current?.destroy();
-    streamRef.current?.getTracks().forEach(t => t.stop());
     callRef.current = null;
     peerRef.current = null;
-    streamRef.current = null;
   }, []);
+
+  const cleanup = useCallback(() => {
+    resetTransport();
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+  }, [resetTransport]);
 
   useEffect(() => () => cleanup(), [cleanup]);
 
@@ -88,6 +98,7 @@ export default function RemoteCameraView() {
     const hostId = hostPeerId(roomId);
     setDebugInfo(prev => ({ ...prev, hostId, lastEvent: 'calling-host' }));
     addLog('Calling Studio...');
+    shouldAutoBroadcastRef.current = true;
 
     const call = peer.call(hostId, stream, { metadata: { role: 'camera', room: roomId } });
     callRef.current = call;
@@ -146,9 +157,15 @@ export default function RemoteCameraView() {
         try { conn.close(); } catch { /* ok */ }
         addLog('Studio found!');
         setDebugInfo(prev => ({ ...prev, lastEvent: 'studio-host-ready' }));
-        // Park here — wait for user to tap "Start Broadcasting"
-        setStatus('ready');
-        broadcastFnRef.current = () => doCall(peer, stream, attempt);
+        if (shouldAutoBroadcastRef.current) {
+          setStatus('connecting');
+          addLog('Restoring live feed...');
+          doCall(peer, stream, attempt);
+        } else {
+          // Park here — wait for user to tap "Start Broadcasting"
+          setStatus('ready');
+          broadcastFnRef.current = () => doCall(peer, stream, attempt);
+        }
       });
 
       conn.on('error', () => {
@@ -160,6 +177,69 @@ export default function RemoteCameraView() {
 
     attempt();
   }, [roomId, addLog, doCall]);
+
+  const connectPeerTransport = useCallback((stream: MediaStream, lastEvent: string = 'connecting-peerjs') => {
+    streamRef.current = stream;
+    resetTransport();
+    setStatus('connecting');
+    setErrorMsg('');
+    addLog('Connecting to PeerJS cloud...');
+
+    const myId = clientPeerId(roomId, 'camera');
+    const peerEnv = getPeerEnv();
+    const peerServer = `${peerEnv.secure ? 'https' : 'http'}://${peerEnv.host}:${peerEnv.port}${peerEnv.path}`;
+    setDebugInfo({
+      hostId: hostPeerId(roomId),
+      clientId: myId,
+      peerServer,
+      lastEvent,
+    });
+
+    const peer = new Peer(myId, {
+      host: peerEnv.host, port: peerEnv.port, path: peerEnv.path, secure: peerEnv.secure, debug: 0,
+      config: { iceServers: DEFAULT_ICE_SERVERS },
+    });
+    peerRef.current = peer;
+
+    peer.on('open', () => {
+      addLog('Cloud ready');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-open' }));
+      startHostChecker(peer, streamRef.current ?? stream);
+    });
+    peer.on('disconnected', () => {
+      addLog('Cloud disconnected, reconnecting...');
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-disconnected' }));
+      try { (peer as any).reconnect?.(); } catch { /* ok */ }
+    });
+    peer.on('error', (err: any) => {
+      addLog(`Peer error: ${err.type || err.message}`);
+      setDebugInfo(prev => ({ ...prev, lastEvent: `peer-error:${err.type || err.message}` }));
+
+      if (err.type === 'network' || err.type === 'disconnected') {
+        const existingStream = streamRef.current ?? stream;
+        if (existingStream) {
+          setStatus('connecting');
+          setErrorMsg('');
+          if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = setTimeout(() => {
+            connectPeerTransport(existingStream, 'reconnecting-peerjs');
+          }, 1500);
+          return;
+        }
+      }
+
+      if (err.type !== 'peer-unavailable') {
+        setStatus('error');
+        setErrorMsg(`PeerJS error: ${err.type || err.message}`);
+      }
+    });
+  }, [addLog, resetTransport, roomId, startHostChecker]);
+
+  const returnHome = () => {
+    shouldAutoBroadcastRef.current = false;
+    cleanup();
+    window.location.href = '/?mode=app';
+  };
 
   /** Acquire a camera stream only — no PeerJS side effects */
   const acquireStream = useCallback(async (facing: 'user' | 'environment', res: Resolution): Promise<MediaStream | null> => {
@@ -233,46 +313,36 @@ export default function RemoteCameraView() {
     streamRef.current = stream;
     stream.getAudioTracks().forEach(t => (t.enabled = !isMuted));
     applyStreamLocally(stream);
-
-    setStatus('connecting');
-    addLog('Connecting to PeerJS cloud...');
-
-    const myId = clientPeerId(roomId);
-    const peerEnv = getPeerEnv();
-    const peerServer = `${peerEnv.secure ? 'https' : 'http'}://${peerEnv.host}:${peerEnv.port}${peerEnv.path}`;
-    setDebugInfo({
-      hostId: hostPeerId(roomId),
-      clientId: myId,
-      peerServer,
-      lastEvent: 'connecting-peerjs',
-    });
-    const peer = new Peer(myId, {
-      host: peerEnv.host, port: peerEnv.port, path: peerEnv.path, secure: peerEnv.secure, debug: 0,
-      config: { iceServers: DEFAULT_ICE_SERVERS },
-    });
-    peerRef.current = peer;
-    peer.on('open', () => {
-      addLog('Cloud ready');
-      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-open' }));
-      startHostChecker(peer, stream);
-    });
-    peer.on('disconnected', () => {
-      addLog('Cloud disconnected, reconnecting...');
-      setDebugInfo(prev => ({ ...prev, lastEvent: 'peerjs-disconnected' }));
-      try { (peer as any).reconnect?.(); } catch { /* ok */ }
-    });
-    peer.on('error', (err: any) => {
-      addLog(`Peer error: ${err.type || err.message}`);
-      setDebugInfo(prev => ({ ...prev, lastEvent: `peer-error:${err.type || err.message}` }));
-      if (err.type !== 'peer-unavailable') { setStatus('error'); setErrorMsg(`PeerJS error: ${err.type || err.message}`); }
-    });
-  }, [acquireStream, applyStreamLocally, cleanup, addLog, startHostChecker, roomId, isMuted]);
+    connectPeerTransport(stream);
+  }, [acquireStream, applyStreamLocally, cleanup, connectPeerTransport, isMuted]);
 
   const start = useCallback(async (facing: 'user' | 'environment' = facingMode, res: Resolution = resolution) => {
     await swapCamera(facing, res);
   }, [facingMode, resolution, swapCamera]);
 
   useEffect(() => { start(); }, []);
+
+  useEffect(() => {
+    const handleResume = () => {
+      if (document.visibilityState === 'hidden') return;
+      const existingStream = streamRef.current;
+      if (!existingStream || status === 'connected' || status === 'ready' || status === 'camera') return;
+      addLog('Restoring camera link...');
+      connectPeerTransport(existingStream, 'reconnecting-peerjs');
+    };
+
+    window.addEventListener('online', handleResume);
+    window.addEventListener('focus', handleResume);
+    window.addEventListener('pageshow', handleResume);
+    document.addEventListener('visibilitychange', handleResume);
+
+    return () => {
+      window.removeEventListener('online', handleResume);
+      window.removeEventListener('focus', handleResume);
+      window.removeEventListener('pageshow', handleResume);
+      document.removeEventListener('visibilitychange', handleResume);
+    };
+  }, [addLog, connectPeerTransport, status]);
 
   const toggleMute = () => {
     if (!streamRef.current) return;
@@ -313,7 +383,8 @@ export default function RemoteCameraView() {
   }[status];
 
   return (
-    <div className="h-screen bg-black flex flex-col items-center justify-center text-white">
+    <div className="h-screen bg-black flex flex-col items-center justify-center text-white px-4">
+      <MobileModeBar roomId={roomId} onHome={returnHome} />
       <div className="relative w-full max-w-sm aspect-[9/16] bg-gray-900 rounded-2xl overflow-hidden shadow-2xl border border-white/10">
         <video
           ref={videoRef}
@@ -359,7 +430,10 @@ export default function RemoteCameraView() {
               initial={{ scale: 0.85 }}
               animate={{ scale: 1 }}
               whileTap={{ scale: 0.95 }}
-              onClick={() => broadcastFnRef.current?.()}
+              onClick={() => {
+                shouldAutoBroadcastRef.current = true;
+                broadcastFnRef.current?.();
+              }}
               className="flex flex-col items-center gap-3 px-10 py-6 rounded-3xl bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-bold shadow-2xl shadow-red-900/60"
             >
               <div className="w-16 h-16 rounded-full bg-white/20 flex items-center justify-center">

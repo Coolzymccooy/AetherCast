@@ -250,7 +250,10 @@ function StudioView() {
         {showSourceRack && (
         <ErrorBoundary name="Source Rack" onError={(err) => notify(err.message, 'error')}>
         <SourceRack sources={studio.sources} onSourceClick={s => {
-          const scene = studio.scenes.find(sc => sc.name === s.name);
+          const scene =
+            s.name === 'Screen Share'
+              ? studio.scenes.find(sc => sc.type === 'SCREEN')
+              : studio.scenes.find(sc => sc.name === s.name);
           if (scene) studio.setActiveScene(scene);
         }} />
         </ErrorBoundary>

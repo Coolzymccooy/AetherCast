@@ -6,13 +6,14 @@ interface UseScreenCaptureResult {
   stream: MediaStream | null;
   isCapturing: boolean;
   error: string | null;
+  framesRendered: number;
   startCapture: () => Promise<void>;
   stopCapture: () => void;
 }
 
-const CAPTURE_WIDTH = 1280;
-const CAPTURE_HEIGHT = 720;
-const CAPTURE_FPS = 15;
+const CAPTURE_WIDTH = 720;
+const CAPTURE_HEIGHT = 405;
+const CAPTURE_FPS = 8;
 
 /**
  * Canvas bridge: native JPEG frames → drawImage → captureStream(fps) → MediaStream.
@@ -25,11 +26,13 @@ export function useScreenCapture(): UseScreenCaptureResult {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [framesRendered, setFramesRendered] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const listenerRef = useRef<{ remove: () => void } | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const decodeBusyRef = useRef(false);
 
   const ensureCanvas = useCallback((): HTMLCanvasElement => {
     if (!canvasRef.current) {
@@ -51,6 +54,7 @@ export function useScreenCapture(): UseScreenCaptureResult {
 
     streamRef.current?.getTracks().forEach(track => track.stop());
     streamRef.current = null;
+    decodeBusyRef.current = false;
 
     if (canvasRef.current) {
       document.body.removeChild(canvasRef.current);
@@ -58,10 +62,12 @@ export function useScreenCapture(): UseScreenCaptureResult {
     }
     setStream(null);
     setIsCapturing(false);
+    setFramesRendered(0);
   }, []);
 
   const startCapture = useCallback(async () => {
     setError(null);
+    setFramesRendered(0);
     try {
       const canvas = ensureCanvas();
       const ctx = canvas.getContext('2d')!;
@@ -71,7 +77,17 @@ export function useScreenCapture(): UseScreenCaptureResult {
       const img = imgRef.current;
 
       const listener = await ScreenCapture.addListener('frameReady', ({ jpeg }) => {
-        img.onload = () => ctx.drawImage(img, 0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+        if (decodeBusyRef.current) return;
+
+        decodeBusyRef.current = true;
+        img.onload = () => {
+          ctx.drawImage(img, 0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
+          decodeBusyRef.current = false;
+          setFramesRendered(prev => prev + 1);
+        };
+        img.onerror = () => {
+          decodeBusyRef.current = false;
+        };
         img.src = `data:image/jpeg;base64,${jpeg}`;
       });
 
@@ -104,5 +120,5 @@ export function useScreenCapture(): UseScreenCaptureResult {
     };
   }, []);
 
-  return { stream, isCapturing, error, startCapture, stopCapture };
+  return { stream, isCapturing, error, framesRendered, startCapture, stopCapture };
 }

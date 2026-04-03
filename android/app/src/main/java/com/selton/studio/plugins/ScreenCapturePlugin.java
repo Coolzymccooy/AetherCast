@@ -44,6 +44,11 @@ public class ScreenCapturePlugin extends Plugin {
             return;
         }
 
+        if (result.getData() == null) {
+            call.reject("Screen capture permission data missing");
+            return;
+        }
+
         int    width  = call.getInt("width",  1280);
         int    height = call.getInt("height", 720);
         int    fps    = call.getInt("fps",    15);
@@ -81,8 +86,13 @@ public class ScreenCapturePlugin extends Plugin {
 
     /** Fired from ScreenCaptureService background thread for each JPEG frame */
     private void onFrameReady(String base64Jpeg) {
-        JSObject data = new JSObject();
-        data.put("jpeg", base64Jpeg);
-        notifyListeners("frameReady", data);
+        Activity activity = getActivity();
+        if (activity == null) return;
+
+        activity.runOnUiThread(() -> {
+            JSObject data = new JSObject();
+            data.put("jpeg", base64Jpeg);
+            notifyListeners("frameReady", data);
+        });
     }
 }
