@@ -8,6 +8,7 @@ import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
 import { resolveRoomId } from '../utils/roomId';
 import { useKeepAwake } from '../hooks/useKeepAwake';
 import { MobileModeBar } from './MobileModeBar';
+import { applyVideoTrackProfile, tuneOutgoingVideoPeerConnection } from '../utils/videoQuality';
 
 type Resolution = '720p' | '1080p';
 const RESOLUTIONS: Record<Resolution, { width: number; height: number }> = {
@@ -37,7 +38,7 @@ export default function RemoteCameraView() {
   const [searchSecs, setSearchSecs] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
-  const [resolution, setResolution] = useState<Resolution>('720p');
+  const [resolution, setResolution] = useState<Resolution>('1080p');
   const [zoom, setZoom] = useState(1);
   const [maxZoom, setMaxZoom] = useState(1);
   const [logs, setLogs] = useState<string[]>([]);
@@ -105,6 +106,7 @@ export default function RemoteCameraView() {
 
     const peerConn: RTCPeerConnection | undefined = (call as any).peerConnection;
     if (peerConn) {
+      void tuneOutgoingVideoPeerConnection(peerConn, 'camera');
       const onConnState = () => {
         if (peerConn.connectionState === 'connected') {
           setStatus('connected');
@@ -245,13 +247,17 @@ export default function RemoteCameraView() {
   const acquireStream = useCallback(async (facing: 'user' | 'environment', res: Resolution): Promise<MediaStream | null> => {
     const { width, height } = RESOLUTIONS[res];
     const attempts: MediaStreamConstraints[] = [
-      { video: { facingMode: facing, width: { ideal: width }, height: { ideal: height } }, audio: true },
-      { video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true },
+      { video: { facingMode: facing, width: { ideal: width }, height: { ideal: height }, frameRate: { ideal: 30, max: 30 } }, audio: true },
+      { video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } }, audio: true },
       { video: { facingMode: facing }, audio: true },
       { video: { facingMode: facing }, audio: false },
     ];
     for (const constraints of attempts) {
-      try { return await navigator.mediaDevices.getUserMedia(constraints); } catch { /* try next */ }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        applyVideoTrackProfile(stream.getVideoTracks()[0], 'camera');
+        return stream;
+      } catch { /* try next */ }
     }
     return null;
   }, []);
@@ -292,6 +298,8 @@ export default function RemoteCameraView() {
       try {
         if (videoSender && newVideo) await videoSender.replaceTrack(newVideo);
         if (audioSender && newAudio) await audioSender.replaceTrack(newAudio);
+        if (newVideo) applyVideoTrackProfile(newVideo, 'camera');
+        void tuneOutgoingVideoPeerConnection(pc, 'camera');
       } catch { /* replaceTrack not supported — fall through below */ }
 
       // Stop old tracks, swap ref

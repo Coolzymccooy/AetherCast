@@ -10,6 +10,7 @@ import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
 import { resolveRoomId } from '../utils/roomId';
 import { useKeepAwake } from '../hooks/useKeepAwake';
 import { MobileModeBar } from './MobileModeBar';
+import { applyVideoTrackProfile, tuneOutgoingVideoPeerConnection } from '../utils/videoQuality';
 
 interface NativeRuntimeInfo {
   hasWindowBridge: boolean;
@@ -65,7 +66,15 @@ export default function PhoneScreenView() {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Native screen capture hook — only active inside the APK
-  const { stream: nativeStream, isCapturing, error: captureError, framesRendered, startCapture, stopCapture } = useScreenCapture();
+  const {
+    stream: nativeStream,
+    isCapturing,
+    error: captureError,
+    framesRendered,
+    captureProfile,
+    startCapture,
+    stopCapture,
+  } = useScreenCapture();
 
   const addLog = useCallback((msg: string) => {
     setLogs(prev => [msg, ...prev].slice(0, 3));
@@ -188,6 +197,7 @@ export default function PhoneScreenView() {
     if (!isNative || !nativeStream || status !== 'requesting') return;
 
     streamRef.current = nativeStream;
+    applyVideoTrackProfile(nativeStream.getVideoTracks()[0], 'screen');
     if (previewRef.current) {
       previewRef.current.srcObject = nativeStream;
       previewRef.current.play().catch(() => { /* autoplay ok */ });
@@ -229,6 +239,7 @@ export default function PhoneScreenView() {
 
         const peerConn: RTCPeerConnection | undefined = (call as unknown as { peerConnection?: RTCPeerConnection }).peerConnection;
         if (peerConn) {
+          void tuneOutgoingVideoPeerConnection(peerConn, 'screen');
           const onConnState = () => {
             if (peerConn.connectionState === 'connected') {
               if (hostCheckTimerRef.current) {
@@ -303,8 +314,15 @@ export default function PhoneScreenView() {
 
     let stream: MediaStream | null = null;
     try {
+      const deviceScale = Math.min(window.devicePixelRatio || 1, 2);
+      const screenWidth = Math.min(Math.round(window.screen.width * deviceScale), 1920);
+      const screenHeight = Math.min(Math.round(window.screen.height * deviceScale), 1920);
       stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30 }, width: { ideal: 1280 }, height: { ideal: 720 } } as MediaTrackConstraints,
+        video: {
+          frameRate: { ideal: 30, max: 30 },
+          width: { ideal: screenWidth },
+          height: { ideal: screenHeight },
+        } as MediaTrackConstraints,
         audio: false,
       });
     } catch (err: unknown) {
@@ -322,6 +340,7 @@ export default function PhoneScreenView() {
     }
 
     streamRef.current = stream;
+    applyVideoTrackProfile(stream.getVideoTracks()[0], 'screen');
     if (previewRef.current) {
       previewRef.current.srcObject = stream;
       previewRef.current.play().catch(() => { /* autoplay ok */ });
@@ -472,6 +491,7 @@ export default function PhoneScreenView() {
           <div>Platform: {runtime.platform}</div>
           <div>Bridge: {runtime.hasWindowBridge ? 'present' : 'missing'}</div>
           <div>Capture: {isCapturing ? 'active' : 'idle'}</div>
+          <div>Profile: {captureProfile ? `${captureProfile.width}x${captureProfile.height} @ ${captureProfile.fps}fps` : 'pending'}</div>
           <div>Frames: {framesRendered}</div>
           <div>Host: {debugInfo.hostId}</div>
           <div>Client: {debugInfo.clientId || 'pending'}</div>

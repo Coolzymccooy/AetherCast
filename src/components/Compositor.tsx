@@ -70,6 +70,70 @@ interface CompositorProps {
   activeMessageId?: string | null;
 }
 
+type DrawableMedia = HTMLVideoElement | HTMLImageElement;
+type ContentFit = 'Fit' | 'Fill';
+
+const isDrawableMediaReady = (media: DrawableMedia | null): media is DrawableMedia => {
+  if (!media) return false;
+
+  if (media instanceof HTMLVideoElement) {
+    return media.readyState >= 2 && media.videoWidth > 0 && media.videoHeight > 0;
+  }
+
+  return media.complete && media.naturalWidth > 0 && media.naturalHeight > 0;
+};
+
+const getMediaDimensions = (media: DrawableMedia): { width: number; height: number } => {
+  if (media instanceof HTMLVideoElement) {
+    return {
+      width: media.videoWidth || media.clientWidth || 0,
+      height: media.videoHeight || media.clientHeight || 0,
+    };
+  }
+
+  return {
+    width: media.naturalWidth || media.width || 0,
+    height: media.naturalHeight || media.height || 0,
+  };
+};
+
+const drawMediaToRect = (
+  ctx: CanvasRenderingContext2D,
+  media: DrawableMedia | null,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  fit: ContentFit = 'Fit',
+  crop: { left: number; right: number; top: number; bottom: number } = { left: 0, right: 0, top: 0, bottom: 0 },
+): boolean => {
+  if (!isDrawableMediaReady(media)) return false;
+
+  const { width: mediaWidth, height: mediaHeight } = getMediaDimensions(media);
+  if (!mediaWidth || !mediaHeight) return false;
+
+  const cropLeft = Math.max(0, Math.min(crop.left, 50)) / 100;
+  const cropRight = Math.max(0, Math.min(crop.right, 50)) / 100;
+  const cropTop = Math.max(0, Math.min(crop.top, 50)) / 100;
+  const cropBottom = Math.max(0, Math.min(crop.bottom, 50)) / 100;
+
+  const sourceX = mediaWidth * cropLeft;
+  const sourceY = mediaHeight * cropTop;
+  const sourceWidth = mediaWidth * Math.max(0.01, 1 - cropLeft - cropRight);
+  const sourceHeight = mediaHeight * Math.max(0.01, 1 - cropTop - cropBottom);
+  const scale = fit === 'Fill'
+    ? Math.max(w / sourceWidth, h / sourceHeight)
+    : Math.min(w / sourceWidth, h / sourceHeight);
+
+  const drawWidth = sourceWidth * scale;
+  const drawHeight = sourceHeight * scale;
+  const drawX = x + ((w - drawWidth) / 2);
+  const drawY = y + ((h - drawHeight) / 2);
+
+  ctx.drawImage(media, sourceX, sourceY, sourceWidth, sourceHeight, drawX, drawY, drawWidth, drawHeight);
+  return true;
+};
+
 export const Compositor: React.FC<CompositorProps> = ({ 
   activeScene, 
   sources, 
@@ -284,29 +348,6 @@ export const Compositor: React.FC<CompositorProps> = ({
       }
     }
 
-    // Apply scale and crop
-    let drawX = x;
-    let drawY = y;
-    let drawW = w;
-    let drawH = h;
-
-    if (settings?.crop) {
-      const cropL = settings.crop.left / 100;
-      const cropR = settings.crop.right / 100;
-      const cropT = settings.crop.top / 100;
-      const cropB = settings.crop.bottom / 100;
-      
-      const visibleW = 1 - cropL - cropR;
-      const visibleH = 1 - cropT - cropB;
-      
-      if (visibleW > 0 && visibleH > 0) {
-        drawW = w / visibleW;
-        drawH = h / visibleH;
-        drawX = x - (cropL * drawW);
-        drawY = y - (cropT * drawH);
-      }
-    }
-
     if (scale !== 1.0) {
       const cx = x + w/2;
       const cy = y + h/2;
@@ -316,15 +357,13 @@ export const Compositor: React.FC<CompositorProps> = ({
     }
 
     if (media) {
-      if (media instanceof HTMLVideoElement && media.readyState >= 1) {
-        ctx.drawImage(media, drawX, drawY, drawW, drawH);
-      } else if (media instanceof HTMLImageElement && media.complete) {
-        ctx.drawImage(media, drawX, drawY, drawW, drawH);
-      } else {
-        drawSimulatedFeed(ctx, label, drawX, drawY, drawW, drawH, frameCount, color);
+      const fit = settings?.contentFit || 'Fit';
+      const crop = settings?.crop || { left: 0, right: 0, top: 0, bottom: 0 };
+      if (!drawMediaToRect(ctx, media, x, y, w, h, fit, crop)) {
+        drawSimulatedFeed(ctx, label, x, y, w, h, frameCount, color);
       }
     } else {
-      drawSimulatedFeed(ctx, label, drawX, drawY, drawW, drawH, frameCount, color);
+      drawSimulatedFeed(ctx, label, x, y, w, h, frameCount, color);
     }
     
     ctx.restore(); // Restores from clip, scale, and filter
@@ -403,7 +442,7 @@ export const Compositor: React.FC<CompositorProps> = ({
         drawFramedVideo(ctx, screen, 'Screen Share', padding, y, w, h, frameCount, '#00E5FF');
         drawFramedVideo(ctx, cam, 'Camera', width / 2 + padding / 2, y, w, h, frameCount + 100, '#FF4C4C', camoSettings);
       } else if (layout === 'Picture-in-Pic' || layout === 'PiP') {
-        ctx.drawImage(screen, 0, 0, width, height);
+        drawMediaToRect(ctx, screen, 0, 0, width, height, 'Fit');
         const pipW = width / 4;
         const pipH = height / 4;
         drawFramedVideo(ctx, cam, 'Camera', width - pipW - 40, height - pipH - 40, pipW, pipH, frameCount + 200, '#FF4C4C', camoSettings);
@@ -448,15 +487,11 @@ export const Compositor: React.FC<CompositorProps> = ({
       } else {
         if (scene.name === 'Cam 2') {
           const remoteVideo = remoteVideos[0] || localCam2;
-          if (remoteVideo && remoteVideo.readyState >= 1) {
-            ctx.drawImage(remoteVideo, 0, 0, width, height);
-          } else {
+          if (!drawMediaToRect(ctx, remoteVideo || null, 0, 0, width, height, camoSettings?.contentFit || 'Fit')) {
             drawSimulatedFeed(ctx, 'REMOTE CAM 2', 0, 0, width, height, frameCount);
           }
         } else {
-          if (video && video.readyState >= 1) {
-            ctx.drawImage(video, 0, 0, width, height);
-          } else {
+          if (!drawMediaToRect(ctx, video || null, 0, 0, width, height, camoSettings?.contentFit || 'Fit', camoSettings?.crop)) {
             drawSimulatedFeed(ctx, 'LOCAL CAM 1', 0, 0, width, height, frameCount);
           }
         }
@@ -476,9 +511,7 @@ export const Compositor: React.FC<CompositorProps> = ({
         drawFramedVideo(ctx, remoteVideo, 'SOURCE 2', width / 2 + padding / 2, y, w, h, frameCount + 100, '#00E5FF');
       } else if (layout === 'Picture-in-Pic') {
         // Remote as background, local as PiP
-        if (remoteVideo && remoteVideo.readyState >= 1) {
-          ctx.drawImage(remoteVideo, 0, 0, width, height);
-        } else {
+        if (!drawMediaToRect(ctx, remoteVideo || null, 0, 0, width, height, 'Fit')) {
           drawSimulatedFeed(ctx, 'REMOTE CAM 2', 0, 0, width, height, frameCount);
         }
 
@@ -546,9 +579,7 @@ export const Compositor: React.FC<CompositorProps> = ({
         drawFramedVideo(ctx, screenVid, 'Screen Share', sx, sy, sw, sh, frameCount, '#00E5FF');
         drawFramedVideo(ctx, video, 'LOCAL CAM 1', width - camW - 40, height - camH - 40, camW, camH, frameCount, '#FF4C4C', camoSettings);
       } else if (layout === 'PiP' || layout === 'Picture-in-Pic') {
-        if (screenVid && screenVid.readyState >= 1) {
-          ctx.drawImage(screenVid, 0, 0, width, height);
-        } else {
+        if (!drawMediaToRect(ctx, screenVid || null, 0, 0, width, height, 'Fit')) {
           drawSimulatedFeed(ctx, 'Screen Share', 0, 0, width, height, frameCount, '#00E5FF');
         }
         const pipW = width / 4;
@@ -557,9 +588,7 @@ export const Compositor: React.FC<CompositorProps> = ({
 
       } else {
         // Default: full screen share, any layout not explicitly handled
-        if (screenVid && screenVid.readyState >= 1) {
-          ctx.drawImage(screenVid, 0, 0, width, height);
-        } else {
+        if (!drawMediaToRect(ctx, screenVid || null, 0, 0, width, height, 'Fit')) {
           drawSimulatedFeed(ctx, 'Screen Share', 0, 0, width, height, frameCount, '#00E5FF');
         }
       }
@@ -589,9 +618,7 @@ export const Compositor: React.FC<CompositorProps> = ({
       const video = primaryVideo;
       const remoteVideo = secondaryVideo;
 
-      if (remoteVideo && remoteVideo.readyState >= 1) {
-        ctx.drawImage(remoteVideo, 0, 0, width, height);
-      } else {
+      if (!drawMediaToRect(ctx, remoteVideo || null, 0, 0, width, height, 'Fit')) {
         drawSimulatedFeed(ctx, 'GUEST (REMOTE)', 0, 0, width, height, frameCount);
       }
 
@@ -624,6 +651,8 @@ export const Compositor: React.FC<CompositorProps> = ({
 
   const draw = (ctx: CanvasRenderingContext2D, frameCount: number) => {
     const { width, height } = ctx.canvas;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
 
     // 1. Draw Background
     if (bgImageRef.current) {

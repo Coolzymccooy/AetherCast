@@ -8,6 +8,7 @@ import { hostPeerId, inferPeerRole } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
 import { DEFAULT_ICE_SERVERS } from '../utils/iceServers';
 import { audioEngine } from '../lib/audioEngine';
+import { applyVideoTrackProfile } from '../utils/videoQuality';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'disconnected' | 'failed';
 
@@ -590,15 +591,19 @@ export function useWebRTC({
   const startCamera = async (videoId?: string, audioId?: string, videoId2?: string) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: videoId ? { deviceId: { exact: videoId }, width: 1920, height: 1080 } : { width: 1920, height: 1080 },
+        video: videoId
+          ? { deviceId: { exact: videoId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } }
+          : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
         audio: audioId ? { deviceId: { exact: audioId } } : true,
       });
+      applyVideoTrackProfile(stream.getVideoTracks()[0], 'camera');
       setWebcamStream(stream);
 
       if (videoId2) {
         const stream2 = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: videoId2 }, width: 1920, height: 1080 },
+          video: { deviceId: { exact: videoId2 }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
         });
+        applyVideoTrackProfile(stream2.getVideoTracks()[0], 'camera');
         setRemoteStreams(prev => { const next = new Map(prev); next.set('local-cam-2', stream2); return next; });
       }
 
@@ -635,7 +640,16 @@ export function useWebRTC({
 
   const startScreenShare = async () => {
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { cursor: 'always' } as any, audio: true });
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          cursor: 'always',
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30, max: 30 },
+        } as any,
+        audio: true,
+      });
+      applyVideoTrackProfile(stream.getVideoTracks()[0], 'screen');
       setScreenStream(stream);
       setSources(prev => prev.map(s => s.name === 'Screen Share' ? { ...s, status: 'active' as const } : s));
 

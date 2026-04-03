@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.SystemClock;
 import android.util.Base64;
 
 import androidx.core.app.NotificationCompat;
@@ -67,6 +68,8 @@ public class ScreenCaptureService extends Service {
     private Handler         handler;
     private MediaProjection.Callback projectionCallback;
     private volatile boolean running = false;
+    private long frameIntervalMs = 83L;
+    private long lastFrameAtMs = 0L;
 
     // ── Service lifecycle ──────────────────────────────────────────────────────
 
@@ -148,7 +151,10 @@ public class ScreenCaptureService extends Service {
         };
         mediaProjection.registerCallback(projectionCallback, handler);
 
-        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
+        frameIntervalMs = fps > 0 ? Math.max(1000L / fps, 33L) : 83L;
+        lastFrameAtMs = 0L;
+
+        imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 3);
         imageReader.setOnImageAvailableListener(reader -> captureFrame(reader), handler);
         virtualDisplay = mediaProjection.createVirtualDisplay(
                 "AetherScreenCapture",
@@ -169,6 +175,12 @@ public class ScreenCaptureService extends Service {
         if (image == null) return;
 
         try {
+            long now = SystemClock.elapsedRealtime();
+            if (lastFrameAtMs != 0L && now - lastFrameAtMs < frameIntervalMs) {
+                return;
+            }
+            lastFrameAtMs = now;
+
             Image.Plane[] planes  = image.getPlanes();
             ByteBuffer    buffer  = planes[0].getBuffer();
             int pixelStride       = planes[0].getPixelStride();
@@ -186,7 +198,7 @@ public class ScreenCaptureService extends Service {
             bitmap.recycle();
 
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            cropped.compress(Bitmap.CompressFormat.JPEG, 40, baos);
+            cropped.compress(Bitmap.CompressFormat.JPEG, 68, baos);
             cropped.recycle();
 
             String base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
@@ -214,6 +226,7 @@ public class ScreenCaptureService extends Service {
         }
         if (handlerThread   != null) { handlerThread.quitSafely(); handlerThread   = null; }
         handler = null;
+        lastFrameAtMs = 0L;
         stopForeground(STOP_FOREGROUND_REMOVE);
     }
 
