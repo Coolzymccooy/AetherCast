@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Camera, Monitor, MessageSquare, QrCode, ArrowRight, X } from 'lucide-react';
 import MobileOnboarding from './MobileOnboarding';
+import QrScanner from './QrScanner';
 
 type Mode = 'remote' | 'screen' | 'audience';
 
@@ -53,6 +54,7 @@ export default function MobileHome() {
   const [onboarded, setOnboarded] = useState(() => !!localStorage.getItem('ac_onboarded'));
   const [selected, setSelected] = useState<ModeCard | null>(null);
   const [roomCode, setRoomCode] = useState('');
+  const [showScanner, setShowScanner] = useState(false);
 
   if (!onboarded) {
     return <MobileOnboarding onComplete={() => setOnboarded(true)} />;
@@ -64,7 +66,29 @@ export default function MobileHome() {
     window.location.href = `/?mode=${selected.mode}&room=${room}`;
   };
 
+  const handleScan = useCallback((raw: string) => {
+    setShowScanner(false);
+    try {
+      // The QR contains a full URL like https://aethercast.../…?mode=remote&room=SLTN-1234
+      const url = new URL(raw);
+      const mode = url.searchParams.get('mode');
+      const room = url.searchParams.get('room') ?? 'SLTN-1234';
+      if (mode && ['remote', 'screen', 'audience'].includes(mode)) {
+        window.location.href = `/?mode=${mode}&room=${room}`;
+      }
+    } catch {
+      // Not a valid URL — ignore and let user try again
+    }
+  }, []);
+
   return (
+    <>
+    <AnimatePresence>
+      {showScanner && (
+        <QrScanner onScan={handleScan} onClose={() => setShowScanner(false)} />
+      )}
+    </AnimatePresence>
+
     <div className="min-h-screen bg-bg text-white flex flex-col">
       {/* Header */}
       <div className="px-6 pt-12 pb-6 text-center">
@@ -75,6 +99,15 @@ export default function MobileHome() {
         <p className="text-gray-400 text-sm mt-1">
           Scan the QR code in Studio — or tap a mode below to connect manually.
         </p>
+
+        {/* Primary CTA — scan QR */}
+        <button
+          onClick={() => setShowScanner(true)}
+          className="mt-5 inline-flex items-center gap-2 px-6 py-3 rounded-2xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 font-bold text-white transition-colors text-sm shadow-lg shadow-blue-900/30"
+        >
+          <QrCode size={18} />
+          Scan Studio QR Code
+        </button>
       </div>
 
       {/* Mode cards */}
@@ -172,5 +205,6 @@ export default function MobileHome() {
         )}
       </AnimatePresence>
     </div>
+    </>
   );
 }

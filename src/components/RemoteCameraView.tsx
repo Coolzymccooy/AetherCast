@@ -28,6 +28,7 @@ export default function RemoteCameraView() {
 
   const [status, setStatus] = useState<'idle' | 'camera' | 'connecting' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
+  const [searchSecs, setSearchSecs] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('environment');
   const [resolution, setResolution] = useState<Resolution>('720p');
@@ -35,6 +36,7 @@ export default function RemoteCameraView() {
   const [maxZoom, setMaxZoom] = useState(1);
   const [logs, setLogs] = useState<string[]>([]);
 
+  const searchTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -47,6 +49,7 @@ export default function RemoteCameraView() {
 
   const cleanup = useCallback(() => {
     if (hostCheckTimerRef.current) clearTimeout(hostCheckTimerRef.current);
+    if (searchTimerRef.current) clearInterval(searchTimerRef.current);
     callRef.current?.close();
     peerRef.current?.destroy();
     streamRef.current?.getTracks().forEach(t => t.stop());
@@ -56,6 +59,20 @@ export default function RemoteCameraView() {
   }, []);
 
   useEffect(() => () => cleanup(), [cleanup]);
+
+  // Track how long we've been searching so we can show a helpful hint
+  useEffect(() => {
+    if (status === 'connecting') {
+      setSearchSecs(0);
+      searchTimerRef.current = setInterval(() => setSearchSecs(s => s + 1), 1000);
+    } else {
+      if (searchTimerRef.current) { clearInterval(searchTimerRef.current); searchTimerRef.current = null; }
+      if (status !== 'error') setSearchSecs(0);
+    }
+    return () => {
+      if (searchTimerRef.current) { clearInterval(searchTimerRef.current); searchTimerRef.current = null; }
+    };
+  }, [status]);
 
   const startHostChecker = useCallback((peer: Peer, stream: MediaStream) => {
     const hostId = hostPeerId(roomId);
@@ -289,6 +306,11 @@ export default function RemoteCameraView() {
             {logs.map((l, i) => (
               <span key={i} className="text-[10px] text-white/50 font-mono">{l}</span>
             ))}
+            {status === 'connecting' && searchSecs >= 10 && (
+              <span className="text-[10px] text-yellow-400/80 font-mono mt-1 text-center px-4">
+                Make sure AetherCast Studio is open and running on the desktop.
+              </span>
+            )}
           </div>
         )}
 
