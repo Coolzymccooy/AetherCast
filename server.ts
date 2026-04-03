@@ -5,7 +5,6 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import ffmpeg from "fluent-ffmpeg";
 import { PassThrough, Transform, TransformCallback } from "stream";
 import { spawn, ChildProcess } from "child_process";
 import crypto from "crypto";
@@ -147,7 +146,6 @@ const FFMPEG_PATHS = [
 ];
 for (const p of FFMPEG_PATHS) {
   if (fs.existsSync(p)) {
-    ffmpeg.setFfmpegPath(p);
     console.log(`FFmpeg found at: ${p}`);
     break;
   }
@@ -211,7 +209,7 @@ class RateLimiter {
 }
 
 const messageLimiter = new RateLimiter(60_000, 30); // 30 messages per minute
-const chunkLimiter = new RateLimiter(1_000, 60);    // 60 chunks per second — enough for 30fps without dropping WebM headers
+const chunkLimiter = new RateLimiter(1_000, 240);   // Allow higher chunk cadence for reconnect bursts and future frame-level transports
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Stream Session Types
@@ -247,6 +245,15 @@ interface FFmpegStats {
   speed: number;
 }
 
+type StartStreamData = {
+  destinations: any[];
+  encodingProfile: string;
+  browserH264?: boolean;
+  mimeType?: string;
+  transportMode?: 'mediarecorder-h264' | 'mediarecorder-webm';
+  disableSyntheticAudio?: boolean;
+};
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
@@ -277,7 +284,7 @@ async function startServer() {
   // Socket.io Signaling & Streaming
   io.on("connection", (socket) => {
     console.log("User connected:", socket.id);
-    let ffmpegProcess: any = null;
+    let ffmpegProcess: ChildProcess | null = null;
     let inputStream: PassThrough | null = null;
     let fmp4Demuxer: FMP4Demuxer | null = null;
 
@@ -287,7 +294,7 @@ async function startServer() {
 
     // ── Stream Session State ──────────────────────────────────────────────
     let currentSession: StreamSession | null = null;
-    let lastStartData: { destinations: any[]; encodingProfile: string; browserH264?: boolean; mimeType?: string } | null = null;
+    let lastStartData: StartStreamData | null = null;
     let destinationHealthMap: Map<string, DestinationHealth> = new Map();
 
     // ── Backpressure State ────────────────────────────────────────────────
@@ -296,12 +303,15 @@ async function startServer() {
     // ── Heartbeat State ──────────────────────────────────────────────────
     let lastChunkTime = 0;
     let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+    let lastRefreshRequestAt = 0;
+    const ignoredExitPids = new Set<number>();
 
     // ── FFmpeg Watchdog State ─────────────────────────────────────────────
     const RESTART_LIMIT = 5;
     const RESTART_WINDOW_MS = 60_000;
     let restartTimestamps: number[] = [];
     let intentionallyStopped = false;
+    let lastFFmpegStartupIssue: 'missing-lavfi' | null = null;
 
     // ── FFmpeg Stats Parsing State ────────────────────────────────────────
     let lastStatsEmit = 0;
@@ -320,9 +330,70 @@ async function startServer() {
       currentSession = null;
     }
 
+    function clearHeartbeat() {
+      if (heartbeatInterval) {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+    }
+
+    function clearCurrentPipelineState() {
+      ffmpegProcess = null;
+
+      if (fmp4Demuxer) {
+        fmp4Demuxer.destroy();
+        fmp4Demuxer = null;
+      }
+
+      if (inputStream) {
+        inputStream.destroy();
+        inputStream = null;
+      }
+
+      backpressureActive = false;
+    }
+
+    function destroyActivePipeline(markPlannedExit = false) {
+      const proc = ffmpegProcess;
+      if (proc?.pid && markPlannedExit) {
+        ignoredExitPids.add(proc.pid);
+      }
+
+      try {
+        proc?.stdin?.destroy();
+      } catch {
+        // Best effort only.
+      }
+
+      try {
+        proc?.kill('SIGINT');
+      } catch {
+        // Process may already be gone.
+      }
+
+      if (proc) {
+        setTimeout(() => {
+          try {
+            if (proc.exitCode == null && !proc.killed) {
+              proc.kill('SIGKILL');
+            }
+          } catch {
+            // Process may already be gone.
+          }
+        }, 1000);
+      }
+
+      clearCurrentPipelineState();
+    }
+
     // ── Helper: parse FFmpeg stderr line ──────────────────────────────────
     function parseStderrLine(line: string) {
       if (!currentSession) return;
+      const lower = line.toLowerCase();
+
+      if (lower.includes('input format lavfi is not available') || lower.includes("unknown input format: 'lavfi'")) {
+        lastFFmpegStartupIssue = 'missing-lavfi';
+      }
 
       // Parse progress stats: frame=  123 fps= 30 q=25.0 size=    1234kB time=00:00:04.10 bitrate=2465.5kbits/s speed=1.00x
       const statsMatch = line.match(
@@ -453,6 +524,30 @@ async function startServer() {
       }
     }
 
+    function getReencodeProfile(profile: string) {
+      switch (profile) {
+        case '1080p60':
+        case '1080p30':
+        case '720p30':
+          return {
+            scale: '1280:720',
+            fps: 30,
+            bitrate: '2500k',
+            maxrate: '3000k',
+            bufsize: '6000k',
+          };
+        case '480p30':
+        default:
+          return {
+            scale: '854:480',
+            fps: 30,
+            bitrate: '1200k',
+            maxrate: '1500k',
+            bufsize: '3000k',
+          };
+      }
+    }
+
     // ── Helper: attach process event handlers ─────────────────────────
     function attachFFmpegHandlers(proc: ChildProcess) {
       proc.stderr?.on('data', (data: Buffer) => {
@@ -472,25 +567,39 @@ async function startServer() {
       });
 
       proc.on('error', (err: Error) => {
+        const plannedExit = proc.pid != null && ignoredExitPids.delete(proc.pid);
+        const isCurrentProcess = ffmpegProcess?.pid === proc.pid;
+        if (plannedExit) {
+          if (isCurrentProcess) {
+            clearCurrentPipelineState();
+          }
+          return;
+        }
+
         console.error('FFmpeg process error:', err.message);
         socket.emit('server-log', { message: `FFmpeg Error: ${err.message}`, type: 'error' });
         if (currentSession) {
           currentSession.errors.push({ time: Date.now(), message: err.message });
         }
-        ffmpegProcess = null;
-        if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
-        if (inputStream) { inputStream.destroy(); inputStream = null; }
+        if (isCurrentProcess) {
+          clearCurrentPipelineState();
+        }
         if (!intentionallyStopped && lastStartData) {
           attemptRestart();
         }
       });
 
       proc.on('exit', (code: number | null) => {
+        const plannedExit = proc.pid != null && ignoredExitPids.delete(proc.pid);
+        const isCurrentProcess = ffmpegProcess?.pid === proc.pid;
         console.log(`FFmpeg exited with code ${code}`);
         socket.emit('server-log', { message: `FFmpeg exited (code ${code})`, type: code === 0 ? 'info' : 'error' });
-        ffmpegProcess = null;
-        if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
-        if (inputStream) { inputStream.destroy(); inputStream = null; }
+        if (isCurrentProcess) {
+          clearCurrentPipelineState();
+        }
+        if (plannedExit) {
+          return;
+        }
         if (!intentionallyStopped && lastStartData) {
           attemptRestart();
         }
@@ -498,7 +607,7 @@ async function startServer() {
     }
 
     // ── Helper: spawn FFmpeg with current config ─────────────────────────
-    function spawnFFmpeg(data: { destinations: any[]; encodingProfile: string }) {
+    function spawnFFmpeg(data: StartStreamData) {
       const { destinations, encodingProfile } = data;
 
       const classified = classifyDestinations(destinations);
@@ -524,11 +633,14 @@ async function startServer() {
         socket.emit('destination-status', health);
       }
 
-      // Check if browser is sending H.264 (can be copied without re-encoding)
-      const browserH264 = (data as any).browserH264 === true;
+      // Check if browser is sending MediaRecorder H.264 (can be copied without re-encoding)
+      const browserH264 = data.browserH264 === true;
+      const transportMode = data.transportMode || (browserH264 ? 'mediarecorder-h264' : 'mediarecorder-webm');
+      const disableSyntheticAudio = data.disableSyntheticAudio === true;
       const outputArgs = buildOutputArgs(rtmpDests, srtDests, ristDests);
+      lastFFmpegStartupIssue = null;
 
-      if (browserH264) {
+      if (transportMode === 'mediarecorder-h264') {
         // ═══════════════════════════════════════════════════════════════
         // H.264 CODEC COPY PATH
         //
@@ -554,24 +666,25 @@ async function startServer() {
 
         const args = [
           '-y', '-hide_banner', '-loglevel', 'warning',
-          // Raw H.264 Annex B input from pipe (output of our fMP4 demuxer)
+          '-fflags', '+genpts+discardcorrupt+nobuffer',
+          '-thread_queue_size', '4096',
           '-f', 'h264',
-          '-framerate', '30',  // MediaRecorder captures at 30fps from captureStream(30)
+          '-framerate', '30',
           '-i', 'pipe:0',
-          // Silent audio source — YouTube/Twitch require an audio track
-          '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo',
-          // Map video and audio
+          ...(disableSyntheticAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']),
           '-map', '0:v:0',
-          '-map', '1:a:0',
-          '-c:v', 'copy',       // Zero CPU — just remux the H.264 NAL units
-          '-c:a', 'aac',
-          '-b:a', '128k',
-          '-ar', '44100',
-          '-shortest',
+          ...(disableSyntheticAudio ? [] : ['-map', '1:a:0']),
+          '-c:v', 'copy',
+          ...(disableSyntheticAudio ? ['-an'] : ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-shortest']),
+          '-max_interleave_delta', '0',
           '-flags', '+global_header',
           '-flvflags', 'no_duration_filesize',
           ...outputArgs,
         ];
+
+        if (disableSyntheticAudio) {
+          socket.emit('server-log', { message: 'Streaming without synthetic audio track fallback', type: 'warning' });
+        }
 
         console.log(`FFmpeg command: ${resolvedFFmpegPath} ${args.join(' ')}`);
         socket.emit('server-log', { message: 'FFmpeg started (H.264 codec copy via fMP4 demuxer)', type: 'success' });
@@ -601,84 +714,65 @@ async function startServer() {
         if (ristDests.length > 0) socket.emit('server-log', { message: `RIST: ${ristDests.length} destination(s) connected`, type: 'info' });
 
       } else {
-        // ═══════════════════════════════════════════════════════════════
-        // VP8 RE-ENCODE PATH — uses fluent-ffmpeg (unchanged)
-        // Server must transcode VP8→H.264, limited to 480p15 on weak CPU
-        // ═══════════════════════════════════════════════════════════════
-        console.log('[stream] Browser sent VP8 — re-encoding to H.264 (CPU intensive)');
-        socket.emit('server-log', { message: 'Re-encoding VP8→H.264 (CPU intensive)', type: 'warning' });
+        const profile = getReencodeProfile(encodingProfile);
+        console.log(`[stream] Browser transport requires server re-encode (${profile.scale} @ ${profile.fps}fps)`);
+        socket.emit('server-log', {
+          message: `Re-encoding browser stream to H.264 (${profile.scale} @ ${profile.fps}fps)`,
+          type: 'warning',
+        });
 
-        let command = ffmpeg(inputStream)
-          .inputFormat('webm')
-          .videoCodec('libx264')
-          .outputOptions([
-            '-preset ultrafast',
-            '-tune zerolatency',
-            '-pix_fmt yuv420p',
-            '-vf scale=854:480',    // 480p — the only resolution this server can encode in realtime
-            '-r 15',                // 15fps — half the frames
-            '-g 30',                // Keyframe every 2s at 15fps
-            '-b:v 1000k',           // 1 Mbps at 480p
-            '-maxrate 1200k',
-            '-bufsize 2000k',
-            '-threads 1',
-            '-profile:v baseline',
-          ]);
+        const args = [
+          '-y', '-hide_banner', '-loglevel', 'warning',
+          '-fflags', '+genpts+discardcorrupt+nobuffer',
+          '-thread_queue_size', '4096',
+          '-f', 'webm',
+          '-i', 'pipe:0',
+          ...(disableSyntheticAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']),
+          '-map', '0:v:0',
+          ...(disableSyntheticAudio ? [] : ['-map', '1:a:0']),
+          '-c:v', 'libx264',
+          '-preset', 'superfast',
+          '-tune', 'zerolatency',
+          '-pix_fmt', 'yuv420p',
+          '-vf', `scale=${profile.scale}`,
+          '-r', String(profile.fps),
+          '-g', String(profile.fps * 2),
+          '-keyint_min', String(profile.fps * 2),
+          '-sc_threshold', '0',
+          '-b:v', profile.bitrate,
+          '-maxrate', profile.maxrate,
+          '-bufsize', profile.bufsize,
+          '-profile:v', 'high',
+          ...(disableSyntheticAudio ? ['-an'] : ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-shortest']),
+          '-max_interleave_delta', '0',
+          '-flags', '+global_header',
+          '-flvflags', 'no_duration_filesize',
+          ...outputArgs,
+        ];
 
-        // Add silent audio for RTMP compatibility
-        command = command
-          .input('anullsrc=r=44100:cl=stereo')
-          .inputFormat('lavfi')
-          .audioCodec('aac')
-          .audioBitrate('96k')
-          .outputOptions(['-ar 44100', '-shortest']);
-
-        if (outputArgs[1] === 'tee') {
-          command = command
-            .format('tee')
-            .outputOptions(['-map 0:v', '-map 1:a', '-flags +global_header'])
-            .output(outputArgs[2]);
-        } else {
-          command = command
-            .format(outputArgs[1])
-            .outputOptions(['-map 0:v', '-map 1:a', '-flags +global_header'])
-            .output(outputArgs[2]);
+        if (disableSyntheticAudio) {
+          socket.emit('server-log', { message: 'Re-encode fallback running without synthetic audio track', type: 'warning' });
         }
 
-        ffmpegProcess = command
-          .on('start', (commandLine) => {
-            console.log('FFmpeg started with command: ' + commandLine);
-            socket.emit('server-log', { message: 'FFmpeg started successfully', type: 'success' });
-            if (srtDests.length > 0) socket.emit('server-log', { message: `SRT: ${srtDests.length} destination(s) connected`, type: 'info' });
-            if (ristDests.length > 0) socket.emit('server-log', { message: `RIST: ${ristDests.length} destination(s) connected`, type: 'info' });
-          })
-          .on('stderr', (stderrLine: string) => {
-            console.log('FFmpeg:', stderrLine);
-            parseStderrLine(stderrLine);
-          })
-          .on('error', (err: Error) => {
-            console.error('FFmpeg error:', err.message);
-            socket.emit('server-log', { message: `FFmpeg Error: ${err.message}`, type: 'error' });
-            if (currentSession) {
-              currentSession.errors.push({ time: Date.now(), message: err.message });
-            }
-            ffmpegProcess = null;
-            if (inputStream) { inputStream.destroy(); inputStream = null; }
-            if (!intentionallyStopped && lastStartData) {
-              attemptRestart();
-            }
-          })
-          .on('end', () => {
-            console.log('FFmpeg process ended');
-            socket.emit('server-log', { message: 'FFmpeg process ended', type: 'info' });
-            ffmpegProcess = null;
-            if (inputStream) { inputStream.destroy(); inputStream = null; }
-            if (!intentionallyStopped && lastStartData) {
-              attemptRestart();
-            }
-          });
+        console.log(`FFmpeg command: ${resolvedFFmpegPath} ${args.join(' ')}`);
+        socket.emit('server-log', { message: 'FFmpeg started (browser re-encode path)', type: 'success' });
 
-        ffmpegProcess.run();
+        const proc = spawn(resolvedFFmpegPath, args, {
+          stdio: ['pipe', 'ignore', 'pipe'],
+        });
+
+        inputStream.pipe(proc.stdin!);
+        proc.stdin!.on('error', (err) => {
+          if ((err as any).code !== 'EPIPE') {
+            console.error('FFmpeg stdin error:', err.message);
+          }
+        });
+
+        attachFFmpegHandlers(proc);
+        ffmpegProcess = proc;
+
+        if (srtDests.length > 0) socket.emit('server-log', { message: `SRT: ${srtDests.length} destination(s) connected`, type: 'info' });
+        if (ristDests.length > 0) socket.emit('server-log', { message: `RIST: ${ristDests.length} destination(s) connected`, type: 'info' });
       }
 
       return true;
@@ -689,11 +783,38 @@ async function startServer() {
 
     function attemptRestart() {
       if (!lastStartData || intentionallyStopped) return;
+      if (ffmpegProcess) return;
 
       const now = Date.now();
 
       // Don't restart if FFmpeg ran for less than 5 seconds — indicates a config error, not a transient crash
       if (lastFFmpegSpawnTime > 0 && (now - lastFFmpegSpawnTime) < 5_000) {
+        if (lastFFmpegStartupIssue === 'missing-lavfi' && !lastStartData.disableSyntheticAudio) {
+          const retryData: StartStreamData = {
+            ...lastStartData,
+            disableSyntheticAudio: true,
+          };
+          lastStartData = retryData;
+          lastFFmpegStartupIssue = null;
+          socket.emit('server-log', {
+            message: 'FFmpeg is missing lavfi support — retrying without synthetic audio fallback',
+            type: 'warning',
+          });
+          destroyActivePipeline(true);
+          lastFFmpegSpawnTime = Date.now();
+          lastChunkTime = Date.now();
+          if (spawnFFmpeg(retryData)) {
+            socket.emit('stream-recovered', { attempt: 'lavfi-fallback', timestamp: Date.now() });
+          } else {
+            const failMsg = 'FFmpeg restart failed after disabling synthetic audio fallback';
+            socket.emit('server-log', { message: failMsg, type: 'error' });
+            socket.emit('stream-failed', { message: failMsg });
+            if (currentSession) currentSession.errors.push({ time: Date.now(), message: failMsg });
+            finalizeSession();
+          }
+          return;
+        }
+
         const msg = 'FFmpeg died within 5s of starting — likely a config error, not restarting';
         console.error(msg);
         socket.emit('server-log', { message: msg, type: 'error' });
@@ -730,6 +851,7 @@ async function startServer() {
       setTimeout(() => {
         if (intentionallyStopped || !lastStartData) return;
 
+        destroyActivePipeline(true);
         lastFFmpegSpawnTime = Date.now();
         lastChunkTime = Date.now(); // Reset so heartbeat doesn't trigger immediately
         const success = spawnFFmpeg(lastStartData);
@@ -783,6 +905,7 @@ async function startServer() {
       slowSpeedCount = 0;
       lastStatsEmit = 0;
       backpressureActive = false;
+      lastRefreshRequestAt = 0;
       destinationHealthMap.clear();
 
       // Store config for watchdog restarts — include browserH264 and mimeType so
@@ -792,39 +915,59 @@ async function startServer() {
         encodingProfile: encodingProfile || '1080p60',
         browserH264: data.browserH264,
         mimeType: data.mimeType,
+        transportMode: data.transportMode,
+        disableSyntheticAudio: data.disableSyntheticAudio,
       };
 
-      // Initialize stream session
-      currentSession = {
-        id: crypto.randomUUID(),
-        startTime: Date.now(),
-        destinations: destinations.map((d: any) => d.rtmpUrl || d.url || ''),
-        encodingProfile: encodingProfile || '1080p60',
-        totalFramesSent: 0,
-        totalBytesReceived: 0,
-        droppedFrames: 0,
-        ffmpegRestarts: 0,
-        errors: [],
-      };
+      const replacingActivePipeline = !!ffmpegProcess || !!inputStream || !!fmp4Demuxer;
+      if (replacingActivePipeline) {
+        socket.emit('server-log', { message: 'Refreshing FFmpeg pipeline for browser transport restart...', type: 'info' });
+        if (currentSession) {
+          currentSession.destinations = destinations.map((d: any) => d.rtmpUrl || d.url || '');
+          currentSession.encodingProfile = encodingProfile || '1080p60';
+        }
+        destroyActivePipeline(true);
+      } else {
+        currentSession = {
+          id: crypto.randomUUID(),
+          startTime: Date.now(),
+          destinations: destinations.map((d: any) => d.rtmpUrl || d.url || ''),
+          encodingProfile: encodingProfile || '1080p60',
+          totalFramesSent: 0,
+          totalBytesReceived: 0,
+          droppedFrames: 0,
+          ffmpegRestarts: 0,
+          errors: [],
+        };
+      }
 
       lastFFmpegSpawnTime = Date.now();
-      spawnFFmpeg(lastStartData);
+      if (!spawnFFmpeg(lastStartData)) {
+        socket.emit('stream-failed', { message: 'Unable to initialize FFmpeg with the current destinations' });
+        finalizeSession();
+        return;
+      }
 
-      // Start heartbeat monitor — warns on chunk stalls but does NOT auto-restart
+      // Start heartbeat monitor — requests a client transport refresh on chunk stalls.
       lastChunkTime = Date.now();
       let lastHeartbeatWarn = 0;
-      if (heartbeatInterval) clearInterval(heartbeatInterval);
+      clearHeartbeat();
       heartbeatInterval = setInterval(() => {
         if (!ffmpegProcess || intentionallyStopped) return;
         if (!lastChunkTime) return;
         const elapsed = Date.now() - lastChunkTime;
         const now = Date.now();
+        if (elapsed > 6_000 && (now - lastRefreshRequestAt) > 12_000) {
+          lastRefreshRequestAt = now;
+          socket.emit('server-log', { message: 'No browser chunks received for 6s — requesting transport refresh', type: 'warning' });
+          socket.emit('stream-refresh-request', { reason: 'server-chunk-stall', elapsedMs: elapsed });
+        }
         // Only warn once per 30 seconds to avoid flooding the client
         if (elapsed > 10_000 && (now - lastHeartbeatWarn) > 30_000) {
-          socket.emit('server-log', { message: 'Warning: No chunks received for 10s — stream may have stalled', type: 'warning' });
+          socket.emit('server-log', { message: 'Warning: No chunks received for 10s — stream may be stalled', type: 'warning' });
           lastHeartbeatWarn = now;
         }
-      }, 10_000); // Check every 10s (was 5s)
+      }, 3_000);
     });
 
     socket.on("audience-message", (data, callback) => {
@@ -869,6 +1012,7 @@ async function startServer() {
 
       // Track last chunk arrival for heartbeat
       lastChunkTime = Date.now();
+      lastRefreshRequestAt = 0;
 
       if (inputStream && data.chunk) {
         // data.chunk can be ArrayBuffer, Buffer, or Blob — normalize to Buffer
@@ -906,23 +1050,14 @@ async function startServer() {
       }
     });
 
-    // Helper to kill FFmpeg regardless of whether it's a ChildProcess or fluent-ffmpeg instance
     function killFFmpeg() {
-      if (!ffmpegProcess) return;
-      try {
-        if (typeof ffmpegProcess.kill === 'function') {
-          ffmpegProcess.kill('SIGINT');
-        }
-      } catch { /* already dead */ }
-      ffmpegProcess = null;
+      destroyActivePipeline(true);
     }
 
     socket.on("stop-stream", () => {
       intentionallyStopped = true;
-      if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+      clearHeartbeat();
       killFFmpeg();
-      if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
-      if (inputStream) { inputStream.destroy(); inputStream = null; }
       console.log('Streaming stopped');
       finalizeSession();
     });
@@ -932,10 +1067,8 @@ async function startServer() {
       messageLimiter.remove(socket.id);
       chunkLimiter.remove(socket.id);
       intentionallyStopped = true;
-      if (heartbeatInterval) { clearInterval(heartbeatInterval); heartbeatInterval = null; }
+      clearHeartbeat();
       killFFmpeg();
-      if (fmp4Demuxer) { fmp4Demuxer.destroy(); fmp4Demuxer = null; }
-      if (inputStream) { inputStream.destroy(); inputStream = null; }
       finalizeSession();
     });
   });
