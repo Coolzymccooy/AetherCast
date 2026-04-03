@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { X, Smartphone, ExternalLink, Copy, Monitor, Users, CheckCircle } from 'lucide-react';
+import { X, Smartphone, ExternalLink, Copy, Monitor, Users, CheckCircle, Download } from 'lucide-react';
 import { motion } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import { QrMode } from '../../types';
@@ -213,6 +213,21 @@ export const QrModal: React.FC<QrModalProps> = ({ qrMode, setQrMode, onClose }) 
             <div className="bg-black/40 border border-border rounded-xl p-4 text-center">
               <span className="text-[10px] font-bold uppercase tracking-widest text-gray-500 block mb-2">Room Code</span>
               <span className="text-2xl font-mono font-bold tracking-[0.3em] text-white">SLTN-1234</span>
+            </div>
+
+            {/* APK download strip */}
+            <div className="mt-4 flex items-center justify-between gap-3 bg-blue-500/5 border border-blue-500/20 rounded-xl px-4 py-3">
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold text-blue-300">Android app required for screen share</p>
+                <p className="text-[10px] text-gray-500 mt-0.5">Camera &amp; audience work in any browser</p>
+              </div>
+              <a
+                href="/downloads/aethercast-camera.apk"
+                download
+                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors"
+              >
+                <Download size={12} /> APK
+              </a>
             </div>
           </div>
         </div>

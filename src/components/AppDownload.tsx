@@ -26,10 +26,10 @@ const STEPS = [
 ];
 
 export default function AppDownload() {
-  const [stepsOpen, setStepsOpen] = useState(false);
+  const [stepsOpen, setStepsOpen] = useState(true);
 
   return (
-    <div className="min-h-screen bg-bg text-white flex flex-col items-center justify-start p-6 pt-16">
+    <div className="min-h-screen bg-bg text-white flex flex-col items-center justify-start p-6 pt-16 overflow-y-auto">
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
