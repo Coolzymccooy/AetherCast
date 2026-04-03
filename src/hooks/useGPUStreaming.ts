@@ -25,6 +25,9 @@ interface NativeStreamStats {
   bytes_written: number;
   write_failures: number;
   keepalive_frames: number;
+  archive_path_pattern?: string | null;
+  archive_segment_seconds: number;
+  last_restart_delay_ms: number;
   last_error?: string | null;
   last_exit_status?: string | null;
   ffmpeg_path: string;
@@ -46,6 +49,9 @@ interface GPUStreamStats {
   bitrateKbps: number;
   width: number;
   height: number;
+  archivePathPattern: string | null;
+  archiveSegmentSeconds: number;
+  lastRestartDelayMs: number;
   lastError: string | null;
   uptimeMs: number;
 }
@@ -119,6 +125,9 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
     bitrateKbps: 0,
     width: 0,
     height: 0,
+    archivePathPattern: null,
+    archiveSegmentSeconds: 0,
+    lastRestartDelayMs: 0,
     lastError: null,
     uptimeMs: 0,
   });
@@ -170,6 +179,9 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
       bitrateKbps: native.bitrate_kbps,
       width: native.width,
       height: native.height,
+      archivePathPattern: native.archive_path_pattern || null,
+      archiveSegmentSeconds: native.archive_segment_seconds,
+      lastRestartDelayMs: native.last_restart_delay_ms,
       lastError: native.last_error || null,
       uptimeMs: native.uptime_ms,
     });
@@ -193,13 +205,17 @@ export function useGPUStreaming(options: UseGPUStreamingOptions = {}) {
 
       if (native.restarting && !previous?.restarting) {
         addServerLog(
-          `Native encoder restarting (${native.restart_count}/${native.max_restarts})`,
+          `Native encoder restarting (${native.restart_count}/${native.max_restarts}) in ${(native.last_restart_delay_ms / 1000).toFixed(0)}s`,
           'warning',
         );
       }
 
       if (!native.restarting && previous?.restarting) {
         addServerLog('Native encoder recovered after restart', 'success');
+      }
+
+      if (native.archive_path_pattern && native.archive_path_pattern !== previous?.archive_path_pattern) {
+        addServerLog(`Local safety archive enabled: ${native.archive_path_pattern}`, 'info');
       }
 
       if (native.last_error && native.last_error !== previous?.last_error) {

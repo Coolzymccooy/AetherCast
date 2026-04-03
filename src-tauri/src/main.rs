@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Child, ChildStderr, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,6 +56,11 @@ fn default_height() -> u32 { 1080 }
 fn default_fps() -> u32 { 30 }
 fn default_bitrate() -> u32 { 6000 }
 
+const DEFAULT_MAX_RESTARTS: u32 = 12;
+const RESTART_RESET_AFTER_MS: u64 = 180_000;
+const ARCHIVE_SEGMENT_SECONDS: u32 = 300;
+const FIFO_QUEUE_SIZE: i32 = 180;
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -105,11 +111,14 @@ struct NativeStreamRuntime {
     restart_count: u32,
     max_restarts: u32,
     session_id: u64,
+    last_spawn_at_ms: u64,
+    last_restart_delay_ms: u64,
     ffmpeg_path: String,
     encoder: String,
     is_gpu: bool,
     config: Option<GPUStreamConfig>,
     lavfi_enabled: bool,
+    archive_path_pattern: Option<String>,
     last_error: Option<String>,
     last_exit_status: Option<String>,
     started_at_ms: u64,
@@ -128,13 +137,16 @@ impl Default for NativeStreamRuntime {
             active: false,
             restarting: false,
             restart_count: 0,
-            max_restarts: 5,
+            max_restarts: DEFAULT_MAX_RESTARTS,
             session_id: 0,
+            last_spawn_at_ms: 0,
+            last_restart_delay_ms: 0,
             ffmpeg_path: String::new(),
             encoder: String::new(),
             is_gpu: false,
             config: None,
             lavfi_enabled: true,
+            archive_path_pattern: None,
             last_error: None,
             last_exit_status: None,
             started_at_ms: 0,
@@ -165,6 +177,9 @@ struct NativeStreamStats {
     bytes_written: u64,
     write_failures: u64,
     keepalive_frames: u64,
+    archive_path_pattern: Option<String>,
+    archive_segment_seconds: u32,
+    last_restart_delay_ms: u64,
     last_error: Option<String>,
     last_exit_status: Option<String>,
     ffmpeg_path: String,
@@ -183,6 +198,47 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn restart_delay_ms(restart_count: u32) -> u64 {
+    match restart_count {
+        0 | 1 => 1_000,
+        2 => 2_000,
+        3 => 4_000,
+        4 => 8_000,
+        _ => 15_000,
+    }
+}
+
+fn archive_root_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(profile).join("Videos").join("AetherCast").join("Archive");
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join("Movies").join("AetherCast").join("Archive");
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Videos").join("AetherCast").join("Archive");
+    }
+
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("aether-archive")
+}
+
+fn build_archive_pattern(session_id: u64) -> Result<String, String> {
+    let root = archive_root_dir();
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("Failed to create archive directory {}: {}", root.display(), e))?;
+
+    let pattern = root.join(format!("aethercast-session-{}-%Y%m%d-%H%M%S.mkv", session_id));
+    Ok(pattern.to_string_lossy().replace('\\', "/"))
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +376,7 @@ fn build_ffmpeg_args(
     encoder: &str,
     is_gpu: bool,
     lavfi_enabled: bool,
+    archive_path_pattern: Option<&str>,
 ) -> Vec<String> {
     let is_jpeg_mode = config.mode == "jpeg";
     let mut args: Vec<String> = Vec::new();
@@ -456,19 +513,35 @@ fn build_ffmpeg_args(
         "-flvflags".into(), "no_duration_filesize".into(),
     ]);
 
-    if active.len() == 1 {
-        let (fmt, url) = destination_to_output(active[0]);
-        args.extend(["-f".into(), fmt, url]);
-    } else {
-        let tee: Vec<String> = active
-            .iter()
-            .map(|d| {
-                let (fmt, url) = destination_to_output(d);
-                format!("[f={}:onfail=ignore]{}", fmt, url)
-            })
-            .collect();
-        args.extend(["-f".into(), "tee".into(), tee.join("|")]);
+    let mut tee_outputs: Vec<String> = active
+        .iter()
+        .map(|d| {
+            let (fmt, url) = destination_to_output(d);
+            format!("[f={}:onfail=ignore]{}", fmt, url)
+        })
+        .collect();
+
+    if let Some(archive_path_pattern) = archive_path_pattern {
+        tee_outputs.push(format!(
+            "[f=segment:onfail=ignore:segment_format=matroska:segment_time={}:reset_timestamps=1:strftime=1]{}",
+            ARCHIVE_SEGMENT_SECONDS,
+            archive_path_pattern
+        ));
     }
+
+    let fifo_options = format!(
+        "attempt_recovery=1:recover_any_error=1:drop_pkts_on_overflow=1:queue_size={}:max_recovery_attempts=0:recovery_wait_time=1:restart_with_keyframe=1",
+        FIFO_QUEUE_SIZE
+    );
+    args.extend([
+        "-f".into(),
+        "tee".into(),
+        "-use_fifo".into(),
+        "1".into(),
+        "-fifo_options".into(),
+        fifo_options,
+        tee_outputs.join("|"),
+    ]);
 
     args
 }
@@ -543,7 +616,7 @@ fn start_keepalive_loop(session_id: u64) {
 }
 
 fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
-    let (config, ffmpeg_bin, encoder, is_gpu, lavfi_enabled, restart_count) = {
+    let (config, ffmpeg_bin, encoder, is_gpu, lavfi_enabled, restart_count, archive_path_pattern) = {
         let state = stream_runtime().lock().map_err(|e| e.to_string())?;
         if !state.desired_active {
             return Err("Stream is not marked active".into());
@@ -555,6 +628,7 @@ fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
             state.is_gpu,
             state.lavfi_enabled,
             state.restart_count,
+            state.archive_path_pattern.clone(),
         )
     };
 
@@ -563,7 +637,14 @@ fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
         return Err("No enabled destinations".into());
     }
 
-    let args = build_ffmpeg_args(&config, &active, &encoder, is_gpu, lavfi_enabled);
+    let args = build_ffmpeg_args(
+        &config,
+        &active,
+        &encoder,
+        is_gpu,
+        lavfi_enabled,
+        archive_path_pattern.as_deref(),
+    );
     println!("[aether] FFmpeg command: {} {}", ffmpeg_bin, args.join(" "));
 
     let mut cmd = Command::new(&ffmpeg_bin);
@@ -592,6 +673,7 @@ fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
         if state.started_at_ms == 0 {
             state.started_at_ms = now_ms();
         }
+        state.last_spawn_at_ms = now_ms();
         println!(
             "[aether] Native stream active: encoder={} lavfi={} restart={}",
             state.encoder,
@@ -659,7 +741,9 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
             *stdin_guard = None;
         }
 
+        let exit_at_ms = now_ms();
         let mut should_restart = false;
+        let mut delay_before_restart_ms = 0;
         {
             let mut state = match stream_runtime().lock() {
                 Ok(guard) => guard,
@@ -669,17 +753,27 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
             state.last_exit_status = Some(status_text.clone());
             if let Some(line) = last_error_line.clone() {
                 state.last_error = Some(line);
+            } else {
+                state.last_error = Some(format!("FFmpeg exited with status {}", status_text));
             }
 
             if state.desired_active {
+                let stable_runtime_ms = exit_at_ms.saturating_sub(state.last_spawn_at_ms);
+                if stable_runtime_ms >= RESTART_RESET_AFTER_MS {
+                    state.restart_count = 0;
+                }
+
                 if state.restart_count < state.max_restarts {
                     state.restart_count += 1;
                     state.restarting = true;
-                    state.last_restart_at_ms = now_ms();
+                    state.last_restart_at_ms = exit_at_ms;
+                    delay_before_restart_ms = restart_delay_ms(state.restart_count);
+                    state.last_restart_delay_ms = delay_before_restart_ms;
                     should_restart = true;
                 } else {
                     state.desired_active = false;
                     state.restarting = false;
+                    state.last_restart_delay_ms = 0;
                     state.last_error = Some(
                         state
                             .last_error
@@ -691,12 +785,13 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
         }
 
         if should_restart {
-            std::thread::sleep(Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(delay_before_restart_ms.max(1)));
             if let Err(err) = spawn_ffmpeg_from_runtime() {
                 if let Ok(mut state) = stream_runtime().lock() {
                     state.desired_active = false;
                     state.active = false;
                     state.restarting = false;
+                    state.last_restart_delay_ms = 0;
                     state.last_error = Some(err);
                 }
             }
@@ -737,6 +832,7 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     let is_gpu = encoder != "libx264";
     let lavfi_enabled = supports_lavfi(&ffmpeg_bin);
     let session_id = now_ms();
+    let archive_path_pattern = build_archive_pattern(session_id)?;
 
     if let Ok(mut counter) = frame_counter().lock() {
         *counter = 0;
@@ -749,11 +845,14 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         state.restarting = false;
         state.restart_count = 0;
         state.session_id = session_id;
+        state.last_spawn_at_ms = 0;
+        state.last_restart_delay_ms = 0;
         state.ffmpeg_path = ffmpeg_bin.clone();
         state.encoder = encoder.clone();
         state.is_gpu = is_gpu;
         state.config = Some(config.clone());
         state.lavfi_enabled = lavfi_enabled;
+        state.archive_path_pattern = Some(archive_path_pattern.clone());
         state.last_error = None;
         state.last_exit_status = None;
         state.started_at_ms = now_ms();
@@ -772,26 +871,33 @@ async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     let mode_label = if config.mode == "jpeg" { "JPEG->image2pipe" } else { "Raw RGBA" };
     let audio_label = if lavfi_enabled { "with silent audio keepalive" } else { "without synthetic audio fallback" };
     return Ok(format!(
-        "Streaming via {} [{}] {} at {}x{} @{}fps to {} destination(s)",
+        "Streaming via {} [{}] {} at {}x{} @{}fps to {} destination(s); archive segments: {}",
         encoder_label,
         mode_label,
         audio_label,
         config.width,
         config.height,
         config.fps,
-        active.len()
+        active.len(),
+        archive_path_pattern
     ));
 }
 
 
 #[tauri::command]
 async fn stop_stream() -> Result<String, String> {
+    let archive_path_pattern = {
+        let state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.archive_path_pattern.clone()
+    };
+
     {
         let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
         state.desired_active = false;
         state.active = false;
         state.restarting = false;
         state.last_frame = None;
+        state.last_restart_delay_ms = 0;
     }
 
     { *ffmpeg_stdin().lock().map_err(|e| e.to_string())? = None; }
@@ -802,7 +908,10 @@ async fn stop_stream() -> Result<String, String> {
     }
 
     let frames = frame_counter().lock().map(|c| *c).unwrap_or(0);
-    return Ok(format!("Stream stopped ({} frames encoded)", frames));
+    return Ok(match archive_path_pattern {
+        Some(path) => format!("Stream stopped ({} frames encoded). Archive segments: {}", frames, path),
+        None => format!("Stream stopped ({} frames encoded)", frames),
+    });
 }
 
 /// Write a base64-encoded JPEG frame to FFmpeg stdin (used in jpeg mode)
@@ -973,6 +1082,9 @@ async fn get_stream_stats() -> Result<String, String> {
         bytes_written: state.bytes_written,
         write_failures: state.write_failures,
         keepalive_frames: state.keepalive_frames,
+        archive_path_pattern: state.archive_path_pattern,
+        archive_segment_seconds: ARCHIVE_SEGMENT_SECONDS,
+        last_restart_delay_ms: state.last_restart_delay_ms,
         last_error: state.last_error,
         last_exit_status: state.last_exit_status,
         ffmpeg_path: state.ffmpeg_path,
