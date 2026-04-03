@@ -76,8 +76,6 @@ pub struct OutputStatus {
     pub state: EngineHealthState,
     pub last_error: Option<String>,
     pub last_update_ms: u64,
-    #[serde(skip_serializing, skip_deserializing, default)]
-    pub match_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

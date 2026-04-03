@@ -5,6 +5,7 @@ use super::state::{
 };
 
 pub const DEFAULT_ARCHIVE_SEGMENT_SECONDS: u32 = 300;
+#[allow(dead_code)]
 pub const DEFAULT_FIFO_QUEUE_SIZE: i32 = 180;
 
 #[derive(Debug, Clone)]
@@ -14,23 +15,40 @@ pub struct OutputSessionPlan {
     pub protocol: String,
     pub muxer: String,
     pub target: String,
-    pub tee_spec: String,
+    pub ffmpeg_target: String,
     pub recovery_delay_ms: u64,
-    pub match_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ArchiveSessionPlan {
+    pub worker_id: String,
     pub path_pattern: String,
     pub segment_seconds: u32,
-    pub tee_spec: String,
+    pub recovery_delay_ms: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct OutputManagerPlan {
     pub outputs: Vec<OutputSessionPlan>,
     pub archive: Option<ArchiveSessionPlan>,
-    pub fifo_options: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputWorkerKind {
+    Destination,
+    Archive,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputWorkerPlan {
+    pub worker_id: String,
+    pub name: String,
+    pub protocol: String,
+    pub muxer: String,
+    pub target: String,
+    pub ffmpeg_target: String,
+    pub recovery_delay_ms: u64,
+    pub kind: OutputWorkerKind,
 }
 
 impl OutputManagerPlan {
@@ -51,18 +69,36 @@ impl OutputManagerPlan {
             .unwrap_or(DEFAULT_ARCHIVE_SEGMENT_SECONDS)
     }
 
-    pub fn tee_targets(&self) -> Vec<String> {
-        let mut tee_targets: Vec<String> = self
+    pub fn worker_plans(&self) -> Vec<OutputWorkerPlan> {
+        let mut workers: Vec<OutputWorkerPlan> = self
             .outputs
             .iter()
-            .map(|output| output.tee_spec.clone())
+            .map(|output| OutputWorkerPlan {
+                worker_id: output.worker_id.clone(),
+                name: output.name.clone(),
+                protocol: output.protocol.clone(),
+                muxer: output.muxer.clone(),
+                target: output.target.clone(),
+                ffmpeg_target: output.ffmpeg_target.clone(),
+                recovery_delay_ms: output.recovery_delay_ms,
+                kind: OutputWorkerKind::Destination,
+            })
             .collect();
 
         if let Some(archive) = &self.archive {
-            tee_targets.push(archive.tee_spec.clone());
+            workers.push(OutputWorkerPlan {
+                worker_id: archive.worker_id.clone(),
+                name: "Local Archive".into(),
+                protocol: "archive".into(),
+                muxer: "segment".into(),
+                target: archive.path_pattern.clone(),
+                ffmpeg_target: archive.path_pattern.clone(),
+                recovery_delay_ms: archive.recovery_delay_ms,
+                kind: OutputWorkerKind::Archive,
+            });
         }
 
-        tee_targets
+        workers
     }
 }
 
@@ -100,22 +136,64 @@ pub fn build_output_manager_plan(
 
     let archive = archive_path_pattern.map(build_archive_session);
 
-    Ok(OutputManagerPlan {
-        outputs,
-        archive,
-        fifo_options: build_fifo_options(DEFAULT_FIFO_QUEUE_SIZE),
-    })
+    Ok(OutputManagerPlan { outputs, archive })
 }
 
+pub fn append_worker_output_args(args: &mut Vec<String>, worker: &OutputWorkerPlan) {
+    match worker.kind {
+        OutputWorkerKind::Destination => {
+            args.extend([
+                "-f".into(),
+                worker.muxer.clone(),
+                worker.ffmpeg_target.clone(),
+            ]);
+        }
+        OutputWorkerKind::Archive => {
+            args.extend([
+                "-f".into(),
+                "segment".into(),
+                "-segment_format".into(),
+                "matroska".into(),
+                "-segment_time".into(),
+                DEFAULT_ARCHIVE_SEGMENT_SECONDS.to_string(),
+                "-reset_timestamps".into(),
+                "1".into(),
+                "-strftime".into(),
+                "1".into(),
+                worker.ffmpeg_target.clone(),
+            ]);
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn append_output_args(args: &mut Vec<String>, plan: &OutputManagerPlan) {
+    let mut tee_targets: Vec<String> = plan
+        .outputs
+        .iter()
+        .map(|output| format!("[f={}:onfail=ignore]{}", output.muxer, output.ffmpeg_target))
+        .collect();
+
+    if let Some(archive) = &plan.archive {
+        tee_targets.push(format!(
+            "[f=segment:onfail=ignore:segment_format=matroska:segment_time={}:reset_timestamps=1:strftime=1]{}",
+            archive.segment_seconds, archive.path_pattern
+        ));
+    }
+
+    let fifo_options = format!(
+        "attempt_recovery=1:recover_any_error=1:drop_pkts_on_overflow=1:queue_size={}:max_recovery_attempts=0:recovery_wait_time=1:restart_with_keyframe=1",
+        DEFAULT_FIFO_QUEUE_SIZE
+    );
+
     args.extend([
         "-f".into(),
         "tee".into(),
         "-use_fifo".into(),
         "1".into(),
         "-fifo_options".into(),
-        plan.fifo_options.clone(),
-        plan.tee_targets().join("|"),
+        fifo_options,
+        tee_targets.join("|"),
     ]);
 }
 
@@ -132,7 +210,23 @@ pub fn set_output_states(
     set_output_states_for_indexes(outputs, &indexes, next, error);
 }
 
+pub fn set_output_state_by_worker_id(
+    outputs: &mut [OutputStatus],
+    worker_id: &str,
+    next: EngineHealthState,
+    error: Option<String>,
+) {
+    if let Some(index) = outputs
+        .iter()
+        .position(|output| output.worker_id == worker_id)
+    {
+        set_output_states_for_indexes(outputs, &[index], next, error);
+    }
+}
+
 pub fn apply_output_runtime_signal(
+    worker_id: &str,
+    kind: OutputWorkerKind,
     line: &str,
     outputs: &mut [OutputStatus],
     archive: &mut ArchiveStatus,
@@ -140,64 +234,37 @@ pub fn apply_output_runtime_signal(
     let lowered = line.to_ascii_lowercase();
     let line_message = Some(line.to_string());
 
-    if lowered.contains("segment")
-        || lowered.contains("matroska")
-        || lowered.contains("archive")
-        || lowered.contains("muxer")
-    {
-        let next = if lowered.contains("error") || lowered.contains("failed") {
-            EngineHealthState::Error
-        } else {
-            EngineHealthState::Degraded
-        };
-        archive.state = next;
-        archive.last_error = line_message;
-        archive.last_update_ms = now_ms();
-        return;
-    }
-
-    let matched_indexes = match_output_indexes(outputs, &lowered);
-    let target_indexes = if matched_indexes.is_empty() {
-        (0..outputs.len()).collect::<Vec<_>>()
-    } else {
-        matched_indexes
-    };
-
-    if lowered.contains("reconnect")
+    let next = if lowered.contains("reconnect")
         || lowered.contains("timed out")
         || lowered.contains("broken pipe")
         || lowered.contains("connection reset")
     {
-        set_output_states_for_indexes(
-            outputs,
-            &target_indexes,
-            EngineHealthState::Recovering,
-            line_message,
-        );
-        return;
-    }
-
-    if lowered.contains("error")
+        Some(EngineHealthState::Recovering)
+    } else if lowered.contains("error")
         || lowered.contains("failed")
         || lowered.contains("invalid")
         || lowered.contains("denied")
     {
-        set_output_states_for_indexes(
-            outputs,
-            &target_indexes,
-            EngineHealthState::Error,
-            line_message,
-        );
-        return;
-    }
+        Some(EngineHealthState::Error)
+    } else if lowered.contains("warning") || lowered.contains("drop") {
+        Some(EngineHealthState::Degraded)
+    } else {
+        None
+    };
 
-    if lowered.contains("warning") || lowered.contains("drop") {
-        set_output_states_for_indexes(
-            outputs,
-            &target_indexes,
-            EngineHealthState::Degraded,
-            line_message,
-        );
+    let Some(next) = next else {
+        return;
+    };
+
+    match kind {
+        OutputWorkerKind::Destination => {
+            set_output_state_by_worker_id(outputs, worker_id, next, line_message);
+        }
+        OutputWorkerKind::Archive => {
+            archive.state = next;
+            archive.last_error = line_message;
+            archive.last_update_ms = now_ms();
+        }
     }
 }
 
@@ -265,36 +332,25 @@ fn build_output_session(destination: &StreamDestination) -> Result<OutputSession
         destination.name.trim().to_string()
     };
     let worker_id = build_worker_id(protocol, &name);
-    let match_tokens = build_match_tokens(&name, protocol, &resolved_target);
 
     Ok(OutputSessionPlan {
         worker_id,
         name,
         protocol: protocol.to_string(),
-        muxer: muxer.clone(),
+        muxer,
         target: display_target,
-        tee_spec: format!("[f={}:onfail=ignore]{}", muxer, resolved_target),
+        ffmpeg_target: resolved_target,
         recovery_delay_ms: protocol_recovery_delay_ms(protocol),
-        match_tokens,
     })
 }
 
 fn build_archive_session(path_pattern: &str) -> ArchiveSessionPlan {
     ArchiveSessionPlan {
+        worker_id: "archive:local".into(),
         path_pattern: path_pattern.to_string(),
         segment_seconds: DEFAULT_ARCHIVE_SEGMENT_SECONDS,
-        tee_spec: format!(
-            "[f=segment:onfail=ignore:segment_format=matroska:segment_time={}:reset_timestamps=1:strftime=1]{}",
-            DEFAULT_ARCHIVE_SEGMENT_SECONDS, path_pattern
-        ),
+        recovery_delay_ms: 1_000,
     }
-}
-
-fn build_fifo_options(queue_size: i32) -> String {
-    format!(
-        "attempt_recovery=1:recover_any_error=1:drop_pkts_on_overflow=1:queue_size={}:max_recovery_attempts=0:recovery_wait_time=1:restart_with_keyframe=1",
-        queue_size
-    )
 }
 
 fn resolved_destination_url(destination: &StreamDestination) -> String {
@@ -372,42 +428,6 @@ fn build_worker_id(protocol: &str, name: &str) -> String {
     format!("{}:{}", protocol, normalized)
 }
 
-fn build_match_tokens(name: &str, protocol: &str, resolved_target: &str) -> Vec<String> {
-    let sanitized = sanitize_target(resolved_target).to_ascii_lowercase();
-    let host = extract_host_token(&sanitized);
-    let tail = sanitized
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .next_back()
-        .unwrap_or_default()
-        .to_string();
-    let name_token = name.trim().to_ascii_lowercase();
-
-    let mut tokens = Vec::new();
-    if !name_token.is_empty() && name_token.len() >= 4 {
-        tokens.push(name_token);
-    }
-    if !host.is_empty() && host.len() >= 4 {
-        tokens.push(host);
-    }
-    if protocol != "rtmp" && !tail.is_empty() && tail.len() >= 4 {
-        tokens.push(tail);
-    }
-    tokens.sort();
-    tokens.dedup();
-    tokens
-}
-
-fn extract_host_token(target: &str) -> String {
-    let without_scheme = target.split("://").nth(1).unwrap_or(target);
-    without_scheme
-        .split(['/', '?'])
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string()
-}
-
 fn build_output_status(output: &OutputSessionPlan) -> OutputStatus {
     OutputStatus {
         worker_id: output.worker_id.clone(),
@@ -421,7 +441,6 @@ fn build_output_status(output: &OutputSessionPlan) -> OutputStatus {
         state: EngineHealthState::Starting,
         last_error: None,
         last_update_ms: now_ms(),
-        match_tokens: output.match_tokens.clone(),
     }
 }
 
@@ -451,24 +470,6 @@ fn set_output_states_for_indexes(
             _ => None,
         };
     }
-}
-
-fn match_output_indexes(outputs: &[OutputStatus], lowered_line: &str) -> Vec<usize> {
-    outputs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, output)| {
-            if output
-                .match_tokens
-                .iter()
-                .any(|token| !token.is_empty() && lowered_line.contains(token))
-            {
-                Some(index)
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn now_ms() -> u64 {
