@@ -20,6 +20,7 @@ import { useReplay } from './hooks/useReplay';
 import { useProject } from './hooks/useProject';
 import { useMIDI } from './hooks/useMIDI';
 import { useNativeEngine } from './hooks/useNativeEngine';
+import { buildNativeSceneSnapshot } from './lib/sceneSchema';
 
 // --- Studio Components ---
 import { MenuBar } from './components/studio/MenuBar';
@@ -222,6 +223,58 @@ function StudioView() {
       studio.setIsStreaming(nativeEngine.isStreaming);
     }
   }, [nativeEngine.isStreaming, studio.setIsStreaming]);
+
+  useEffect(() => {
+    if (!nativeEngine.isAvailable) return;
+
+    const remoteIds = Array.from(webrtc.remoteStreams.keys());
+    const remoteSourceCount = remoteIds.filter((id) => !id.startsWith('local-cam-')).length;
+    const hasLocalCam2 = remoteIds.includes('local-cam-2');
+
+    const snapshot = buildNativeSceneSnapshot({
+      activeScene: studio.activeScene,
+      layout: studio.layout,
+      transitionType: studio.transition,
+      sources: studio.sources,
+      lowerThirds: studio.lowerThirds,
+      graphics: {
+        showBug: studio.activeGraphics.has('Bug - Logo'),
+        showSocials: studio.activeGraphics.has('Overlay - Socials'),
+      },
+      background: studio.background,
+      frameStyle: studio.frameStyle,
+      motionStyle: studio.motionStyle,
+      brandColor: studio.brandColor,
+      sourceSwap: studio.sourceSwap,
+      audienceMessages: studio.audienceMessages,
+      activeMessageId: studio.activeMessageId,
+      webcamAvailable: !!webrtc.webcamStream,
+      screenAvailable: !!webrtc.screenStream,
+      remoteSourceCount,
+      hasLocalCam2,
+    });
+
+    void nativeEngine.syncSceneSnapshot(snapshot);
+  }, [
+    nativeEngine.isAvailable,
+    nativeEngine.syncSceneSnapshot,
+    studio.activeScene,
+    studio.layout,
+    studio.transition,
+    studio.sources,
+    studio.lowerThirds,
+    studio.activeGraphics,
+    studio.background,
+    studio.frameStyle,
+    studio.motionStyle,
+    studio.brandColor,
+    studio.sourceSwap,
+    studio.audienceMessages,
+    studio.activeMessageId,
+    webrtc.webcamStream,
+    webrtc.screenStream,
+    webrtc.remoteStreams,
+  ]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (

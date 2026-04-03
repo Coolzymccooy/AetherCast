@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { StreamDestination, ServerLog, EncodingProfile } from '../types';
+import type { NativeSceneSnapshot } from '../lib/sceneSchema';
 
 interface UseNativeEngineOptions {
   setTelemetry?: Dispatch<SetStateAction<any>>;
@@ -78,6 +79,20 @@ interface NativeAudioDiscovery {
   suggested_status: NativeAudioStatus;
 }
 
+interface NativeVideoStatus {
+  state: NativeHealthState;
+  render_path: string;
+  scene_revision: number;
+  active_scene_id?: string | null;
+  active_scene_name?: string | null;
+  scene_type?: string | null;
+  layout?: string | null;
+  node_count: number;
+  visible_node_count: number;
+  last_sync_ms: number;
+  last_error?: string | null;
+}
+
 interface NativeStreamStats {
   frames: number;
   active: boolean;
@@ -110,6 +125,7 @@ interface NativeStreamStats {
   bridge_frames_received: number;
   bridge_bytes_received: number;
   bridge_last_error?: string | null;
+  video_status: NativeVideoStatus;
   audio_status: NativeAudioStatus;
   output_statuses: NativeOutputStatus[];
   archive_status: NativeArchiveStatus;
@@ -141,6 +157,7 @@ interface GPUStreamStats {
   lastRestartDelayMs: number;
   lastError: string | null;
   uptimeMs: number;
+  videoStatus: NativeVideoStatus | null;
   audioStatus: NativeAudioStatus | null;
   outputStatuses: NativeOutputStatus[];
   archiveStatus: NativeArchiveStatus | null;
@@ -261,6 +278,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     lastRestartDelayMs: 0,
     lastError: null,
     uptimeMs: 0,
+    videoStatus: null,
     audioStatus: null,
     outputStatuses: [],
     archiveStatus: null,
@@ -286,6 +304,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   const bridgeUrlRef = useRef<string | null>(null);
   const bridgeReconnectTimerRef = useRef<number | null>(null);
   const transportModeRef = useRef<'bridge' | 'invoke'>('invoke');
+  const lastSceneRevisionRef = useRef<number>(0);
 
   const addServerLog = useCallback((message: string, type: ServerLog['type']) => {
     if (!options.setServerLogs) return;
@@ -403,6 +422,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastRestartDelayMs: native.last_restart_delay_ms,
       lastError: native.last_error || null,
       uptimeMs: native.uptime_ms,
+      videoStatus: native.video_status || null,
       audioStatus: native.audio_status || null,
       outputStatuses: native.output_statuses || [],
       archiveStatus: native.archive_status || null,
@@ -415,6 +435,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       droppedFrames: droppedRef.current + native.write_failures,
       network: resolveNativeNetworkState(native),
       nativeFrameTransport: native.frame_transport || prev.nativeFrameTransport,
+      nativeVideoState: native.video_status?.state || prev.nativeVideoState,
+      nativeVideoScene: native.video_status?.active_scene_name || prev.nativeVideoScene,
       nativeAudioState: native.audio_status?.state || prev.nativeAudioState,
       nativeAudioSource: native.audio_status?.source_summary || prev.nativeAudioSource,
       nativeOutputHealth: native.output_statuses?.map((output) => ({
@@ -448,6 +470,19 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           last_update_ms: 0,
         },
         frame_transport: 'unknown',
+        video_status: {
+          state: 'inactive',
+          render_path: 'unsynced',
+          scene_revision: 0,
+          active_scene_id: null,
+          active_scene_name: null,
+          scene_type: null,
+          layout: null,
+          node_count: 0,
+          visible_node_count: 0,
+          last_sync_ms: 0,
+          last_error: null,
+        },
         output_statuses: [],
         archive_status: {
           state: 'inactive',
@@ -473,6 +508,23 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
       if (native.archive_path_pattern && native.archive_path_pattern !== previous?.archive_path_pattern) {
         addServerLog(`Local safety archive enabled: ${native.archive_path_pattern}`, 'info');
+      }
+
+      if (!previous?.video_status) {
+        addServerLog(
+          `[video] ${native.video_status.state} (${native.video_status.render_path}, scene ${native.video_status.active_scene_name || 'unsynced'})`,
+          healthStateLogType(native.video_status.state),
+        );
+      } else if (
+        native.video_status.scene_revision !== previous.video_status.scene_revision ||
+        native.video_status.state !== previous.video_status.state ||
+        native.video_status.last_error !== previous.video_status.last_error
+      ) {
+        const detail = native.video_status.last_error ? `: ${native.video_status.last_error}` : '';
+        addServerLog(
+          `[video] ${native.video_status.state} (${native.video_status.render_path}, scene ${native.video_status.active_scene_name || 'unsynced'}, nodes ${native.video_status.visible_node_count}/${native.video_status.node_count})${detail}`,
+          healthStateLogType(native.video_status.state),
+        );
       }
 
       if (!previous?.audio_status) {
@@ -599,6 +651,26 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       return null;
     }
   }, [addServerLog, applyNativeStats, connectBridgeSocket, options, stopStatsPolling]);
+
+  const syncSceneSnapshot = useCallback(async (snapshot: NativeSceneSnapshot) => {
+    if (!window.__TAURI_INTERNALS__) return;
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    if (lastSceneRevisionRef.current === snapshot.revision) {
+      return;
+    }
+
+    try {
+      await invokeRef.current('update_scene_snapshot', { snapshot });
+      lastSceneRevisionRef.current = snapshot.revision;
+    } catch (err: any) {
+      addServerLog(`Native scene sync failed: ${err?.message || err}`, 'warning');
+    }
+  }, [addServerLog]);
 
   const startStatsPolling = useCallback(() => {
     stopStatsPolling();
@@ -897,6 +969,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     transportModeRef.current = 'invoke';
     bridgeUrlRef.current = null;
     lastNativeStateRef.current = null;
+    lastSceneRevisionRef.current = 0;
 
     if (!window.__TAURI_INTERNALS__ || !invokeRef.current) {
       setIsStreaming(false);
@@ -917,6 +990,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         isActive: false,
         restarting: false,
         frameTransport: 'unknown',
+        videoStatus: null,
         audioStatus: null,
         outputStatuses: [],
         archiveStatus: null,
@@ -941,6 +1015,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     stats,
     encoderInfo,
     audioInfo,
+    syncSceneSnapshot,
     startStream,
     stopStream,
     // Transitional aliases while the app migrates off the old hook name.

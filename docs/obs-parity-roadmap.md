@@ -37,9 +37,12 @@ The current stack has improved materially, but it still falls short of broadcast
   - `src/hooks/useNativeEngine.ts` now sends raw RGBA frames to the native engine instead of JPEG blobs for the primary desktop path.
   - `src-tauri/src/engine/service.rs` validates raw frame sizing and exposes `frame_transport` in native stats.
   - JPEG/image pipe remains only as legacy compatibility, not the preferred desktop transport.
+  - `src/lib/sceneSchema.ts` now builds a shared scene snapshot for the desktop engine.
+  - `src-tauri/src/engine/video.rs` now stores native scene revisions and exposes structured video sync state.
+  - `src/App.tsx` now syncs scene/layout/overlay changes into the native engine instead of leaving the browser canvas as the only scene authority.
 - Still outstanding before real OBS-class parity:
   - native audio bus graph, monitoring, delay, and metering parity
-  - native video/compositor ownership
+  - native video/compositor ownership beyond synced browser-authored scene snapshots
   - output manager split beyond inline FFmpeg session control
   - long-lived native worker/service outside the UI process
 

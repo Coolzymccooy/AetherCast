@@ -264,6 +264,7 @@ pub struct NativeStreamStats {
     pub bridge_frames_received: u64,
     pub bridge_bytes_received: u64,
     pub bridge_last_error: Option<String>,
+    pub video_status: NativeVideoStatus,
     pub audio_status: NativeAudioStatus,
     pub output_statuses: Vec<OutputStatus>,
     pub archive_status: ArchiveStatus,
@@ -276,6 +277,21 @@ pub struct NativeAudioDiscovery {
     pub supports_lavfi: bool,
     pub devices: Vec<NativeAudioInput>,
     pub suggested_status: NativeAudioStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeVideoStatus {
+    pub state: EngineHealthState,
+    pub render_path: String,
+    pub scene_revision: u64,
+    pub active_scene_id: Option<String>,
+    pub active_scene_name: Option<String>,
+    pub scene_type: Option<String>,
+    pub layout: Option<String>,
+    pub node_count: usize,
+    pub visible_node_count: usize,
+    pub last_sync_ms: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]

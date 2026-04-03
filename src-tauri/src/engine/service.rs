@@ -28,6 +28,7 @@ use super::state::{
     NativeStreamRuntime, NativeStreamStats, StartStreamResponse,
 };
 use super::telemetry::{build_archive_status, now_ms, set_archive_state};
+use super::video::current_video_status;
 
 const DEFAULT_MAX_RESTARTS: u32 = 12;
 #[allow(dead_code)]
@@ -1843,6 +1844,7 @@ pub async fn get_stream_stats() -> Result<String, String> {
         .lock()
         .map_err(|e| e.to_string())?
         .clone();
+    let video_status = current_video_status();
     let (width, height, fps, bitrate_kbps) = state
         .config
         .as_ref()
@@ -1909,6 +1911,7 @@ pub async fn get_stream_stats() -> Result<String, String> {
         bridge_frames_received: bridge.frames_received,
         bridge_bytes_received: bridge.bytes_received,
         bridge_last_error: bridge.last_error,
+        video_status,
         audio_status: state.audio_status,
         output_statuses: state.output_statuses,
         archive_status: state.archive_status,

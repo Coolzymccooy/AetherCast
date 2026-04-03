@@ -7,6 +7,7 @@ use engine::service::{
     capture_replay, detect_encoder, encode_frame, get_stream_stats, list_audio_devices,
     start_replay_buffer, start_stream, stop_replay_buffer, stop_stream, write_frame,
 };
+use engine::video::{get_scene_snapshot, update_scene_snapshot};
 
 fn main() {
     tauri::Builder::default()
@@ -18,6 +19,8 @@ fn main() {
             get_stream_stats,
             detect_encoder,
             list_audio_devices,
+            update_scene_snapshot,
+            get_scene_snapshot,
             start_replay_buffer,
             capture_replay,
             stop_replay_buffer,
