@@ -4,15 +4,8 @@
 mod engine;
 
 use engine::service::{
-    capture_replay,
-    detect_encoder,
-    encode_frame,
-    get_stream_stats,
-    start_replay_buffer,
-    start_stream,
-    stop_replay_buffer,
-    stop_stream,
-    write_frame,
+    capture_replay, detect_encoder, encode_frame, get_stream_stats, start_replay_buffer,
+    start_stream, stop_replay_buffer, stop_stream, write_frame,
 };
 
 fn main() {

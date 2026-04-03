@@ -16,6 +16,22 @@ The current stack has improved materially, but it still falls short of broadcast
 - Desktop audio is not yet a real native broadcast mixer. Synthetic fallback is still present in [main.rs](/c:/Users/segun/source/repos/aether2/src-tauri/src/main.rs).
 - The Tauri app is stronger than the browser path, but it is still a custom encoder path rather than a full native media runtime.
 
+## Implementation Progress
+
+- Phase 1 service boundary is complete:
+  - `src-tauri/src/engine/service.rs` now owns the native stream runtime.
+  - `src/hooks/useNativeEngine.ts` is the primary desktop control hook.
+  - `src/hooks/useGPUStreaming.ts` is a compatibility alias.
+- Phase 2 has started:
+  - `src-tauri/src/engine/state.rs` now owns native runtime/output/archive state shapes.
+  - `src-tauri/src/engine/telemetry.rs` now owns structured output/archive health transitions.
+  - `get_stream_stats` now returns structured output/archive health, not only flat FFmpeg counters and error strings.
+- Still outstanding before real OBS-class parity:
+  - native audio graph
+  - native video/compositor ownership
+  - output manager split beyond inline FFmpeg session control
+  - long-lived native worker/service outside the UI process
+
 ## Recommended Direction
 
 Use Tauri as the control UI, but move live media ownership into a native media engine.

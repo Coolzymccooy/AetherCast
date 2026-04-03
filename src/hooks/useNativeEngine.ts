@@ -9,6 +9,32 @@ interface UseNativeEngineOptions {
   onSuccess?: (message: string) => void;
 }
 
+type NativeHealthState =
+  | 'inactive'
+  | 'starting'
+  | 'active'
+  | 'recovering'
+  | 'degraded'
+  | 'error'
+  | 'stopped';
+
+interface NativeOutputStatus {
+  name: string;
+  protocol: string;
+  target: string;
+  state: NativeHealthState;
+  last_error?: string | null;
+  last_update_ms: number;
+}
+
+interface NativeArchiveStatus {
+  state: NativeHealthState;
+  path_pattern?: string | null;
+  segment_seconds: number;
+  last_error?: string | null;
+  last_update_ms: number;
+}
+
 interface NativeStreamStats {
   frames: number;
   active: boolean;
@@ -40,6 +66,8 @@ interface NativeStreamStats {
   bridge_frames_received: number;
   bridge_bytes_received: number;
   bridge_last_error?: string | null;
+  output_statuses: NativeOutputStatus[];
+  archive_status: NativeArchiveStatus;
 }
 
 interface NativeStartStreamResponse {
@@ -67,6 +95,8 @@ interface GPUStreamStats {
   lastRestartDelayMs: number;
   lastError: string | null;
   uptimeMs: number;
+  outputStatuses: NativeOutputStatus[];
+  archiveStatus: NativeArchiveStatus | null;
 }
 
 type NativeCaptureProfile = {
@@ -80,6 +110,55 @@ type NativeCaptureProfile = {
 const STATS_POLL_MS = 1500;
 const BRIDGE_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
 const BRIDGE_RECONNECT_MS = 1000;
+
+function resolveNativeNetworkState(native: NativeStreamStats): 'excellent' | 'good' | 'fair' | 'poor' {
+  const outputStates = native.output_statuses.map((output) => output.state);
+
+  if (
+    outputStates.includes('error') ||
+    native.archive_status?.state === 'error' ||
+    (!native.active && native.restarting)
+  ) {
+    return 'poor';
+  }
+
+  if (
+    native.restarting ||
+    outputStates.includes('recovering') ||
+    outputStates.includes('degraded') ||
+    native.archive_status?.state === 'recovering' ||
+    native.archive_status?.state === 'degraded'
+  ) {
+    return 'fair';
+  }
+
+  if (
+    native.last_frame_age_ms > 1500 ||
+    (native.transport_mode === 'bridge' && !native.bridge_connected)
+  ) {
+    return 'good';
+  }
+
+  return 'excellent';
+}
+
+function outputStatusKey(status: NativeOutputStatus): string {
+  return `${status.protocol}:${status.target}`;
+}
+
+function healthStateLogType(state: NativeHealthState): ServerLog['type'] {
+  switch (state) {
+    case 'active':
+      return 'success';
+    case 'recovering':
+    case 'degraded':
+      return 'warning';
+    case 'error':
+      return 'error';
+    default:
+      return 'info';
+  }
+}
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
@@ -145,6 +224,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     lastRestartDelayMs: 0,
     lastError: null,
     uptimeMs: 0,
+    outputStatuses: [],
+    archiveStatus: null,
   });
   const [encoderInfo, setEncoderInfo] = useState<{ encoder: string; isGPU: boolean; ffmpegPath: string } | null>(null);
 
@@ -283,6 +364,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastRestartDelayMs: native.last_restart_delay_ms,
       lastError: native.last_error || null,
       uptimeMs: native.uptime_ms,
+      outputStatuses: native.output_statuses || [],
+      archiveStatus: native.archive_status || null,
     });
 
     options.setTelemetry?.((prev: any) => ({
@@ -290,7 +373,12 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       bitrate: native.bitrate_kbps > 0 ? `${(native.bitrate_kbps / 1000).toFixed(1)} Mbps` : prev.bitrate,
       fps: native.fps || prev.fps,
       droppedFrames: droppedRef.current + native.write_failures,
-      network: native.restarting ? 'fair' : native.last_frame_age_ms > 1500 ? 'good' : 'excellent',
+      network: resolveNativeNetworkState(native),
+      nativeOutputHealth: native.output_statuses?.map((output) => ({
+        name: output.name,
+        state: output.state,
+      })) || [],
+      nativeArchiveState: native.archive_status?.state || prev.nativeArchiveState,
     }));
   }, [options]);
 
@@ -299,7 +387,18 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
     try {
       const result = await invokeRef.current('get_stream_stats');
-      const native = JSON.parse(result as string) as NativeStreamStats;
+      const parsed = JSON.parse(result as string) as Partial<NativeStreamStats>;
+      const native = {
+        output_statuses: [],
+        archive_status: {
+          state: 'inactive',
+          path_pattern: null,
+          segment_seconds: 0,
+          last_error: null,
+          last_update_ms: 0,
+        },
+        ...parsed,
+      } as NativeStreamStats;
       const previous = lastNativeStateRef.current;
 
       if (native.restarting && !previous?.restarting) {
@@ -315,6 +414,43 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
       if (native.archive_path_pattern && native.archive_path_pattern !== previous?.archive_path_pattern) {
         addServerLog(`Local safety archive enabled: ${native.archive_path_pattern}`, 'info');
+      }
+
+      for (const output of native.output_statuses || []) {
+        const previousOutput = previous?.output_statuses?.find(
+          (candidate) => outputStatusKey(candidate) === outputStatusKey(output),
+        );
+
+        if (!previousOutput) {
+          addServerLog(
+            `[output:${output.name}] ${output.state} (${output.protocol} ${output.target})`,
+            healthStateLogType(output.state),
+          );
+          continue;
+        }
+
+        if (previousOutput.state !== output.state || previousOutput.last_error !== output.last_error) {
+          const detail = output.last_error ? `: ${output.last_error}` : '';
+          addServerLog(
+            `[output:${output.name}] ${output.state}${detail}`,
+            healthStateLogType(output.state),
+          );
+        }
+      }
+
+      if (
+        native.archive_status &&
+        previous?.archive_status &&
+        (
+          native.archive_status.state !== previous.archive_status.state ||
+          native.archive_status.last_error !== previous.archive_status.last_error
+        )
+      ) {
+        const detail = native.archive_status.last_error ? `: ${native.archive_status.last_error}` : '';
+        addServerLog(
+          `[archive] ${native.archive_status.state}${detail}`,
+          healthStateLogType(native.archive_status.state),
+        );
       }
 
       if (native.last_error && native.last_error !== previous?.last_error) {
@@ -647,6 +783,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     closeBridgeSocket('stop streaming');
     transportModeRef.current = 'invoke';
     bridgeUrlRef.current = null;
+    lastNativeStateRef.current = null;
 
     if (!window.__TAURI_INTERNALS__ || !invokeRef.current) {
       setIsStreaming(false);
@@ -666,6 +803,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       ...prev,
       isActive: false,
       restarting: false,
+      outputStatuses: [],
+      archiveStatus: null,
     }));
   }, [addServerLog, closeBridgeSocket, stopStatsPolling]);
 
