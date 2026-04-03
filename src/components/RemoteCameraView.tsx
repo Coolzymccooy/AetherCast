@@ -26,7 +26,7 @@ const RESOLUTIONS: Record<Resolution, { width: number; height: number }> = {
 export default function RemoteCameraView() {
   const roomId = new URLSearchParams(window.location.search).get('room') ?? 'SLTN-1234';
 
-  const [status, setStatus] = useState<'idle' | 'camera' | 'connecting' | 'connected' | 'error'>('idle');
+  const [status, setStatus] = useState<'idle' | 'camera' | 'connecting' | 'ready' | 'connected' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [searchSecs, setSearchSecs] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
@@ -37,6 +37,7 @@ export default function RemoteCameraView() {
   const [logs, setLogs] = useState<string[]>([]);
 
   const searchTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const broadcastFnRef = useRef<(() => void) | null>(null);
   const peerRef = useRef<Peer | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -74,6 +75,39 @@ export default function RemoteCameraView() {
     };
   }, [status]);
 
+  const doCall = useCallback((peer: Peer, stream: MediaStream, attempt: () => void) => {
+    const hostId = hostPeerId(roomId);
+    addLog('Calling Studio...');
+
+    const call = peer.call(hostId, stream, { metadata: { role: 'camera', room: roomId } });
+    callRef.current = call;
+
+    const peerConn: RTCPeerConnection | undefined = (call as any).peerConnection;
+    if (peerConn) {
+      const onConnState = () => {
+        if (peerConn.connectionState === 'connected') {
+          setStatus('connected');
+          addLog('Connected!');
+          peerConn.removeEventListener('connectionstatechange', onConnState);
+        }
+      };
+      peerConn.addEventListener('connectionstatechange', onConnState);
+    }
+    call.on('stream', () => { setStatus('connected'); addLog('Connected!'); });
+    call.on('close', () => {
+      setStatus('connecting');
+      addLog('Call ended, retrying...');
+      broadcastFnRef.current = null;
+      hostCheckTimerRef.current = setTimeout(attempt, 2000);
+    });
+    call.on('error', (err) => {
+      setStatus('connecting');
+      addLog(`Call error: ${err.message}`);
+      broadcastFnRef.current = null;
+      hostCheckTimerRef.current = setTimeout(attempt, 2000);
+    });
+  }, [roomId, addLog]);
+
   const startHostChecker = useCallback((peer: Peer, stream: MediaStream) => {
     const hostId = hostPeerId(roomId);
 
@@ -89,40 +123,10 @@ export default function RemoteCameraView() {
       conn.on('open', () => {
         clearTimeout(timeout);
         try { conn.close(); } catch { /* ok */ }
-        addLog('Studio found — calling...');
-
-        const call = peer.call(hostId, stream, { metadata: { role: 'camera', room: roomId } });
-        callRef.current = call;
-
-        // Host answers without a return stream so 'stream' event may never fire.
-        // Watch the underlying RTCPeerConnection for the actual connected state.
-        const peerConn: RTCPeerConnection | undefined = (call as any).peerConnection;
-        if (peerConn) {
-          const onConnState = () => {
-            if (peerConn.connectionState === 'connected') {
-              setStatus('connected');
-              addLog('Connected!');
-              peerConn.removeEventListener('connectionstatechange', onConnState);
-            }
-          };
-          peerConn.addEventListener('connectionstatechange', onConnState);
-        }
-
-        call.on('stream', () => {
-          // Host sent a return stream (optional) — mark connected if not already
-          setStatus('connected');
-          addLog('Connected!');
-        });
-        call.on('close', () => {
-          setStatus('connecting');
-          addLog('Call ended, retrying...');
-          hostCheckTimerRef.current = setTimeout(attempt, 2000);
-        });
-        call.on('error', (err) => {
-          setStatus('connecting');
-          addLog(`Call error: ${err.message}`);
-          hostCheckTimerRef.current = setTimeout(attempt, 2000);
-        });
+        addLog('Studio found!');
+        // Park here — wait for user to tap "Start Broadcasting"
+        setStatus('ready');
+        broadcastFnRef.current = () => doCall(peer, stream, attempt);
       });
 
       conn.on('error', () => {
@@ -132,7 +136,7 @@ export default function RemoteCameraView() {
     };
 
     attempt();
-  }, [roomId, addLog]);
+  }, [roomId, addLog, doCall]);
 
   /** Acquire a camera stream only — no PeerJS side effects */
   const acquireStream = useCallback(async (facing: 'user' | 'environment', res: Resolution): Promise<MediaStream | null> => {
@@ -264,6 +268,7 @@ export default function RemoteCameraView() {
     idle: 'Initializing...',
     camera: 'Starting camera...',
     connecting: 'Searching for Studio...',
+    ready: 'Studio Ready',
     connected: 'LIVE — Studio Connected',
     error: 'Connection failed',
   }[status];
@@ -286,6 +291,8 @@ export default function RemoteCameraView() {
             className={`flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-bold backdrop-blur-md border ${
               status === 'connected'
                 ? 'bg-red-600/80 border-red-500/50 text-white'
+                : status === 'ready'
+                ? 'bg-green-600/80 border-green-500/50 text-white'
                 : status === 'error'
                 ? 'bg-red-900/80 border-red-700/50 text-red-300'
                 : 'bg-black/60 border-white/20 text-gray-300'
@@ -293,12 +300,37 @@ export default function RemoteCameraView() {
           >
             {status === 'connected'
               ? <><div className="w-2 h-2 bg-white rounded-full animate-pulse" /> LIVE</>
+              : status === 'ready'
+              ? <><div className="w-2 h-2 bg-green-300 rounded-full" /> Studio Ready</>
               : status === 'error'
               ? <><WifiOff size={12} /> Error</>
               : <><Wifi size={12} className="animate-pulse" /> {statusLabel}</>
             }
           </motion.div>
         </div>
+
+        {/* Start Broadcasting overlay */}
+        {status === 'ready' && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="absolute inset-0 flex flex-col items-center justify-center bg-black/50 backdrop-blur-sm"
+          >
+            <motion.button
+              initial={{ scale: 0.85 }}
+              animate={{ scale: 1 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => broadcastFnRef.current?.()}
+              className="flex flex-col items-center gap-3 px-10 py-6 rounded-3xl bg-red-600 hover:bg-red-700 active:bg-red-800 text-white font-bold shadow-2xl shadow-red-900/60"
+            >
+              <div className="w-16 h-16 rounded-full bg-white/20 flex items-center justify-center">
+                <div className="w-8 h-8 rounded-full bg-white" />
+              </div>
+              <span className="text-lg tracking-wide">Start Broadcasting</span>
+              <span className="text-xs font-normal text-red-200">Studio is connected and waiting</span>
+            </motion.button>
+          </motion.div>
+        )}
 
         {/* Live log */}
         {logs.length > 0 && status !== 'connected' && (

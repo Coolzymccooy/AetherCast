@@ -158,6 +158,8 @@ function StudioView() {
     onPhoneConnected: (role) => {
       const label = role === 'screen' ? 'Screen Share' : 'Camera';
       notify(`Phone ${label} connected`, 'success');
+      // Auto-dismiss the QR modal so the camera fills the canvas immediately
+      studio.setShowQrModal(false);
     },
   });
 
