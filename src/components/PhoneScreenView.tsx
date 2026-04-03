@@ -118,18 +118,6 @@ export default function PhoneScreenView() {
     };
   }, []);
 
-  // When native stream becomes available, connect to Studio
-  useEffect(() => {
-    if (isNative && nativeStream && status === 'requesting') {
-      streamRef.current = nativeStream;
-      if (previewRef.current) {
-        previewRef.current.srcObject = nativeStream;
-        previewRef.current.play().catch(() => { /* autoplay ok */ });
-      }
-      connectToStudio(nativeStream);
-    }
-  }, [nativeStream, isNative, status]); // eslint-disable-line react-hooks/exhaustive-deps
-
   // Surface native capture errors
   useEffect(() => {
     if (captureError) {
@@ -194,6 +182,24 @@ export default function PhoneScreenView() {
     });
   }, [roomId, addLog]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // When native stream becomes available, wait for the first rendered frame
+  // before attempting WebRTC. Otherwise Studio sees an empty stream.
+  useEffect(() => {
+    if (!isNative || !nativeStream || status !== 'requesting') return;
+
+    streamRef.current = nativeStream;
+    if (previewRef.current) {
+      previewRef.current.srcObject = nativeStream;
+      previewRef.current.play().catch(() => { /* autoplay ok */ });
+    }
+
+    if (framesRendered > 0) {
+      connectToStudio(nativeStream);
+    } else {
+      setDebugInfo(prev => ({ ...prev, lastEvent: 'waiting-first-frame' }));
+    }
+  }, [connectToStudio, framesRendered, isNative, nativeStream, status]);
+
   const startHostChecker = useCallback((peer: Peer, stream: MediaStream) => {
     const hostId = hostPeerId(roomId);
 
@@ -210,6 +216,10 @@ export default function PhoneScreenView() {
 
       conn.on('open', () => {
         clearTimeout(timeout);
+        if (hostCheckTimerRef.current) {
+          clearTimeout(hostCheckTimerRef.current);
+          hostCheckTimerRef.current = null;
+        }
         try { conn.close(); } catch { /* ok */ }
         addLog('Studio found — calling...');
         setDebugInfo(prev => ({ ...prev, lastEvent: 'studio-host-ready' }));
@@ -221,6 +231,10 @@ export default function PhoneScreenView() {
         if (peerConn) {
           const onConnState = () => {
             if (peerConn.connectionState === 'connected') {
+              if (hostCheckTimerRef.current) {
+                clearTimeout(hostCheckTimerRef.current);
+                hostCheckTimerRef.current = null;
+              }
               setStatus('connected');
               addLog('Connected!');
               setDebugInfo(prev => ({ ...prev, lastEvent: 'webrtc-connected' }));
@@ -231,6 +245,10 @@ export default function PhoneScreenView() {
         }
 
         call.on('stream', () => {
+          if (hostCheckTimerRef.current) {
+            clearTimeout(hostCheckTimerRef.current);
+            hostCheckTimerRef.current = null;
+          }
           setStatus('connected');
           addLog('Connected!');
           setDebugInfo(prev => ({ ...prev, lastEvent: 'remote-stream-active' }));
@@ -348,7 +366,7 @@ export default function PhoneScreenView() {
 
   const statusLabel = {
     idle: isNative ? 'Ready to share screen' : 'Not sharing',
-    requesting: isNative ? 'Requesting permission...' : 'Requesting permission...',
+    requesting: isNative ? (framesRendered > 0 ? 'Preparing connection...' : 'Waiting for first frame...') : 'Requesting permission...',
     connecting: 'Searching for Studio...',
     connected: 'LIVE — Screen is being shared',
     error: 'Error',

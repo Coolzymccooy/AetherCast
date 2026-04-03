@@ -33,6 +33,7 @@ export function useScreenCapture(): UseScreenCaptureResult {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const decodeBusyRef = useRef(false);
+  const firstFrameTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const ensureCanvas = useCallback((): HTMLCanvasElement => {
     if (!canvasRef.current) {
@@ -47,6 +48,10 @@ export function useScreenCapture(): UseScreenCaptureResult {
   }, []);
 
   const stopCapture = useCallback(() => {
+    if (firstFrameTimeoutRef.current) {
+      clearTimeout(firstFrameTimeoutRef.current);
+      firstFrameTimeoutRef.current = null;
+    }
     listenerRef.current?.remove();
     listenerRef.current = null;
     ScreenCapture.removeAllListeners().catch(() => { /* ok if bridge is not ready */ });
@@ -83,6 +88,10 @@ export function useScreenCapture(): UseScreenCaptureResult {
         img.onload = () => {
           ctx.drawImage(img, 0, 0, CAPTURE_WIDTH, CAPTURE_HEIGHT);
           decodeBusyRef.current = false;
+          if (firstFrameTimeoutRef.current) {
+            clearTimeout(firstFrameTimeoutRef.current);
+            firstFrameTimeoutRef.current = null;
+          }
           setFramesRendered(prev => prev + 1);
         };
         img.onerror = () => {
@@ -99,6 +108,10 @@ export function useScreenCapture(): UseScreenCaptureResult {
       streamRef.current = mediaStream;
       setStream(mediaStream);
       setIsCapturing(true);
+      firstFrameTimeoutRef.current = setTimeout(() => {
+        setError('Screen capture started but no frames were received from Android.');
+        stopCapture();
+      }, 5000);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Screen capture failed';
       setError(msg);
@@ -110,6 +123,10 @@ export function useScreenCapture(): UseScreenCaptureResult {
   useEffect(() => {
     return () => {
       listenerRef.current?.remove();
+      if (firstFrameTimeoutRef.current) {
+        clearTimeout(firstFrameTimeoutRef.current);
+        firstFrameTimeoutRef.current = null;
+      }
       if (canvasRef.current) {
         try { document.body.removeChild(canvasRef.current); } catch { /* ok */ }
         canvasRef.current = null;

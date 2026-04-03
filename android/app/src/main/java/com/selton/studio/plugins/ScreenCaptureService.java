@@ -65,6 +65,7 @@ public class ScreenCaptureService extends Service {
     private ImageReader     imageReader;
     private HandlerThread   handlerThread;
     private Handler         handler;
+    private MediaProjection.Callback projectionCallback;
     private volatile boolean running = false;
 
     // ── Service lifecycle ──────────────────────────────────────────────────────
@@ -134,8 +135,21 @@ public class ScreenCaptureService extends Service {
         MediaProjectionManager mgr = (MediaProjectionManager)
                 getSystemService(MEDIA_PROJECTION_SERVICE);
         mediaProjection = mgr.getMediaProjection(resultCode, resultData);
+        if (mediaProjection == null) {
+            throw new IllegalStateException("MediaProjection unavailable");
+        }
+
+        projectionCallback = new MediaProjection.Callback() {
+            @Override
+            public void onStop() {
+                stopCapture();
+                stopSelf();
+            }
+        };
+        mediaProjection.registerCallback(projectionCallback, handler);
 
         imageReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2);
+        imageReader.setOnImageAvailableListener(reader -> captureFrame(reader), handler);
         virtualDisplay = mediaProjection.createVirtualDisplay(
                 "AetherScreenCapture",
                 width,
@@ -146,23 +160,12 @@ public class ScreenCaptureService extends Service {
                 null,
                 null
         );
-
         running = true;
-        long intervalMs = 1000L / Math.max(1, fps);
-        scheduleFrame(intervalMs);
     }
 
-    private void scheduleFrame(long intervalMs) {
-        if (!running || handler == null) return;
-        handler.postDelayed(() -> {
-            captureFrame();
-            scheduleFrame(intervalMs);
-        }, intervalMs);
-    }
-
-    private void captureFrame() {
-        if (imageReader == null || frameCallback == null) return;
-        Image image = imageReader.acquireLatestImage();
+    private void captureFrame(ImageReader reader) {
+        if (!running || frameCallback == null) return;
+        Image image = reader.acquireLatestImage();
         if (image == null) return;
 
         try {
@@ -196,8 +199,19 @@ public class ScreenCaptureService extends Service {
     private void stopCapture() {
         running = false;
         if (virtualDisplay  != null) { virtualDisplay.release();   virtualDisplay  = null; }
-        if (mediaProjection != null) { mediaProjection.stop();     mediaProjection = null; }
-        if (imageReader     != null) { imageReader.close();        imageReader     = null; }
+        if (imageReader != null) {
+            imageReader.setOnImageAvailableListener(null, null);
+            imageReader.close();
+            imageReader = null;
+        }
+        if (mediaProjection != null) {
+            if (projectionCallback != null) {
+                mediaProjection.unregisterCallback(projectionCallback);
+                projectionCallback = null;
+            }
+            mediaProjection.stop();
+            mediaProjection = null;
+        }
         if (handlerThread   != null) { handlerThread.quitSafely(); handlerThread   = null; }
         handler = null;
         stopForeground(STOP_FOREGROUND_REMOVE);
