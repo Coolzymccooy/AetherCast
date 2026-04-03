@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Camera, Monitor, MessageSquare, QrCode, ArrowRight, X } from 'lucide-react';
+import MobileOnboarding from './MobileOnboarding';
 
 type Mode = 'remote' | 'screen' | 'audience';
 
@@ -49,8 +50,13 @@ const MODES: ModeCard[] = [
 ];
 
 export default function MobileHome() {
+  const [onboarded, setOnboarded] = useState(() => !!localStorage.getItem('ac_onboarded'));
   const [selected, setSelected] = useState<ModeCard | null>(null);
   const [roomCode, setRoomCode] = useState('');
+
+  if (!onboarded) {
+    return <MobileOnboarding onComplete={() => setOnboarded(true)} />;
+  }
 
   const connect = () => {
     if (!selected) return;
