@@ -240,7 +240,33 @@ fn write_bytes_to_workers(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+fn current_frame_spec() -> Option<(String, u32, u32)> {
+    let state = stream_runtime().lock().ok()?;
+    let config = state.config.as_ref()?;
+    Some((config.mode.clone(), config.width, config.height))
+}
+
 fn handle_frame_bytes(bytes: Vec<u8>) -> Result<(), String> {
+    if let Some((mode, width, height)) = current_frame_spec() {
+        if mode != "jpeg" {
+            let expected = (width.saturating_mul(height).saturating_mul(4)) as usize;
+            if bytes.len() != expected {
+                return Err(format!(
+                    "RAW_FRAME_SIZE_MISMATCH: got {}, expected {} for {}x{} RGBA",
+                    bytes.len(),
+                    expected,
+                    width,
+                    height
+                ));
+            }
+        }
+
+        if let Ok(mut rb) = replay_buffer().lock() {
+            rb.width = width;
+            rb.height = height;
+        }
+    }
+
     {
         if let Ok(mut rb) = replay_buffer().lock() {
             if rb.active && rb.capacity > 0 {
@@ -1706,9 +1732,15 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         "Software (libx264)".into()
     };
     let audio_label = describe_audio_plan(&audio_plan);
+    let video_label = if config.mode == "jpeg" {
+        "jpeg-image2pipe"
+    } else {
+        "raw-rgba"
+    };
     let message = format!(
-        "Streaming via {} [native workers] audio: {} at {}x{} @{}fps to {} destination worker(s); archive: {}",
+        "Streaming via {} [native workers] video: {} audio: {} at {}x{} @{}fps to {} destination worker(s); archive: {}",
         encoder_label,
+        video_label,
         audio_label,
         config.width,
         config.height,
@@ -1861,6 +1893,17 @@ pub async fn get_stream_stats() -> Result<String, String> {
         } else {
             "invoke".into()
         },
+        frame_transport: state
+            .config
+            .as_ref()
+            .map(|cfg| {
+                if cfg.mode == "jpeg" {
+                    "jpeg-image2pipe".into()
+                } else {
+                    "raw-rgba".into()
+                }
+            })
+            .unwrap_or_else(|| "unknown".into()),
         bridge_url: bridge.url,
         bridge_connected: bridge.connected,
         bridge_frames_received: bridge.frames_received,

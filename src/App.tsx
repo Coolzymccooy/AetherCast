@@ -297,8 +297,8 @@ function StudioView() {
                 }
 
                 if (nativeEngine.isAvailable) {
-                  // Desktop (Tauri) — use local GPU encoding via JPEG pipeline
-                  // No server-side FFmpeg needed; encoding happens locally with NVENC
+                  // Desktop (Tauri) — use the native engine with raw RGBA frame transport.
+                  // No server-side FFmpeg needed; encoding happens locally.
                   const canvas = document.querySelector('canvas');
                   if (canvas) {
                     const micChannels = studio.audioChannels.filter((channel) => /^Mic/i.test(channel.name));

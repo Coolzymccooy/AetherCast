@@ -12,7 +12,7 @@ The current stack has improved materially, but it still falls short of broadcast
 
 - Browser mode still depends on `MediaRecorder -> Socket.io -> server FFmpeg` in [useStreaming.ts](/c:/Users/segun/source/repos/aether2/src/hooks/useStreaming.ts) and [server.ts](/c:/Users/segun/source/repos/aether2/server.ts).
 - Desktop mode still originates frames from the web compositor canvas in [useGPUStreaming.ts](/c:/Users/segun/source/repos/aether2/src/hooks/useGPUStreaming.ts).
-- Desktop frames still enter FFmpeg as JPEG/image pipe in [main.rs](/c:/Users/segun/source/repos/aether2/src-tauri/src/main.rs).
+- Desktop frames no longer have to pass through JPEG/image pipe by default. The native desktop path now prefers raw RGBA frame transport, but the compositor is still browser-owned.
 - Desktop audio no longer relies only on blind synthetic fallback. Native device-backed audio planning now lives in `src-tauri/src/engine/audio.rs`, but full broadcast-mixer parity is still outstanding.
 - The Tauri app is stronger than the browser path, but it is still a custom encoder path rather than a full native media runtime.
 
@@ -33,6 +33,10 @@ The current stack has improved materially, but it still falls short of broadcast
   - `src-tauri/src/engine/audio.rs` now owns native audio device discovery, source selection, capture planning, and audio runtime state transitions.
   - desktop streaming now starts with an explicit native audio plan instead of hardcoding `anullsrc` in FFmpeg worker arguments.
   - native stream stats now surface audio backend, source summary, selected inputs, and live audio health.
+- Phase 4 has started:
+  - `src/hooks/useNativeEngine.ts` now sends raw RGBA frames to the native engine instead of JPEG blobs for the primary desktop path.
+  - `src-tauri/src/engine/service.rs` validates raw frame sizing and exposes `frame_transport` in native stats.
+  - JPEG/image pipe remains only as legacy compatibility, not the preferred desktop transport.
 - Still outstanding before real OBS-class parity:
   - native audio bus graph, monitoring, delay, and metering parity
   - native video/compositor ownership
@@ -115,7 +119,7 @@ Repo impact:
 
 What is needed:
 
-- Replace `canvas -> JPEG -> FFmpeg` with a native frame path.
+- Replace the remaining browser-owned frame path with native scene ownership.
 - Native source graph for camera, screen, browser, media, and phone inputs.
 - Native compositor for scenes, transforms, crops, z-order, scaling, and transitions.
 

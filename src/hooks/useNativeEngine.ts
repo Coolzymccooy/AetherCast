@@ -104,6 +104,7 @@ interface NativeStreamStats {
   uptime_ms: number;
   lavfi_enabled: boolean;
   transport_mode: 'bridge' | 'invoke';
+  frame_transport: string;
   bridge_url?: string | null;
   bridge_connected: boolean;
   bridge_frames_received: number;
@@ -134,6 +135,7 @@ interface GPUStreamStats {
   bitrateKbps: number;
   width: number;
   height: number;
+  frameTransport: string;
   archivePathPattern: string | null;
   archiveSegmentSeconds: number;
   lastRestartDelayMs: number;
@@ -149,7 +151,6 @@ type NativeCaptureProfile = {
   height: number;
   fps: number;
   bitrate: number;
-  jpegQuality: number;
 };
 
 const STATS_POLL_MS = 1500;
@@ -205,15 +206,6 @@ function healthStateLogType(state: NativeHealthState): ServerLog['type'] {
   }
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const chunks: string[] = [];
-  for (let i = 0; i < bytes.length; i += 8192) {
-    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 8192) as any));
-  }
-  return btoa(chunks.join(''));
-}
-
 function resolveCaptureProfile(
   encodingProfile: EncodingProfile | undefined,
   isGPU: boolean,
@@ -226,17 +218,17 @@ function resolveCaptureProfile(
     case '1080p60':
     case '1080p30':
       base = isGPU
-        ? { width: 1280, height: 720, fps: 30, bitrate: 6000, jpegQuality: 0.88 }
-        : { width: 960, height: 540, fps: 30, bitrate: 3500, jpegQuality: 0.84 };
+        ? { width: 1280, height: 720, fps: 30, bitrate: 6000 }
+        : { width: 960, height: 540, fps: 30, bitrate: 3500 };
       break;
     case '720p30':
       base = isGPU
-        ? { width: 1280, height: 720, fps: 30, bitrate: 4500, jpegQuality: 0.86 }
-        : { width: 960, height: 540, fps: 30, bitrate: 3000, jpegQuality: 0.82 };
+        ? { width: 1280, height: 720, fps: 30, bitrate: 4500 }
+        : { width: 960, height: 540, fps: 30, bitrate: 3000 };
       break;
     case '480p30':
     default:
-      base = { width: 854, height: 480, fps: 30, bitrate: 2000, jpegQuality: 0.8 };
+      base = { width: 854, height: 480, fps: 30, bitrate: 2000 };
       break;
   }
 
@@ -245,7 +237,6 @@ function resolveCaptureProfile(
     height: overrides?.height || base.height,
     fps: overrides?.fps || base.fps,
     bitrate: overrides?.bitrate || base.bitrate,
-    jpegQuality: base.jpegQuality,
   };
 }
 
@@ -264,6 +255,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     bitrateKbps: 0,
     width: 0,
     height: 0,
+    frameTransport: 'unknown',
     archivePathPattern: null,
     archiveSegmentSeconds: 0,
     lastRestartDelayMs: 0,
@@ -286,7 +278,6 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   const fpsRef = useRef(30);
   const widthRef = useRef(1280);
   const heightRef = useRef(720);
-  const jpegQualityRef = useRef(0.86);
   const scaleCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const invokeRef = useRef<any>(null);
   const isStreamingRef = useRef(false);
@@ -406,6 +397,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       bitrateKbps: native.bitrate_kbps,
       width: native.width,
       height: native.height,
+      frameTransport: native.frame_transport || 'unknown',
       archivePathPattern: native.archive_path_pattern || null,
       archiveSegmentSeconds: native.archive_segment_seconds,
       lastRestartDelayMs: native.last_restart_delay_ms,
@@ -422,6 +414,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       fps: native.fps || prev.fps,
       droppedFrames: droppedRef.current + native.write_failures,
       network: resolveNativeNetworkState(native),
+      nativeFrameTransport: native.frame_transport || prev.nativeFrameTransport,
       nativeAudioState: native.audio_status?.state || prev.nativeAudioState,
       nativeAudioSource: native.audio_status?.source_summary || prev.nativeAudioSource,
       nativeOutputHealth: native.output_statuses?.map((output) => ({
@@ -454,6 +447,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           last_event: null,
           last_update_ms: 0,
         },
+        frame_transport: 'unknown',
         output_statuses: [],
         archive_status: {
           state: 'inactive',
@@ -673,14 +667,11 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       const scaleCtx = scaleCanvas.getContext('2d', { willReadFrequently: true });
       if (!scaleCtx) return;
 
+      scaleCtx.imageSmoothingEnabled = true;
+      scaleCtx.imageSmoothingQuality = 'high';
       scaleCtx.drawImage(canvas, 0, 0, widthRef.current, heightRef.current);
-
-      const blob = await new Promise<Blob | null>((resolve) =>
-        scaleCanvas.toBlob(resolve, 'image/jpeg', jpegQualityRef.current),
-      );
-      if (!blob) return;
-
-      const buffer = await blob.arrayBuffer();
+      const imageData = scaleCtx.getImageData(0, 0, widthRef.current, heightRef.current);
+      const frameBytes = new Uint8Array(imageData.data.buffer);
       const bridgeSocket = bridgeSocketRef.current;
       const wantsBridge = transportModeRef.current === 'bridge';
 
@@ -690,7 +681,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         bridgeSocket.readyState === WebSocket.OPEN &&
         bridgeSocket.bufferedAmount < BRIDGE_BACKPRESSURE_BYTES
       ) {
-        bridgeSocket.send(buffer);
+        bridgeSocket.send(frameBytes);
       } else {
         if (wantsBridge) {
           if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
@@ -715,8 +706,11 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           }
         }
 
-        const base64 = arrayBufferToBase64(buffer);
-        await invokeRef.current('write_frame', { data: base64 });
+        await invokeRef.current('encode_frame', {
+          frameData: Array.from(frameBytes),
+          width: widthRef.current,
+          height: heightRef.current,
+        });
       }
 
       frameCountRef.current++;
@@ -790,7 +784,6 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     fpsRef.current = nativeProfile.fps;
     widthRef.current = nativeProfile.width;
     heightRef.current = nativeProfile.height;
-    jpegQualityRef.current = nativeProfile.jpegQuality;
     canvasRef.current = canvas;
     isStreamingRef.current = true;
 
@@ -816,7 +809,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           fps: nativeProfile.fps,
           bitrate: nativeProfile.bitrate,
           encoder: startOptions?.encoder || 'auto',
-          mode: 'jpeg',
+          mode: 'raw',
           audio_mode: startOptions?.audioMode || 'auto',
           audio_device: startOptions?.audioDevice || '',
           audio_sample_rate: 48000,
@@ -862,7 +855,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastNativeStateRef.current = null;
       setIsStreaming(true);
       addServerLog(
-        `Native stream started at ${nativeProfile.width}x${nativeProfile.height} ${nativeProfile.fps}fps`,
+        `Native raw stream started at ${nativeProfile.width}x${nativeProfile.height} ${nativeProfile.fps}fps`,
         'success',
       );
       startStatsPolling();
@@ -923,6 +916,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         ...prev,
         isActive: false,
         restarting: false,
+        frameTransport: 'unknown',
         audioStatus: null,
         outputStatuses: [],
         archiveStatus: null,

@@ -258,6 +258,7 @@ pub struct NativeStreamStats {
     pub uptime_ms: u64,
     pub lavfi_enabled: bool,
     pub transport_mode: String,
+    pub frame_transport: String,
     pub bridge_url: Option<String>,
     pub bridge_connected: bool,
     pub bridge_frames_received: u64,
