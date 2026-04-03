@@ -1,18 +1,22 @@
 use std::path::PathBuf;
 
-use super::state::{GPUStreamConfig, StreamDestination};
+use super::state::{
+    ArchiveStatus, EngineHealthState, GPUStreamConfig, OutputStatus, StreamDestination,
+};
 
 pub const DEFAULT_ARCHIVE_SEGMENT_SECONDS: u32 = 300;
 pub const DEFAULT_FIFO_QUEUE_SIZE: i32 = 180;
 
 #[derive(Debug, Clone)]
 pub struct OutputSessionPlan {
+    pub worker_id: String,
     pub name: String,
     pub protocol: String,
     pub muxer: String,
     pub target: String,
     pub tee_spec: String,
     pub recovery_delay_ms: u64,
+    pub match_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,88 @@ pub fn append_output_args(args: &mut Vec<String>, plan: &OutputManagerPlan) {
     ]);
 }
 
+pub fn build_output_statuses(plan: &OutputManagerPlan) -> Vec<OutputStatus> {
+    plan.outputs.iter().map(build_output_status).collect()
+}
+
+pub fn set_output_states(
+    outputs: &mut [OutputStatus],
+    next: EngineHealthState,
+    error: Option<String>,
+) {
+    let indexes: Vec<usize> = (0..outputs.len()).collect();
+    set_output_states_for_indexes(outputs, &indexes, next, error);
+}
+
+pub fn apply_output_runtime_signal(
+    line: &str,
+    outputs: &mut [OutputStatus],
+    archive: &mut ArchiveStatus,
+) {
+    let lowered = line.to_ascii_lowercase();
+    let line_message = Some(line.to_string());
+
+    if lowered.contains("segment")
+        || lowered.contains("matroska")
+        || lowered.contains("archive")
+        || lowered.contains("muxer")
+    {
+        let next = if lowered.contains("error") || lowered.contains("failed") {
+            EngineHealthState::Error
+        } else {
+            EngineHealthState::Degraded
+        };
+        archive.state = next;
+        archive.last_error = line_message;
+        archive.last_update_ms = now_ms();
+        return;
+    }
+
+    let matched_indexes = match_output_indexes(outputs, &lowered);
+    let target_indexes = if matched_indexes.is_empty() {
+        (0..outputs.len()).collect::<Vec<_>>()
+    } else {
+        matched_indexes
+    };
+
+    if lowered.contains("reconnect")
+        || lowered.contains("timed out")
+        || lowered.contains("broken pipe")
+        || lowered.contains("connection reset")
+    {
+        set_output_states_for_indexes(
+            outputs,
+            &target_indexes,
+            EngineHealthState::Recovering,
+            line_message,
+        );
+        return;
+    }
+
+    if lowered.contains("error")
+        || lowered.contains("failed")
+        || lowered.contains("invalid")
+        || lowered.contains("denied")
+    {
+        set_output_states_for_indexes(
+            outputs,
+            &target_indexes,
+            EngineHealthState::Error,
+            line_message,
+        );
+        return;
+    }
+
+    if lowered.contains("warning") || lowered.contains("drop") {
+        set_output_states_for_indexes(
+            outputs,
+            &target_indexes,
+            EngineHealthState::Degraded,
+            line_message,
+        );
+    }
+}
+
 fn archive_root_dir() -> PathBuf {
     if cfg!(target_os = "windows") {
         if let Some(profile) = std::env::var_os("USERPROFILE") {
@@ -149,7 +235,7 @@ fn archive_root_dir() -> PathBuf {
 fn build_output_session(destination: &StreamDestination) -> Result<OutputSessionPlan, String> {
     let url = resolved_destination_url(destination);
     let protocol = resolved_protocol(destination, &url);
-    let (muxer, target) = match protocol {
+    let (muxer, resolved_target) = match protocol {
         "srt" => {
             let sep = if url.contains('?') { "&" } else { "?" };
             (
@@ -168,23 +254,28 @@ fn build_output_session(destination: &StreamDestination) -> Result<OutputSession
         }
     };
 
-    if target.trim().is_empty() {
+    if resolved_target.trim().is_empty() {
         return Err("Enabled destination is missing a target URL".into());
     }
 
+    let display_target = display_target(protocol, &resolved_target);
     let name = if destination.name.trim().is_empty() {
-        sanitize_target(&target)
+        display_target.clone()
     } else {
         destination.name.trim().to_string()
     };
+    let worker_id = build_worker_id(protocol, &name);
+    let match_tokens = build_match_tokens(&name, protocol, &resolved_target);
 
     Ok(OutputSessionPlan {
+        worker_id,
         name,
         protocol: protocol.to_string(),
         muxer: muxer.clone(),
-        target: sanitize_target(&target),
-        tee_spec: format!("[f={}:onfail=ignore]{}", muxer, target),
+        target: display_target,
+        tee_spec: format!("[f={}:onfail=ignore]{}", muxer, resolved_target),
         recovery_delay_ms: protocol_recovery_delay_ms(protocol),
+        match_tokens,
     })
 }
 
@@ -253,4 +344,136 @@ fn sanitize_target(target: &str) -> String {
         .unwrap_or(target)
         .trim_end_matches('/')
         .to_string()
+}
+
+fn display_target(protocol: &str, resolved_target: &str) -> String {
+    let sanitized = sanitize_target(resolved_target);
+    if protocol == "rtmp" {
+        if let Some((base, _)) = sanitized.rsplit_once('/') {
+            return format!("{}/***", base);
+        }
+    }
+    sanitized
+}
+
+fn build_worker_id(protocol: &str, name: &str) -> String {
+    let normalized = name
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() {
+                char.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    format!("{}:{}", protocol, normalized)
+}
+
+fn build_match_tokens(name: &str, protocol: &str, resolved_target: &str) -> Vec<String> {
+    let sanitized = sanitize_target(resolved_target).to_ascii_lowercase();
+    let host = extract_host_token(&sanitized);
+    let tail = sanitized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .next_back()
+        .unwrap_or_default()
+        .to_string();
+    let name_token = name.trim().to_ascii_lowercase();
+
+    let mut tokens = Vec::new();
+    if !name_token.is_empty() && name_token.len() >= 4 {
+        tokens.push(name_token);
+    }
+    if !host.is_empty() && host.len() >= 4 {
+        tokens.push(host);
+    }
+    if protocol != "rtmp" && !tail.is_empty() && tail.len() >= 4 {
+        tokens.push(tail);
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn extract_host_token(target: &str) -> String {
+    let without_scheme = target.split("://").nth(1).unwrap_or(target);
+    without_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn build_output_status(output: &OutputSessionPlan) -> OutputStatus {
+    OutputStatus {
+        worker_id: output.worker_id.clone(),
+        name: output.name.clone(),
+        protocol: output.protocol.clone(),
+        muxer: output.muxer.clone(),
+        target: output.target.clone(),
+        recovery_delay_ms: output.recovery_delay_ms,
+        restart_count: 0,
+        last_event: None,
+        state: EngineHealthState::Starting,
+        last_error: None,
+        last_update_ms: now_ms(),
+        match_tokens: output.match_tokens.clone(),
+    }
+}
+
+fn set_output_states_for_indexes(
+    outputs: &mut [OutputStatus],
+    indexes: &[usize],
+    next: EngineHealthState,
+    error: Option<String>,
+) {
+    let update_at = now_ms();
+    for index in indexes {
+        let Some(output) = outputs.get_mut(*index) else {
+            continue;
+        };
+
+        if next == EngineHealthState::Recovering && output.state != EngineHealthState::Recovering {
+            output.restart_count += 1;
+        }
+
+        output.state = next.clone();
+        output.last_event = error.clone();
+        output.last_update_ms = update_at;
+        output.last_error = match next {
+            EngineHealthState::Error
+            | EngineHealthState::Recovering
+            | EngineHealthState::Degraded => error.clone(),
+            _ => None,
+        };
+    }
+}
+
+fn match_output_indexes(outputs: &[OutputStatus], lowered_line: &str) -> Vec<usize> {
+    outputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| {
+            if output
+                .match_tokens
+                .iter()
+                .any(|token| !token.is_empty() && lowered_line.contains(token))
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

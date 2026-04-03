@@ -11,17 +11,15 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::output::{
-    append_output_args, build_archive_pattern, build_output_manager_plan, OutputManagerPlan,
+    append_output_args, apply_output_runtime_signal, build_archive_pattern,
+    build_output_manager_plan, build_output_statuses, set_output_states, OutputManagerPlan,
     DEFAULT_ARCHIVE_SEGMENT_SECONDS,
 };
 use super::state::{
     EngineHealthState, FrameBridgeRuntime, GPUStreamConfig, NativeStreamRuntime, NativeStreamStats,
     StartStreamResponse,
 };
-use super::telemetry::{
-    apply_ffmpeg_signal, build_archive_status, build_output_statuses, now_ms, set_archive_state,
-    set_output_states,
-};
+use super::telemetry::{build_archive_status, now_ms, set_archive_state};
 
 const DEFAULT_MAX_RESTARTS: u32 = 12;
 const RESTART_RESET_AFTER_MS: u64 = 180_000;
@@ -789,7 +787,7 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
                                 archive_status,
                                 ..
                             } = &mut *state;
-                            apply_ffmpeg_signal(trimmed, output_statuses, archive_status);
+                            apply_output_runtime_signal(trimmed, output_statuses, archive_status);
                         }
                         let lowered = trimmed.to_ascii_lowercase();
                         if lowered.contains("error")

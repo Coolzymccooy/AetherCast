@@ -19,11 +19,14 @@ type NativeHealthState =
   | 'stopped';
 
 interface NativeOutputStatus {
+  worker_id: string;
   name: string;
   protocol: string;
   muxer: string;
   target: string;
   recovery_delay_ms: number;
+  restart_count: number;
+  last_event?: string | null;
   state: NativeHealthState;
   last_error?: string | null;
   last_update_ms: number;
@@ -145,7 +148,7 @@ function resolveNativeNetworkState(native: NativeStreamStats): 'excellent' | 'go
 }
 
 function outputStatusKey(status: NativeOutputStatus): string {
-  return `${status.protocol}:${status.target}`;
+  return status.worker_id || `${status.protocol}:${status.target}`;
 }
 
 function healthStateLogType(state: NativeHealthState): ServerLog['type'] {
@@ -425,16 +428,20 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
         if (!previousOutput) {
           addServerLog(
-            `[output:${output.name}] ${output.state} (${output.protocol}/${output.muxer} ${output.target}, backoff ${output.recovery_delay_ms}ms)`,
+            `[output:${output.name}] ${output.state} (${output.protocol}/${output.muxer} ${output.target}, backoff ${output.recovery_delay_ms}ms, worker ${output.worker_id})`,
             healthStateLogType(output.state),
           );
           continue;
         }
 
-        if (previousOutput.state !== output.state || previousOutput.last_error !== output.last_error) {
-          const detail = output.last_error ? `: ${output.last_error}` : '';
+        if (
+          previousOutput.state !== output.state ||
+          previousOutput.last_error !== output.last_error ||
+          previousOutput.restart_count !== output.restart_count
+        ) {
+          const detail = output.last_error || output.last_event ? `: ${output.last_error || output.last_event}` : '';
           addServerLog(
-            `[output:${output.name}] ${output.state}${detail}`,
+            `[output:${output.name}] ${output.state} (restarts ${output.restart_count})${detail}`,
             healthStateLogType(output.state),
           );
         }

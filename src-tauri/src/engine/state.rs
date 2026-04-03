@@ -65,14 +65,19 @@ pub enum EngineHealthState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputStatus {
+    pub worker_id: String,
     pub name: String,
     pub protocol: String,
     pub muxer: String,
     pub target: String,
     pub recovery_delay_ms: u64,
+    pub restart_count: u32,
+    pub last_event: Option<String>,
     pub state: EngineHealthState,
     pub last_error: Option<String>,
     pub last_update_ms: u64,
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub match_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
