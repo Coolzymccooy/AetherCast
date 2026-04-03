@@ -4,6 +4,8 @@
 
 # Run and deploy your AI Studio app
 
+For the current desktop streaming parity roadmap, see `docs/obs-parity-roadmap.md`.
+
 This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/3cca8390-2bf3-4cac-a651-cfd3330b42a0

@@ -156,3 +156,14 @@ cp android/app/build/outputs/apk/release/app-release.apk public/downloads/aether
 
 Web/React changes do NOT require a new APK — the APK loads the live production URL and auto-updates.
 Only native Java plugin changes, manifest changes, or `capacitor.config.ts` changes require a rebuild.
+
+## OBS-Class Roadmap
+
+Before making major streaming architecture changes, consult:
+`docs/obs-parity-roadmap.md`
+
+This is the current repo-specific plan for moving AetherCast toward OBS/vMix/Wirecast-class desktop architecture.
+Use it to decide whether a change belongs in:
+- browser compatibility mode
+- transitional Tauri/native work
+- the long-term native media engine

@@ -19,7 +19,7 @@ import { useMediaPlayer } from './hooks/useMediaPlayer';
 import { useReplay } from './hooks/useReplay';
 import { useProject } from './hooks/useProject';
 import { useMIDI } from './hooks/useMIDI';
-import { useGPUStreaming } from './hooks/useGPUStreaming';
+import { useNativeEngine } from './hooks/useNativeEngine';
 
 // --- Studio Components ---
 import { MenuBar } from './components/studio/MenuBar';
@@ -146,7 +146,7 @@ function StudioView() {
   // ── Telemetry ─────────────────────────────────────────────────────────────
   const { telemetry, setTelemetry } = useTelemetry(studio.isStreaming);
 
-  const gpuStreaming = useGPUStreaming({
+  const nativeEngine = useNativeEngine({
     setTelemetry,
     setServerLogs: studio.setServerLogs,
     onError: (msg) => {
@@ -198,7 +198,7 @@ function StudioView() {
       case 'Exit': webrtc.stopCamera(); window.close(); break;
       case 'Start Streaming': studio.setShowStreamSettings(true); break;
       case 'Stop Streaming':
-        if (gpuStreaming.isStreaming) gpuStreaming.stopGPUStream();
+        if (nativeEngine.isStreaming) nativeEngine.stopStream();
         else streaming.stopStreaming();
         break;
       case 'Stream Settings': studio.setShowStreamSettings(true); break;
@@ -219,9 +219,9 @@ function StudioView() {
 
   useEffect(() => {
     if (window.__TAURI_INTERNALS__) {
-      studio.setIsStreaming(gpuStreaming.isStreaming);
+      studio.setIsStreaming(nativeEngine.isStreaming);
     }
-  }, [gpuStreaming.isStreaming, studio.setIsStreaming]);
+  }, [nativeEngine.isStreaming, studio.setIsStreaming]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -283,9 +283,9 @@ function StudioView() {
             isStreaming={studio.isStreaming}
             isRecording={streaming.isRecording}
             onToggleStreaming={() => {
-              if (studio.isStreaming || gpuStreaming.isStreaming) {
+              if (studio.isStreaming || nativeEngine.isStreaming) {
                 // Stop whichever is active
-                if (gpuStreaming.isStreaming) gpuStreaming.stopGPUStream();
+                if (nativeEngine.isStreaming) nativeEngine.stopStream();
                 else streaming.stopStreaming();
                 studio.setIsStreaming(false);
               } else {
@@ -296,12 +296,12 @@ function StudioView() {
                   return;
                 }
 
-                if (gpuStreaming.isAvailable) {
+                if (nativeEngine.isAvailable) {
                   // Desktop (Tauri) — use local GPU encoding via JPEG pipeline
                   // No server-side FFmpeg needed; encoding happens locally with NVENC
                   const canvas = document.querySelector('canvas');
                   if (canvas) {
-                    gpuStreaming.startGPUStream(canvas as HTMLCanvasElement, activeDestinations, {
+                    nativeEngine.startStream(canvas as HTMLCanvasElement, activeDestinations, {
                       encodingProfile: streaming.encodingProfile,
                     }).then((msg) => {
                       studio.setIsStreaming(true);
