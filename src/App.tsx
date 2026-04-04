@@ -164,7 +164,11 @@ function StudioView() {
 
   // ── Hooks ─────────────────────────────────────────────────────────────────
   const webrtc = useWebRTC({
-    scenes: studio.scenes, setActiveScene: studio.setActiveScene,
+    scenes: studio.scenes,
+    scenePresets: studio.scenePresets,
+    setActiveScene: studio.setActiveScene,
+    loadScenePreset: studio.loadScenePreset,
+    setActiveTheme: studio.setActiveTheme,
     setServerLogs: studio.setServerLogs, setAudienceMessages: studio.setAudienceMessages,
     audioChannels: studio.audioChannels, setAudioChannels: studio.setAudioChannels,
     setSources: studio.setSources,

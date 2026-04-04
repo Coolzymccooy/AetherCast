@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import Peer from 'simple-peer';
 import PeerJS, { MediaConnection } from 'peerjs';
-import { Scene, Source, ServerLog, AudioChannel } from '../types';
+import { Scene, Source, ServerLog, AudioChannel, ScenePreset } from '../types';
 import { ROOM_ID, CLOUD_URL } from '../constants';
 import { hostPeerId, inferPeerRole } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
@@ -14,7 +14,10 @@ export type PeerConnectionState = 'connecting' | 'connected' | 'disconnected' | 
 
 interface UseWebRTCOptions {
   scenes: Scene[];
+  scenePresets?: ScenePreset[];
   setActiveScene: (s: Scene) => void;
+  loadScenePreset?: (id: string) => void;
+  setActiveTheme?: (theme: string) => void;
   setServerLogs: React.Dispatch<React.SetStateAction<ServerLog[]>>;
   setAudienceMessages: React.Dispatch<React.SetStateAction<any[]>>;
   audioChannels: AudioChannel[];
@@ -26,7 +29,10 @@ interface UseWebRTCOptions {
 
 export function useWebRTC({
   scenes,
+  scenePresets = [],
   setActiveScene,
+  loadScenePreset,
+  setActiveTheme,
   setServerLogs,
   setAudienceMessages,
   audioChannels,
@@ -64,12 +70,27 @@ export function useWebRTC({
   onErrorRef.current = onError;
   const onPhoneConnectedRef = useRef(onPhoneConnected);
   onPhoneConnectedRef.current = onPhoneConnected;
+  const scenesRef = useRef(scenes);
+  scenesRef.current = scenes;
+  const scenePresetsRef = useRef(scenePresets);
+  scenePresetsRef.current = scenePresets;
+  const loadScenePresetRef = useRef(loadScenePreset);
+  loadScenePresetRef.current = loadScenePreset;
+  const setActiveThemeRef = useRef(setActiveTheme);
+  setActiveThemeRef.current = setActiveTheme;
   // Track which peer IDs have already triggered the connect notification to avoid spam
   const notifiedPeersRef = useRef<Set<string>>(new Set());
   const setServerLogsRef = useRef(setServerLogs);
   setServerLogsRef.current = setServerLogs;
   const setAudienceMessagesRef = useRef(setAudienceMessages);
   setAudienceMessagesRef.current = setAudienceMessages;
+
+  const appendServerLog = useCallback((message: string, type: ServerLog['type'] = 'info') => {
+    setServerLogsRef.current(prev => [
+      { message, type, id: Date.now() + Math.random() } as ServerLog,
+      ...prev,
+    ].slice(0, 20));
+  }, []);
 
   // --- Helper: update peer state ---
   const updatePeerState = useCallback((peerId: string, state: PeerConnectionState) => {
@@ -347,6 +368,75 @@ export function useWebRTC({
     ));
   }, [setSources]);
 
+  const handleLuminaEvent = useCallback((msg: {
+    type?: string;
+    event?: string;
+    payload?: Record<string, unknown>;
+    workspaceId?: string;
+    sessionId?: string;
+  }) => {
+    if (msg?.type !== 'lumina_event') return;
+
+    const eventName = String(msg.event || '').trim();
+    const payload = msg.payload || {};
+
+    if (eventName === 'lumina.scene.switch') {
+      const targetScene = [
+        payload.sceneName,
+        payload.target,
+        payload.scene,
+        payload.name,
+      ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+      if (!targetScene) {
+        appendServerLog('Lumina requested a scene switch without a target scene name.', 'warning');
+        return;
+      }
+
+      const targetLower = targetScene.toLowerCase();
+      const matchingScene = scenesRef.current.find(scene => scene.name.trim().toLowerCase() === targetLower);
+      if (matchingScene) {
+        setActiveScene(matchingScene);
+        appendServerLog(`Lumina scene switch -> ${matchingScene.name}`, 'info');
+        return;
+      }
+
+      const matchingPreset = scenePresetsRef.current.find(preset => preset.name.trim().toLowerCase() === targetLower);
+      if (matchingPreset && loadScenePresetRef.current) {
+        loadScenePresetRef.current(matchingPreset.id);
+        appendServerLog(`Lumina preset switch -> ${matchingPreset.name}`, 'info');
+        return;
+      }
+
+      const targetTheme = [
+        payload.themeName,
+        payload.theme,
+      ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+      const themeCandidate = targetTheme || targetScene;
+      if (themeCandidate && setActiveThemeRef.current) {
+        setActiveThemeRef.current(themeCandidate);
+        appendServerLog(`Lumina theme switch -> ${themeCandidate}`, 'info');
+        return;
+      }
+
+      appendServerLog(`Lumina requested '${targetScene}' but no scene or preset matched.`, 'warning');
+      return;
+    }
+
+    if (eventName === 'lumina.state.sync') {
+      const mode = typeof payload.mode === 'string'
+        ? payload.mode
+        : typeof payload.contentMode === 'string'
+          ? payload.contentMode
+          : 'sync';
+      appendServerLog(`Lumina state sync received (${mode})`, 'info');
+      return;
+    }
+
+    appendServerLog(`Lumina event received: ${eventName}`, 'info');
+  }, [appendServerLog, setActiveScene]);
+
   // --- PeerJS Host (answers calls from phone camera / phone screen) ---
   const setupHostPeer = useCallback(() => {
     if (hostPeerRef.current) {
@@ -470,9 +560,10 @@ export function useWebRTC({
     let serverUrl: string | undefined = undefined;
 
     if (window.__TAURI_INTERNALS__) {
-      // tauri.localhost is the hostname in production Tauri builds (not just dev)
-      const isLocal = ['localhost', '127.0.0.1', 'tauri.localhost'].includes(window.location.hostname);
-      serverUrl = isLocal ? 'http://localhost:3001' : CLOUD_URL;
+      // Tauri production builds run on tauri.localhost and should use the public cloud
+      // signaling server. Only local dev builds should target localhost:3001.
+      const isTauriDevHost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
+      serverUrl = isTauriDevHost ? 'http://localhost:3001' : CLOUD_URL;
     }
 
     // Audience bridge: when Tauri connects to localhost, audience phones reach the cloud.
@@ -502,14 +593,20 @@ export function useWebRTC({
 
     socket.on('connect', () => {
       setIsSocketConnected(true);
+      appendServerLog(`Socket connected to ${serverUrl || window.location.origin}`, 'success');
       socket.emit('join-room', roomId);
     });
     socket.on('disconnect', () => {
       setIsSocketConnected(false);
+      appendServerLog(`Socket disconnected from ${serverUrl || window.location.origin}`, 'warning');
       // Clean up peers on disconnect to prevent stale references
       destroyAllPeers();
       phonePeerRolesRef.current.clear();
       clearPhoneScreen();
+    });
+    socket.on('connect_error', (err) => {
+      setIsSocketConnected(false);
+      appendServerLog(`Socket connection failed (${serverUrl || window.location.origin}): ${err.message}`, 'error');
     });
 
     socket.on('signal', (data: { from: string; signal: any }) => {
@@ -567,6 +664,7 @@ export function useWebRTC({
     socket.on('audience-message', (message: any) => {
       setAudienceMessagesRef.current(prev => [message, ...prev].slice(0, 50));
     });
+    socket.on('lumina-event', handleLuminaEvent);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentionally stable: reconnectSocket should only run on mount.
   // All callbacks inside use refs or are stable (setX dispatchers). Including them as deps
   // would cause an infinite connect/disconnect loop because onError and attachIceRestartLogic

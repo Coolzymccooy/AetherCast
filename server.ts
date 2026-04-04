@@ -170,6 +170,26 @@ const __dirname = path.dirname(__filename);
 /** Simple token for Socket.io auth — set SOCKET_AUTH_TOKEN in .env or auto-generate */
 const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || crypto.randomUUID();
 
+/**
+ * Optional shared secret for the Lumina Presenter bridge endpoint.
+ * Set LUMINA_BRIDGE_TOKEN in .env to require Lumina's x-lumina-token header to match.
+ * Leave empty to accept all requests (safe behind your own CORS/firewall).
+ */
+const LUMINA_BRIDGE_TOKEN = process.env.LUMINA_BRIDGE_TOKEN || '';
+
+const LUMINA_ALLOWED_EVENTS = new Set([
+  'lumina.bridge.ping',
+  'lumina.state.sync',
+  'lumina.scene.switch',
+  'lumina.slide.changed',
+  'lumina.item.started',
+  'lumina.countdown.started',
+  'lumina.countdown.ended',
+  'lumina.service.mode.changed',
+  'lumina.stream.request',
+  'lumina.recording.request',
+]);
+
 /** Allowed origins for CORS — allow all origins to support Tauri desktop + web */
 const ALLOWED_ORIGINS = "*";
 
@@ -1184,6 +1204,55 @@ If no switch needed, respond with exactly: STAY`;
       console.error('AI director error:', err.message);
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────────
+  // Lumina Presenter Bridge
+  // Lumina sends POST /api/lumina/bridge with x-lumina-event / x-lumina-workspace /
+  // x-lumina-session headers plus a JSON body. This endpoint validates and
+  // broadcasts the event to all connected Aether Studio clients via Socket.io.
+  // Clients listen for the 'lumina-event' socket event.
+  // ──────────────────────────────────────────────────────────────────────────────
+  app.post('/api/lumina/bridge', (req, res) => {
+    const eventType = String(req.headers['x-lumina-event'] || '').trim();
+    const workspaceId = String(req.headers['x-lumina-workspace'] || '').trim();
+    const sessionId = String(req.headers['x-lumina-session'] || '').trim();
+    const token = String(req.headers['x-lumina-token'] || '').trim();
+
+    if (!eventType || !workspaceId || !sessionId) {
+      res.status(400).json({ ok: false, message: 'missing_required_headers' });
+      return;
+    }
+
+    if (!LUMINA_ALLOWED_EVENTS.has(eventType)) {
+      res.status(400).json({ ok: false, message: 'unknown_event_type' });
+      return;
+    }
+
+    if (LUMINA_BRIDGE_TOKEN && token !== LUMINA_BRIDGE_TOKEN) {
+      res.status(401).json({ ok: false, message: 'unauthorized' });
+      return;
+    }
+
+    if (eventType === 'lumina.bridge.ping') {
+      console.log(`[lumina-bridge] ping from workspace=${workspaceId}`);
+      res.status(200).json({ ok: true, message: 'accepted' });
+      return;
+    }
+
+    const bridgeEvent = {
+      type: 'lumina_event',
+      event: eventType,
+      workspaceId,
+      sessionId,
+      payload: (req.body as Record<string, unknown>)?.payload ?? req.body ?? {},
+      ts: Date.now(),
+    };
+
+    io.emit('lumina-event', bridgeEvent);
+
+    console.log(`[lumina-bridge] ${eventType} → ${io.engine.clientsCount} client(s)`);
+    res.status(200).json({ ok: true, message: 'accepted' });
   });
 
   // ──────────────────────────────────────────────────────────────────────────────
