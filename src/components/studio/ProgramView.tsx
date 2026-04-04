@@ -1,8 +1,8 @@
-import React, { useRef } from 'react';
+import React, { useImperativeHandle, useRef } from 'react';
 import { Maximize2, ExternalLink, Radio, Play, Square } from 'lucide-react';
 import { motion } from 'motion/react';
 import { Scene, Source, CamoSettings, AudienceMessage, LowerThirds, Graphics } from '../../types';
-import { Compositor } from '../Compositor';
+import { Compositor, type CompositorHandle, type NativeCaptureSource } from '../Compositor';
 
 interface ProgramViewProps {
   activeScene: Scene;
@@ -28,17 +28,34 @@ interface ProgramViewProps {
   sourceSwap: boolean;
   audienceMessages: AudienceMessage[];
   activeMessageId: string | null;
+  extraCaptureSources?: NativeCaptureSource[];
 }
 
-export const ProgramView: React.FC<ProgramViewProps> = ({
+export interface ProgramViewHandle {
+  getNativeCaptureSurface: () => {
+    canvas: HTMLCanvasElement | null;
+    captureSources: () => NativeCaptureSource[];
+  };
+}
+
+export const ProgramView = React.forwardRef<ProgramViewHandle, ProgramViewProps>(({
   activeScene, sources, isStreaming, isRecording,
   onToggleStreaming, onToggleRecording,
   webcamStream, remoteStreams, screenStream,
   transitionType, layout, lowerThirds, graphics,
   backgroundImage, theme, background, frameStyle, motionStyle,
   brandColor, camoSettings, sourceSwap, audienceMessages, activeMessageId,
-}) => {
+  extraCaptureSources = [],
+}, ref) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  const compositorRef = useRef<CompositorHandle>(null);
+
+  useImperativeHandle(ref, () => ({
+    getNativeCaptureSurface: () => ({
+      canvas: compositorRef.current?.getCanvas() || null,
+      captureSources: () => compositorRef.current?.captureNativeSceneSources() || [],
+    }),
+  }), []);
 
   const toggleFullscreen = () => {
     if (!containerRef.current) return;
@@ -75,6 +92,7 @@ export const ProgramView: React.FC<ProgramViewProps> = ({
       <div className="flex-1 flex items-center justify-center p-4">
         <div className="aspect-video w-full max-w-5xl bg-gray-900 shadow-2xl border border-white/5 relative overflow-hidden flex items-center justify-center">
           <Compositor
+            ref={compositorRef}
             activeScene={activeScene}
             sources={sources}
             isStreaming={isStreaming}
@@ -95,6 +113,7 @@ export const ProgramView: React.FC<ProgramViewProps> = ({
             sourceSwap={sourceSwap}
             audienceMessages={audienceMessages}
             activeMessageId={activeMessageId}
+            extraCaptureSources={extraCaptureSources}
           />
           <div className="absolute bottom-4 right-4 text-right pointer-events-none">
             <p className="text-white/20 text-4xl font-black italic tracking-tighter uppercase select-none">Aether Studio</p>
@@ -130,4 +149,6 @@ export const ProgramView: React.FC<ProgramViewProps> = ({
       </div>
     </div>
   );
-};
+});
+
+ProgramView.displayName = 'ProgramView';

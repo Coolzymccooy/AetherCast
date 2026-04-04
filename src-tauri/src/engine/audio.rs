@@ -202,6 +202,7 @@ pub fn detect_audio_engine(ffmpeg_bin: &str, lavfi_enabled: bool) -> NativeAudio
         audio_bitrate: 160,
         include_microphone: true,
         include_system_audio: true,
+        native_video_sources: Vec::new(),
     };
     let devices = list_audio_devices(ffmpeg_bin);
     let suggested_plan = build_audio_plan(ffmpeg_bin, &config, lavfi_enabled);

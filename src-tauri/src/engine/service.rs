@@ -17,18 +17,23 @@ use super::audio::{
     set_audio_state,
     NativeAudioPlan,
 };
+use super::capture::{start_native_source_captures, stop_native_source_captures};
 use super::output::{
     append_output_args, append_worker_output_args, apply_output_runtime_signal,
     build_archive_pattern, build_output_manager_plan, build_output_statuses,
     set_output_state_by_worker_id, set_output_states, OutputManagerPlan, OutputWorkerKind,
     OutputWorkerPlan, DEFAULT_ARCHIVE_SEGMENT_SECONDS,
 };
+use super::source::{
+    current_source_bridge_runtime, current_source_statuses, start_source_bridge,
+    stop_source_bridge,
+};
 use super::state::{
     EngineHealthState, FrameBridgeRuntime, GPUStreamConfig, NativeAudioDiscovery,
     NativeStreamRuntime, NativeStreamStats, StartStreamResponse,
 };
 use super::telemetry::{build_archive_status, now_ms, set_archive_state};
-use super::video::current_video_status;
+use super::video::{current_video_status, render_native_scene_rgba};
 
 const DEFAULT_MAX_RESTARTS: u32 = 12;
 #[allow(dead_code)]
@@ -1683,8 +1688,16 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         state.archive_status = archive_status;
     }
 
+    if let Err(err) = start_native_source_captures(&ffmpeg_bin, &config, session_id) {
+        if let Ok(mut state) = stream_runtime().lock() {
+            state.last_error = Some(err.clone());
+        }
+        return Err(err);
+    }
+
     start_keepalive_loop(session_id);
     if let Err(err) = spawn_output_workers_from_runtime() {
+        stop_native_source_captures();
         if let Ok(mut state) = stream_runtime().lock() {
             state.desired_active = false;
             state.active = false;
@@ -1710,21 +1723,45 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         return Err(err);
     }
 
-    let bridge_url = match start_frame_bridge(session_id).await {
-        Ok(url) => Some(url),
-        Err(err) => {
-            println!(
-                "[aether] Frame bridge unavailable, using invoke fallback: {}",
-                err
-            );
-            if let Ok(mut state) = stream_runtime().lock() {
-                state.last_error = Some(format!(
-                    "Frame bridge unavailable, using invoke fallback: {}",
+    let bridge_url = if config.mode == "native-scene" {
+        None
+    } else {
+        match start_frame_bridge(session_id).await {
+            Ok(url) => Some(url),
+            Err(err) => {
+                println!(
+                    "[aether] Frame bridge unavailable, using invoke fallback: {}",
                     err
-                ));
+                );
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.last_error = Some(format!(
+                        "Frame bridge unavailable, using invoke fallback: {}",
+                        err
+                    ));
+                }
+                None
             }
-            None
         }
+    };
+    let source_bridge_url = if config.mode == "native-scene" {
+        match start_source_bridge(session_id).await {
+            Ok(url) => Some(url),
+            Err(err) => {
+                println!(
+                    "[aether] Source bridge unavailable, using invoke fallback for source sync: {}",
+                    err
+                );
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.last_error = Some(format!(
+                        "Source bridge unavailable, using invoke fallback for source sync: {}",
+                        err
+                    ));
+                }
+                None
+            }
+        }
+    } else {
+        None
     };
 
     let encoder_label = if is_gpu {
@@ -1733,10 +1770,10 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         "Software (libx264)".into()
     };
     let audio_label = describe_audio_plan(&audio_plan);
-    let video_label = if config.mode == "jpeg" {
-        "jpeg-image2pipe"
-    } else {
-        "raw-rgba"
+    let video_label = match config.mode.as_str() {
+        "jpeg" => "jpeg-image2pipe",
+        "native-scene" => "native-scene-rgba",
+        _ => "raw-rgba",
     };
     let message = format!(
         "Streaming via {} [native workers] video: {} audio: {} at {}x{} @{}fps to {} destination worker(s); archive: {}",
@@ -1756,6 +1793,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         message,
         bridge_url: bridge_url.clone(),
         bridge_token: None,
+        source_bridge_url: source_bridge_url.clone(),
         transport: if bridge_url.is_some() {
             "bridge".into()
         } else {
@@ -1791,6 +1829,8 @@ pub async fn stop_stream() -> Result<String, String> {
     }
 
     stop_frame_bridge();
+    stop_source_bridge();
+    stop_native_source_captures();
     stop_output_workers();
 
     let frames = frame_counter().lock().map(|c| *c).unwrap_or(0);
@@ -1835,6 +1875,26 @@ pub async fn encode_frame(frame_data: Vec<u8>, width: u32, height: u32) -> Resul
     handle_frame_bytes(frame_data)
 }
 
+/// Render the current native scene snapshot into a raw RGBA frame and write it to worker stdin.
+#[tauri::command]
+pub async fn render_native_scene_frame() -> Result<(), String> {
+    let (mode, width, height) = current_frame_spec()
+        .ok_or_else(|| "NATIVE_SCENE_NOT_ACTIVE".to_string())?;
+    if mode != "native-scene" {
+        return Err(format!("NATIVE_SCENE_MODE_REQUIRED: current mode is {}", mode));
+    }
+
+    let frame = render_native_scene_rgba(width, height)?;
+    {
+        if let Ok(mut rb) = replay_buffer().lock() {
+            rb.width = width;
+            rb.height = height;
+        }
+    }
+
+    handle_frame_bytes(frame)
+}
+
 /// Get streaming stats
 #[tauri::command]
 pub async fn get_stream_stats() -> Result<String, String> {
@@ -1844,7 +1904,9 @@ pub async fn get_stream_stats() -> Result<String, String> {
         .lock()
         .map_err(|e| e.to_string())?
         .clone();
+    let source_bridge = current_source_bridge_runtime();
     let video_status = current_video_status();
+    let source_statuses = current_source_statuses();
     let (width, height, fps, bitrate_kbps) = state
         .config
         .as_ref()
@@ -1898,12 +1960,10 @@ pub async fn get_stream_stats() -> Result<String, String> {
         frame_transport: state
             .config
             .as_ref()
-            .map(|cfg| {
-                if cfg.mode == "jpeg" {
-                    "jpeg-image2pipe".into()
-                } else {
-                    "raw-rgba".into()
-                }
+            .map(|cfg| match cfg.mode.as_str() {
+                "jpeg" => "jpeg-image2pipe".into(),
+                "native-scene" => "native-scene-rgba".into(),
+                _ => "raw-rgba".into(),
             })
             .unwrap_or_else(|| "unknown".into()),
         bridge_url: bridge.url,
@@ -1911,7 +1971,13 @@ pub async fn get_stream_stats() -> Result<String, String> {
         bridge_frames_received: bridge.frames_received,
         bridge_bytes_received: bridge.bytes_received,
         bridge_last_error: bridge.last_error,
+        source_bridge_url: source_bridge.url,
+        source_bridge_connected_sources: source_bridge.connected_sources.len() as u32,
+        source_bridge_frames_received: source_bridge.frames_received,
+        source_bridge_bytes_received: source_bridge.bytes_received,
+        source_bridge_last_error: source_bridge.last_error,
         video_status,
+        source_statuses,
         audio_status: state.audio_status,
         output_statuses: state.output_statuses,
         archive_status: state.archive_status,

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useImperativeHandle, useRef } from 'react';
 import { Scene, Source, AudienceMessage } from '../types';
 
 // ── Canvas & Layout Constants ────────────────────────────────────────────────
@@ -68,10 +68,21 @@ interface CompositorProps {
   sourceSwap?: boolean;
   audienceMessages?: AudienceMessage[];
   activeMessageId?: string | null;
+  extraCaptureSources?: NativeCaptureSource[];
 }
 
 type DrawableMedia = HTMLVideoElement | HTMLImageElement;
 type ContentFit = 'Fit' | 'Fill';
+
+export interface NativeCaptureSource {
+  sourceId: string;
+  element: HTMLVideoElement | HTMLImageElement;
+}
+
+export interface CompositorHandle {
+  getCanvas: () => HTMLCanvasElement | null;
+  captureNativeSceneSources: () => NativeCaptureSource[];
+}
 
 const isDrawableMediaReady = (media: DrawableMedia | null): media is DrawableMedia => {
   if (!media) return false;
@@ -134,7 +145,7 @@ const drawMediaToRect = (
   return true;
 };
 
-export const Compositor: React.FC<CompositorProps> = ({ 
+export const Compositor = React.forwardRef<CompositorHandle, CompositorProps>(({
   activeScene, 
   sources, 
   isStreaming, 
@@ -154,8 +165,9 @@ export const Compositor: React.FC<CompositorProps> = ({
   camoSettings,
   sourceSwap = false,
   audienceMessages = [],
-  activeMessageId = null
-}) => {
+  activeMessageId = null,
+  extraCaptureSources = [],
+}, ref) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const screenVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -273,6 +285,48 @@ export const Compositor: React.FC<CompositorProps> = ({
       remoteVideoRefs.current.clear();
     };
   }, [remoteStreams]);
+
+  const captureNativeSceneSources = React.useCallback((): NativeCaptureSource[] => {
+    const nativeSources: NativeCaptureSource[] = [];
+
+    if (isDrawableMediaReady(videoRef.current)) {
+      nativeSources.push({ sourceId: 'camera:local-1', element: videoRef.current });
+    }
+
+    const localCam2 = remoteVideoRefs.current.get('local-cam-2');
+    if (isDrawableMediaReady(localCam2 ?? null)) {
+      nativeSources.push({ sourceId: 'camera:local-2', element: localCam2! });
+    }
+
+    if (isDrawableMediaReady(screenVideoRef.current)) {
+      nativeSources.push({ sourceId: 'screen:main', element: screenVideoRef.current });
+    }
+
+    const remoteIds = Array.from(remoteVideoRefs.current.keys())
+      .filter((id) => !id.startsWith('local-cam-'))
+      .sort();
+
+    remoteIds.forEach((id, index) => {
+      const media = remoteVideoRefs.current.get(id) || null;
+      if (!isDrawableMediaReady(media)) return;
+      nativeSources.push({
+        sourceId: `remote:${index + 1}`,
+        element: media,
+      });
+    });
+
+    extraCaptureSources.forEach((source) => {
+      if (!isDrawableMediaReady(source.element)) return;
+      nativeSources.push(source);
+    });
+
+    return nativeSources;
+  }, [extraCaptureSources]);
+
+  useImperativeHandle(ref, () => ({
+    getCanvas: () => canvasRef.current,
+    captureNativeSceneSources,
+  }), [captureNativeSceneSources]);
 
   const drawFramedVideo = (
     ctx: CanvasRenderingContext2D, 
@@ -1074,4 +1128,6 @@ export const Compositor: React.FC<CompositorProps> = ({
       className="w-full h-full object-contain bg-black"
     />
   );
-};
+});
+
+Compositor.displayName = 'Compositor';

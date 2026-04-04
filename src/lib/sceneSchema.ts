@@ -62,6 +62,18 @@ export type NativeSceneSnapshot = {
   nodes: NativeSceneNode[];
 };
 
+export type NativeSourceDescriptor = {
+  source_id: string;
+  label: string;
+  source_kind: string;
+  browser_owned: boolean;
+  available: boolean;
+  source_status?: string | null;
+  resolution?: string | null;
+  fps?: number | null;
+  audio_level?: number | null;
+};
+
 type BuildSceneSnapshotArgs = {
   activeScene: Scene;
   layout: string;
@@ -262,6 +274,101 @@ export function buildNativeSceneSnapshot(args: BuildSceneSnapshotArgs): NativeSc
     ...snapshotBase,
     revision: hashSceneSnapshot(JSON.stringify(snapshotBase)),
   };
+}
+
+type BuildSourceInventoryArgs = Pick<
+  BuildSceneSnapshotArgs,
+  'sources' | 'webcamAvailable' | 'screenAvailable' | 'remoteSourceCount' | 'hasLocalCam2'
+> & {
+  nativeOwnedSourceIds?: string[];
+  mediaAvailable?: boolean;
+  browserAvailable?: boolean;
+};
+
+export function buildNativeSourceInventory(args: BuildSourceInventoryArgs): NativeSourceDescriptor[] {
+  const nativeOwnedSources = new Set(args.nativeOwnedSourceIds || []);
+  const inventory: NativeSourceDescriptor[] = [];
+  const cam1Source = args.sources.find((candidate) => candidate.name === 'Cam 1');
+  const cam2Source = args.sources.find((candidate) => candidate.name === 'Cam 2');
+  const screenSource = args.sources.find((candidate) => candidate.name === 'Screen Share');
+  const mediaSource = args.sources.find((candidate) => candidate.name === 'Media Loop');
+  const browserSource = args.sources.find((candidate) => candidate.name === 'Browser Source');
+
+  inventory.push({
+    source_id: 'camera:local-1',
+    label: 'Cam 1',
+    source_kind: 'camera',
+    browser_owned: !nativeOwnedSources.has('camera:local-1'),
+    available: args.webcamAvailable || nativeOwnedSources.has('camera:local-1'),
+    source_status: cam1Source?.status || null,
+    resolution: cam1Source?.resolution || null,
+    fps: cam1Source?.fps ?? null,
+    audio_level: cam1Source?.audioLevel ?? null,
+  });
+
+  inventory.push({
+    source_id: 'camera:local-2',
+    label: 'Cam 2',
+    source_kind: 'camera',
+    browser_owned: !nativeOwnedSources.has('camera:local-2'),
+    available: args.hasLocalCam2 || nativeOwnedSources.has('camera:local-2'),
+    source_status: cam2Source?.status || null,
+    resolution: cam2Source?.resolution || null,
+    fps: cam2Source?.fps ?? null,
+    audio_level: cam2Source?.audioLevel ?? null,
+  });
+
+  inventory.push({
+    source_id: 'screen:main',
+    label: 'Screen Share',
+    source_kind: 'screen',
+    browser_owned: true,
+    available: args.screenAvailable,
+    source_status: screenSource?.status || null,
+    resolution: screenSource?.resolution || null,
+    fps: screenSource?.fps ?? null,
+    audio_level: screenSource?.audioLevel ?? null,
+  });
+
+  for (let index = 0; index < args.remoteSourceCount; index += 1) {
+    inventory.push({
+      source_id: `remote:${index + 1}`,
+      label: `Remote ${index + 1}`,
+      source_kind: 'remote',
+      browser_owned: !nativeOwnedSources.has(`remote:${index + 1}`),
+      available: true,
+      source_status: 'active',
+      resolution: null,
+      fps: null,
+      audio_level: null,
+    });
+  }
+
+  inventory.push({
+    source_id: 'media:loop',
+    label: 'Media Loop',
+    source_kind: 'media',
+    browser_owned: !nativeOwnedSources.has('media:loop'),
+    available: !!args.mediaAvailable,
+    source_status: mediaSource?.status || null,
+    resolution: mediaSource?.resolution || null,
+    fps: mediaSource?.fps ?? null,
+    audio_level: mediaSource?.audioLevel ?? null,
+  });
+
+  inventory.push({
+    source_id: 'browser:main',
+    label: 'Browser Source',
+    source_kind: 'browser',
+    browser_owned: !nativeOwnedSources.has('browser:main'),
+    available: !!args.browserAvailable,
+    source_status: browserSource?.status || null,
+    resolution: browserSource?.resolution || null,
+    fps: browserSource?.fps ?? null,
+    audio_level: browserSource?.audioLevel ?? null,
+  });
+
+  return inventory;
 }
 
 function pushMainCameraScene(

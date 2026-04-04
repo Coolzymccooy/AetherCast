@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { StreamDestination, ServerLog, EncodingProfile } from '../types';
-import type { NativeSceneSnapshot } from '../lib/sceneSchema';
+import type { NativeSceneSnapshot, NativeSourceDescriptor } from '../lib/sceneSchema';
 
 interface UseNativeEngineOptions {
   setTelemetry?: Dispatch<SetStateAction<any>>;
@@ -24,6 +24,16 @@ type NativeAudioKind =
   | 'system'
   | 'virtual'
   | 'synthetic'
+  | 'unknown';
+
+type NativeSourceKind =
+  | 'camera'
+  | 'screen'
+  | 'remote'
+  | 'browser'
+  | 'media'
+  | 'overlay'
+  | 'background'
   | 'unknown';
 
 interface NativeOutputStatus {
@@ -89,7 +99,26 @@ interface NativeVideoStatus {
   layout?: string | null;
   node_count: number;
   visible_node_count: number;
+  source_frame_count: number;
   last_sync_ms: number;
+  last_render_ms: number;
+  last_error?: string | null;
+}
+
+interface NativeSourceStatus {
+  source_id: string;
+  label: string;
+  source_kind: NativeSourceKind;
+  state: NativeHealthState;
+  source_status?: string | null;
+  resolution?: string | null;
+  fps?: number | null;
+  audio_level?: number | null;
+  browser_owned: boolean;
+  frame_width: number;
+  frame_height: number;
+  last_frame_ms: number;
+  last_inventory_sync_ms: number;
   last_error?: string | null;
 }
 
@@ -125,7 +154,13 @@ interface NativeStreamStats {
   bridge_frames_received: number;
   bridge_bytes_received: number;
   bridge_last_error?: string | null;
+  source_bridge_url?: string | null;
+  source_bridge_connected_sources: number;
+  source_bridge_frames_received: number;
+  source_bridge_bytes_received: number;
+  source_bridge_last_error?: string | null;
   video_status: NativeVideoStatus;
+  source_statuses: NativeSourceStatus[];
   audio_status: NativeAudioStatus;
   output_statuses: NativeOutputStatus[];
   archive_status: NativeArchiveStatus;
@@ -135,6 +170,7 @@ interface NativeStartStreamResponse {
   message: string;
   bridge_url?: string | null;
   bridge_token?: string | null;
+  source_bridge_url?: string | null;
   transport?: 'bridge' | 'invoke';
 }
 
@@ -157,7 +193,9 @@ interface GPUStreamStats {
   lastRestartDelayMs: number;
   lastError: string | null;
   uptimeMs: number;
+  sourceBridgeConnectedSources: number;
   videoStatus: NativeVideoStatus | null;
+  sourceStatuses: NativeSourceStatus[];
   audioStatus: NativeAudioStatus | null;
   outputStatuses: NativeOutputStatus[];
   archiveStatus: NativeArchiveStatus | null;
@@ -169,6 +207,27 @@ type NativeCaptureProfile = {
   fps: number;
   bitrate: number;
 };
+
+export type NativeVideoSourceConfig = {
+  sourceId: string;
+  deviceName: string;
+  backend?: string;
+  width?: number;
+  height?: number;
+  fps?: number;
+};
+
+export type NativeSceneCaptureSource = {
+  sourceId: string;
+  element: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement;
+};
+
+export type NativeCaptureSurface = {
+  canvas: HTMLCanvasElement;
+  captureSources?: () => NativeSceneCaptureSource[];
+};
+
+type NativeFrameMode = 'raw' | 'native-scene';
 
 const STATS_POLL_MS = 1500;
 const BRIDGE_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
@@ -257,6 +316,29 @@ function resolveCaptureProfile(
   };
 }
 
+function getCaptureElementDimensions(
+  element: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement,
+): { width: number; height: number } {
+  if (element instanceof HTMLVideoElement) {
+    return {
+      width: element.videoWidth || element.clientWidth || 0,
+      height: element.videoHeight || element.clientHeight || 0,
+    };
+  }
+
+  if (element instanceof HTMLImageElement) {
+    return {
+      width: element.naturalWidth || element.width || 0,
+      height: element.naturalHeight || element.height || 0,
+    };
+  }
+
+  return {
+    width: element.width || 0,
+    height: element.height || 0,
+  };
+}
+
 export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [stats, setStats] = useState<GPUStreamStats>({
@@ -278,7 +360,9 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     lastRestartDelayMs: 0,
     lastError: null,
     uptimeMs: 0,
+    sourceBridgeConnectedSources: 0,
     videoStatus: null,
+    sourceStatuses: [],
     audioStatus: null,
     outputStatuses: [],
     archiveStatus: null,
@@ -303,8 +387,21 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   const bridgeSocketRef = useRef<WebSocket | null>(null);
   const bridgeUrlRef = useRef<string | null>(null);
   const bridgeReconnectTimerRef = useRef<number | null>(null);
+  const sourceBridgeUrlRef = useRef<string | null>(null);
+  const sourceBridgeSocketsRef = useRef<Map<string, WebSocket>>(new Map());
   const transportModeRef = useRef<'bridge' | 'invoke'>('invoke');
   const lastSceneRevisionRef = useRef<number>(0);
+  const lastSourceInventoryHashRef = useRef<string>('');
+  const latestSourceInventoryRef = useRef<NativeSourceDescriptor[]>([]);
+  const lastOwnedSourceIdsKeyRef = useRef<string>('');
+  const latestSceneSnapshotRef = useRef<NativeSceneSnapshot | null>(null);
+  const sourceCaptureRef = useRef<(() => NativeSceneCaptureSource[]) | null>(null);
+  const sourceScaleCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const sourceCaptureFailureKeysRef = useRef<Set<string>>(new Set());
+  const frameModeRef = useRef<NativeFrameMode>('raw');
+  const activeNativeSourceIdsRef = useRef<Set<string>>(new Set());
+  const sourceStoreOwnedSourceIdsRef = useRef<Set<string>>(new Set());
+  const lastSyncedBrowserSourceIdsRef = useRef<Set<string>>(new Set());
 
   const addServerLog = useCallback((message: string, type: ServerLog['type']) => {
     if (!options.setServerLogs) return;
@@ -347,6 +444,29 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       }
     }
   }, [clearBridgeReconnectTimer]);
+
+  const closeSourceBridgeSocket = useCallback((sourceId: string, reason?: string) => {
+    const socket = sourceBridgeSocketsRef.current.get(sourceId);
+    if (!socket) return;
+
+    sourceBridgeSocketsRef.current.delete(sourceId);
+    socket.onopen = null;
+    socket.onclose = null;
+    socket.onerror = null;
+
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      try {
+        socket.close(1000, reason || 'closing');
+      } catch {
+        // Ignore close failures during teardown.
+      }
+    }
+  }, []);
+
+  const closeAllSourceBridgeSockets = useCallback((reason?: string) => {
+    const sourceIds = Array.from(sourceBridgeSocketsRef.current.keys());
+    sourceIds.forEach((sourceId) => closeSourceBridgeSocket(sourceId, reason));
+  }, [closeSourceBridgeSocket]);
 
   const connectBridgeSocket = useCallback(async (
     url: string,
@@ -399,6 +519,83 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     });
   }, [addServerLog, clearBridgeReconnectTimer, closeBridgeSocket]);
 
+  const ensureSourceBridgeSocket = useCallback(async (
+    sourceId: string,
+  ): Promise<WebSocket | null> => {
+    const bridgeUrl = sourceBridgeUrlRef.current;
+    if (!bridgeUrl || !isStreamingRef.current) {
+      return null;
+    }
+
+    const existing = sourceBridgeSocketsRef.current.get(sourceId);
+    if (existing) {
+      if (existing.readyState === WebSocket.OPEN) {
+        return existing;
+      }
+      if (existing.readyState === WebSocket.CONNECTING) {
+        return null;
+      }
+      closeSourceBridgeSocket(sourceId, 'reconnect');
+    }
+
+    return await new Promise<WebSocket | null>((resolve) => {
+      let settled = false;
+      const socket = new WebSocket(bridgeUrl);
+      socket.binaryType = 'arraybuffer';
+      sourceBridgeSocketsRef.current.set(sourceId, socket);
+
+      const finish = (value: WebSocket | null) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+
+      socket.onopen = () => {
+        try {
+          socket.send(JSON.stringify({ source_id: sourceId }));
+          finish(socket);
+        } catch {
+          finish(null);
+        }
+      };
+
+      socket.onerror = () => {
+        finish(null);
+      };
+
+      socket.onclose = () => {
+        if (sourceBridgeSocketsRef.current.get(sourceId) === socket) {
+          sourceBridgeSocketsRef.current.delete(sourceId);
+        }
+        finish(null);
+      };
+    });
+  }, [closeSourceBridgeSocket]);
+
+  const sendSourceFrameViaBridge = useCallback(async (
+    sourceId: string,
+    width: number,
+    height: number,
+    frameBytes: Uint8Array,
+  ): Promise<boolean> => {
+    const socket = await ensureSourceBridgeSocket(sourceId);
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    if (socket.bufferedAmount >= BRIDGE_BACKPRESSURE_BYTES) {
+      return false;
+    }
+
+    const packet = new Uint8Array(8 + frameBytes.byteLength);
+    const view = new DataView(packet.buffer);
+    view.setUint32(0, width, true);
+    view.setUint32(4, height, true);
+    packet.set(frameBytes, 8);
+    socket.send(packet);
+    return true;
+  }, [ensureSourceBridgeSocket]);
+
   const applyNativeStats = useCallback((native: NativeStreamStats) => {
     lastNativeStateRef.current = native;
     transportModeRef.current = native.transport_mode || 'invoke';
@@ -422,7 +619,9 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastRestartDelayMs: native.last_restart_delay_ms,
       lastError: native.last_error || null,
       uptimeMs: native.uptime_ms,
+      sourceBridgeConnectedSources: native.source_bridge_connected_sources || 0,
       videoStatus: native.video_status || null,
+      sourceStatuses: native.source_statuses || [],
       audioStatus: native.audio_status || null,
       outputStatuses: native.output_statuses || [],
       archiveStatus: native.archive_status || null,
@@ -437,6 +636,10 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       nativeFrameTransport: native.frame_transport || prev.nativeFrameTransport,
       nativeVideoState: native.video_status?.state || prev.nativeVideoState,
       nativeVideoScene: native.video_status?.active_scene_name || prev.nativeVideoScene,
+      nativeSourceHealth: native.source_statuses?.map((source) => ({
+        name: source.label,
+        state: source.state,
+      })) || [],
       nativeAudioState: native.audio_status?.state || prev.nativeAudioState,
       nativeAudioSource: native.audio_status?.source_summary || prev.nativeAudioSource,
       nativeOutputHealth: native.output_statuses?.map((output) => ({
@@ -444,6 +647,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         state: output.state,
       })) || [],
       nativeArchiveState: native.archive_status?.state || prev.nativeArchiveState,
+      nativeSourceBridgeConnectedSources: native.source_bridge_connected_sources || 0,
     }));
   }, [options]);
 
@@ -470,6 +674,11 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           last_update_ms: 0,
         },
         frame_transport: 'unknown',
+        source_bridge_url: null,
+        source_bridge_connected_sources: 0,
+        source_bridge_frames_received: 0,
+        source_bridge_bytes_received: 0,
+        source_bridge_last_error: null,
         video_status: {
           state: 'inactive',
           render_path: 'unsynced',
@@ -480,9 +689,12 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           layout: null,
           node_count: 0,
           visible_node_count: 0,
+          source_frame_count: 0,
           last_sync_ms: 0,
+          last_render_ms: 0,
           last_error: null,
         },
+        source_statuses: [],
         output_statuses: [],
         archive_status: {
           state: 'inactive',
@@ -510,6 +722,16 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         addServerLog(`Local safety archive enabled: ${native.archive_path_pattern}`, 'info');
       }
 
+      if (
+        native.source_bridge_connected_sources !== undefined &&
+        native.source_bridge_connected_sources !== previous?.source_bridge_connected_sources
+      ) {
+        addServerLog(
+          `[source-bridge] ${native.source_bridge_connected_sources} source connection${native.source_bridge_connected_sources === 1 ? '' : 's'} active`,
+          native.source_bridge_connected_sources > 0 ? 'info' : 'warning',
+        );
+      }
+
       if (!previous?.video_status) {
         addServerLog(
           `[video] ${native.video_status.state} (${native.video_status.render_path}, scene ${native.video_status.active_scene_name || 'unsynced'})`,
@@ -525,6 +747,33 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           `[video] ${native.video_status.state} (${native.video_status.render_path}, scene ${native.video_status.active_scene_name || 'unsynced'}, nodes ${native.video_status.visible_node_count}/${native.video_status.node_count})${detail}`,
           healthStateLogType(native.video_status.state),
         );
+      }
+
+      for (const source of native.source_statuses || []) {
+        const previousSource = previous?.source_statuses?.find(
+          (candidate) => candidate.source_id === source.source_id,
+        );
+
+        if (!previousSource) {
+          addServerLog(
+            `[source:${source.label}] ${source.state} (${source.source_kind}${source.frame_width && source.frame_height ? ` ${source.frame_width}x${source.frame_height}` : ''})`,
+            healthStateLogType(source.state),
+          );
+          continue;
+        }
+
+        if (
+          previousSource.state !== source.state ||
+          previousSource.last_error !== source.last_error ||
+          previousSource.frame_width !== source.frame_width ||
+          previousSource.frame_height !== source.frame_height
+        ) {
+          const detail = source.last_error ? `: ${source.last_error}` : '';
+          addServerLog(
+            `[source:${source.label}] ${source.state} (${source.source_kind}${source.frame_width && source.frame_height ? ` ${source.frame_width}x${source.frame_height}` : ''})${detail}`,
+            healthStateLogType(source.state),
+          );
+        }
       }
 
       if (!previous?.audio_status) {
@@ -654,6 +903,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
   const syncSceneSnapshot = useCallback(async (snapshot: NativeSceneSnapshot) => {
     if (!window.__TAURI_INTERNALS__) return;
+    latestSceneSnapshotRef.current = snapshot;
 
     if (!invokeRef.current) {
       const { invoke } = await import('@tauri-apps/api/core');
@@ -671,6 +921,48 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       addServerLog(`Native scene sync failed: ${err?.message || err}`, 'warning');
     }
   }, [addServerLog]);
+
+  const applySourceOwnership = useCallback((sources: NativeSourceDescriptor[]) => {
+    const ownedSourceIds = new Set([
+      ...Array.from(activeNativeSourceIdsRef.current),
+      ...Array.from(sourceStoreOwnedSourceIdsRef.current),
+    ]);
+
+    return sources.map((source) => {
+      if (!ownedSourceIds.has(source.source_id)) {
+        return source;
+      }
+
+      return {
+        ...source,
+        browser_owned: false,
+        available: isStreamingRef.current ? true : source.available,
+      };
+    });
+  }, []);
+
+  const syncSourceInventory = useCallback(async (sources: NativeSourceDescriptor[]) => {
+    if (!window.__TAURI_INTERNALS__) return;
+    latestSourceInventoryRef.current = sources;
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const normalizedSources = applySourceOwnership(sources);
+    const inventoryHash = JSON.stringify(normalizedSources);
+    if (lastSourceInventoryHashRef.current === inventoryHash) {
+      return;
+    }
+
+    try {
+      await invokeRef.current('update_source_inventory', { sources: normalizedSources });
+      lastSourceInventoryHashRef.current = inventoryHash;
+    } catch (err: any) {
+      addServerLog(`Native source sync failed: ${err?.message || err}`, 'warning');
+    }
+  }, [addServerLog, applySourceOwnership]);
 
   const startStatsPolling = useCallback(() => {
     stopStatsPolling();
@@ -722,6 +1014,226 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     };
   }, [addServerLog, stopStatsPolling]);
 
+  const captureAndSendRawFrame = useCallback(async (
+    canvas: HTMLCanvasElement,
+  ) => {
+    if (!invokeRef.current) return;
+
+    const scaleCanvas = scaleCanvasRef.current;
+    if (!scaleCanvas) return;
+    const scaleCtx = scaleCanvas.getContext('2d', { willReadFrequently: true });
+    if (!scaleCtx) return;
+
+    scaleCtx.imageSmoothingEnabled = true;
+    scaleCtx.imageSmoothingQuality = 'high';
+    scaleCtx.clearRect(0, 0, widthRef.current, heightRef.current);
+    scaleCtx.drawImage(canvas, 0, 0, widthRef.current, heightRef.current);
+    const imageData = scaleCtx.getImageData(0, 0, widthRef.current, heightRef.current);
+    const frameBytes = new Uint8Array(imageData.data.buffer);
+    const bridgeSocket = bridgeSocketRef.current;
+    const wantsBridge = transportModeRef.current === 'bridge';
+
+    if (
+      wantsBridge &&
+      bridgeSocket &&
+      bridgeSocket.readyState === WebSocket.OPEN &&
+      bridgeSocket.bufferedAmount < BRIDGE_BACKPRESSURE_BYTES
+    ) {
+      bridgeSocket.send(frameBytes);
+    } else {
+      if (wantsBridge) {
+        if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
+          droppedRef.current++;
+          return;
+        }
+
+        if (
+          bridgeUrlRef.current &&
+          bridgeReconnectTimerRef.current === null &&
+          (!bridgeSocket || bridgeSocket.readyState === WebSocket.CLOSED || bridgeSocket.readyState === WebSocket.CLOSING)
+        ) {
+          const reconnectUrl = bridgeUrlRef.current;
+          bridgeReconnectTimerRef.current = window.setTimeout(() => {
+            bridgeReconnectTimerRef.current = null;
+            const nextUrl = bridgeUrlRef.current || reconnectUrl;
+            if (!isStreamingRef.current || transportModeRef.current !== 'bridge' || !nextUrl) {
+              return;
+            }
+            void connectBridgeSocket(nextUrl, 'send path');
+          }, BRIDGE_RECONNECT_MS);
+        }
+      }
+
+      await invokeRef.current('encode_frame', {
+        frameData: Array.from(frameBytes),
+        width: widthRef.current,
+        height: heightRef.current,
+      });
+    }
+  }, [connectBridgeSocket]);
+
+  const syncNativeSceneSources = useCallback(async (): Promise<number> => {
+    if (!invokeRef.current) return 0;
+
+    const snapshot = latestSceneSnapshotRef.current;
+    const captureSources = sourceCaptureRef.current;
+    if (!snapshot || !captureSources) {
+      closeAllSourceBridgeSockets('source capture unavailable');
+      sourceStoreOwnedSourceIdsRef.current = new Set(activeNativeSourceIdsRef.current);
+      lastSyncedBrowserSourceIdsRef.current = new Set();
+      return 0;
+    }
+
+    const sourceTargets = new Map<string, { width: number; height: number }>();
+    for (const node of snapshot.nodes) {
+      if (!node.source_id) continue;
+      const current = sourceTargets.get(node.source_id);
+      sourceTargets.set(node.source_id, {
+        width: Math.min(
+          widthRef.current,
+          Math.max(current?.width || 0, Math.round(node.width) || 0),
+        ),
+        height: Math.min(
+          heightRef.current,
+          Math.max(current?.height || 0, Math.round(node.height) || 0),
+        ),
+      });
+    }
+
+    const currentBrowserSourceIds = new Set<string>();
+    const sourceStoreOwnedIds = new Set<string>(activeNativeSourceIdsRef.current);
+    let updatedSources = 0;
+
+    for (const source of captureSources()) {
+      currentBrowserSourceIds.add(source.sourceId);
+      sourceStoreOwnedIds.add(source.sourceId);
+
+      const nativeSourceStatus = lastNativeStateRef.current?.source_statuses?.find(
+        (candidate) => candidate.source_id === source.sourceId,
+      );
+      const shouldPreferNativeSource = activeNativeSourceIdsRef.current.has(source.sourceId)
+        && !!nativeSourceStatus
+        && ['active', 'recovering', 'degraded'].includes(nativeSourceStatus.state);
+      if (shouldPreferNativeSource) {
+        closeSourceBridgeSocket(source.sourceId, 'native source active');
+        continue;
+      }
+
+      const sourceDimensions = getCaptureElementDimensions(source.element);
+      if (!sourceDimensions.width || !sourceDimensions.height) continue;
+
+      const target = sourceTargets.get(source.sourceId);
+      const captureWidth = Math.max(
+        2,
+        Math.min(
+          widthRef.current,
+          target?.width || sourceDimensions.width || widthRef.current,
+        ),
+      );
+      const captureHeight = Math.max(
+        2,
+        Math.min(
+          heightRef.current,
+          target?.height || sourceDimensions.height || heightRef.current,
+        ),
+      );
+
+      let sourceCanvas = sourceScaleCanvasesRef.current.get(source.sourceId);
+      if (!sourceCanvas) {
+        sourceCanvas = document.createElement('canvas');
+        sourceScaleCanvasesRef.current.set(source.sourceId, sourceCanvas);
+      }
+
+      sourceCanvas.width = captureWidth;
+      sourceCanvas.height = captureHeight;
+
+      const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) continue;
+      try {
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.clearRect(0, 0, captureWidth, captureHeight);
+        ctx.drawImage(source.element as CanvasImageSource, 0, 0, captureWidth, captureHeight);
+
+        const imageData = ctx.getImageData(0, 0, captureWidth, captureHeight);
+        const frameBytes = new Uint8Array(imageData.data.buffer);
+        const sentViaBridge = await sendSourceFrameViaBridge(
+          source.sourceId,
+          captureWidth,
+          captureHeight,
+          frameBytes,
+        );
+        if (!sentViaBridge) {
+          await invokeRef.current('update_scene_source_frame', {
+            sourceId: source.sourceId,
+            width: captureWidth,
+            height: captureHeight,
+            frameData: Array.from(frameBytes),
+          });
+        }
+        sourceCaptureFailureKeysRef.current.delete(source.sourceId);
+        updatedSources += 1;
+      } catch (error: any) {
+        const message = error?.message || String(error);
+        const failureKey = `${source.sourceId}:${message}`;
+        if (!sourceCaptureFailureKeysRef.current.has(failureKey)) {
+          sourceCaptureFailureKeysRef.current.add(failureKey);
+          addServerLog(
+            `Native source capture skipped for ${source.sourceId}: ${message}`,
+            'warning',
+          );
+        }
+        continue;
+      }
+    }
+
+    for (const previousSourceId of lastSyncedBrowserSourceIdsRef.current) {
+      if (currentBrowserSourceIds.has(previousSourceId)) continue;
+      if (activeNativeSourceIdsRef.current.has(previousSourceId)) continue;
+
+      sourceScaleCanvasesRef.current.delete(previousSourceId);
+      closeSourceBridgeSocket(previousSourceId, 'source removed');
+      await invokeRef.current('clear_scene_source_frame', {
+        sourceId: previousSourceId,
+      });
+    }
+
+    lastSyncedBrowserSourceIdsRef.current = currentBrowserSourceIds;
+    sourceStoreOwnedSourceIdsRef.current = sourceStoreOwnedIds;
+    return updatedSources;
+  }, [addServerLog, closeAllSourceBridgeSockets, closeSourceBridgeSocket, sendSourceFrameViaBridge]);
+
+  const captureAndSendNativeSceneFrame = useCallback(async (
+    canvas: HTMLCanvasElement,
+  ) => {
+    if (!invokeRef.current) return;
+
+    const snapshot = latestSceneSnapshotRef.current;
+    if (!snapshot) {
+      await captureAndSendRawFrame(canvas);
+      return;
+    }
+
+    const updatedSources = await syncNativeSceneSources();
+    const ownedSourceIdsKey = Array.from(sourceStoreOwnedSourceIdsRef.current)
+      .sort()
+      .join('|');
+    if (
+      ownedSourceIdsKey !== lastOwnedSourceIdsKeyRef.current &&
+      latestSourceInventoryRef.current.length > 0
+    ) {
+      lastOwnedSourceIdsKeyRef.current = ownedSourceIdsKey;
+      await syncSourceInventory(latestSourceInventoryRef.current);
+    }
+
+    if (!updatedSources && sourceStoreOwnedSourceIdsRef.current.size === 0) {
+      await captureAndSendRawFrame(canvas);
+      return;
+    }
+
+    await invokeRef.current('render_native_scene_frame');
+  }, [captureAndSendRawFrame, syncNativeSceneSources, syncSourceInventory]);
+
   const captureAndSendFrame = useCallback(async (
     canvas: HTMLCanvasElement,
   ) => {
@@ -734,55 +1246,10 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     try {
       sendingRef.current = true;
 
-      const scaleCanvas = scaleCanvasRef.current;
-      if (!scaleCanvas) return;
-      const scaleCtx = scaleCanvas.getContext('2d', { willReadFrequently: true });
-      if (!scaleCtx) return;
-
-      scaleCtx.imageSmoothingEnabled = true;
-      scaleCtx.imageSmoothingQuality = 'high';
-      scaleCtx.drawImage(canvas, 0, 0, widthRef.current, heightRef.current);
-      const imageData = scaleCtx.getImageData(0, 0, widthRef.current, heightRef.current);
-      const frameBytes = new Uint8Array(imageData.data.buffer);
-      const bridgeSocket = bridgeSocketRef.current;
-      const wantsBridge = transportModeRef.current === 'bridge';
-
-      if (
-        wantsBridge &&
-        bridgeSocket &&
-        bridgeSocket.readyState === WebSocket.OPEN &&
-        bridgeSocket.bufferedAmount < BRIDGE_BACKPRESSURE_BYTES
-      ) {
-        bridgeSocket.send(frameBytes);
+      if (frameModeRef.current === 'native-scene') {
+        await captureAndSendNativeSceneFrame(canvas);
       } else {
-        if (wantsBridge) {
-          if (bridgeSocket && bridgeSocket.readyState === WebSocket.OPEN) {
-            droppedRef.current++;
-            return;
-          }
-
-          if (
-            bridgeUrlRef.current &&
-            bridgeReconnectTimerRef.current === null &&
-            (!bridgeSocket || bridgeSocket.readyState === WebSocket.CLOSED || bridgeSocket.readyState === WebSocket.CLOSING)
-          ) {
-            const reconnectUrl = bridgeUrlRef.current;
-            bridgeReconnectTimerRef.current = window.setTimeout(() => {
-              bridgeReconnectTimerRef.current = null;
-              const nextUrl = bridgeUrlRef.current || reconnectUrl;
-              if (!isStreamingRef.current || transportModeRef.current !== 'bridge' || !nextUrl) {
-                return;
-              }
-              void connectBridgeSocket(nextUrl, 'send path');
-            }, BRIDGE_RECONNECT_MS);
-          }
-        }
-
-        await invokeRef.current('encode_frame', {
-          frameData: Array.from(frameBytes),
-          width: widthRef.current,
-          height: heightRef.current,
-        });
+        await captureAndSendRawFrame(canvas);
       }
 
       frameCountRef.current++;
@@ -808,7 +1275,15 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           frameLoopRef.current = null;
         }
         canvasRef.current = null;
+        sourceCaptureRef.current = null;
         isStreamingRef.current = false;
+        closeAllSourceBridgeSockets('stream dead');
+        sourceBridgeUrlRef.current = null;
+        activeNativeSourceIdsRef.current.clear();
+        sourceStoreOwnedSourceIdsRef.current.clear();
+        lastSyncedBrowserSourceIdsRef.current.clear();
+        lastOwnedSourceIdsKeyRef.current = '';
+        sourceCaptureFailureKeysRef.current.clear();
         setIsStreaming(false);
         stopStatsPolling();
         options.onError?.('Native encoder stopped unexpectedly.');
@@ -820,10 +1295,10 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     } finally {
       sendingRef.current = false;
     }
-  }, [addServerLog, connectBridgeSocket, options, stopStatsPolling]);
+  }, [addServerLog, captureAndSendNativeSceneFrame, captureAndSendRawFrame, closeAllSourceBridgeSockets, options, stopStatsPolling]);
 
   const startStream = useCallback(async (
-    canvas: HTMLCanvasElement,
+    surface: HTMLCanvasElement | NativeCaptureSurface,
     destinations: StreamDestination[],
     startOptions?: {
       width?: number;
@@ -836,6 +1311,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       audioDevice?: string;
       includeMicrophone?: boolean;
       includeSystemAudio?: boolean;
+      nativeVideoSources?: NativeVideoSourceConfig[];
+      sourceFeeds?: () => NativeSceneCaptureSource[];
     },
   ) => {
     if (!window.__TAURI_INTERNALS__) {
@@ -856,8 +1333,23 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     fpsRef.current = nativeProfile.fps;
     widthRef.current = nativeProfile.width;
     heightRef.current = nativeProfile.height;
-    canvasRef.current = canvas;
+    const captureSurface = surface instanceof HTMLCanvasElement
+      ? { canvas: surface, captureSources: undefined }
+      : surface;
+    const resolvedSourceFeeds = startOptions?.sourceFeeds || captureSurface.captureSources;
+    const useNativeScene = typeof resolvedSourceFeeds === 'function';
+    const nativeVideoSources = (startOptions?.nativeVideoSources || []).filter(
+      (source) => !!source.sourceId && !!source.deviceName,
+    );
+    frameModeRef.current = useNativeScene ? 'native-scene' : 'raw';
+    canvasRef.current = captureSurface.canvas;
+    sourceCaptureRef.current = resolvedSourceFeeds || null;
+    activeNativeSourceIdsRef.current = new Set(nativeVideoSources.map((source) => source.sourceId));
     isStreamingRef.current = true;
+
+    if (latestSourceInventoryRef.current.length > 0) {
+      await syncSourceInventory(latestSourceInventoryRef.current);
+    }
 
     if (!scaleCanvasRef.current) {
       scaleCanvasRef.current = document.createElement('canvas');
@@ -881,7 +1373,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           fps: nativeProfile.fps,
           bitrate: nativeProfile.bitrate,
           encoder: startOptions?.encoder || 'auto',
-          mode: 'raw',
+          mode: useNativeScene ? 'native-scene' : 'raw',
           audio_mode: startOptions?.audioMode || 'auto',
           audio_device: startOptions?.audioDevice || '',
           audio_sample_rate: 48000,
@@ -889,6 +1381,14 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           audio_bitrate: 160,
           include_microphone: startOptions?.includeMicrophone ?? true,
           include_system_audio: startOptions?.includeSystemAudio ?? true,
+          native_video_sources: nativeVideoSources.map((source) => ({
+            sourceId: source.sourceId,
+            deviceName: source.deviceName,
+            backend: source.backend || 'dshow',
+            width: source.width || nativeProfile.width,
+            height: source.height || nativeProfile.height,
+            fps: source.fps || nativeProfile.fps,
+          })),
         },
       });
 
@@ -910,7 +1410,9 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
       transportModeRef.current = startResponse.transport || 'invoke';
       bridgeUrlRef.current = startResponse.bridge_url || null;
+      sourceBridgeUrlRef.current = startResponse.source_bridge_url || null;
       closeBridgeSocket('starting stream');
+      closeAllSourceBridgeSockets('starting stream');
 
       if (transportModeRef.current === 'bridge' && bridgeUrlRef.current) {
         const bridgeConnected = await connectBridgeSocket(bridgeUrlRef.current, 'initial connect');
@@ -921,13 +1423,20 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         }
       }
 
+      if (useNativeScene && sourceBridgeUrlRef.current) {
+        addServerLog(`Native source bridge ready: ${sourceBridgeUrlRef.current}`, 'info');
+      }
+
       frameCountRef.current = 0;
       droppedRef.current = 0;
       lastFrameTimeRef.current = 0;
       lastNativeStateRef.current = null;
       setIsStreaming(true);
+      if (latestSourceInventoryRef.current.length > 0) {
+        await syncSourceInventory(latestSourceInventoryRef.current);
+      }
       addServerLog(
-        `Native raw stream started at ${nativeProfile.width}x${nativeProfile.height} ${nativeProfile.fps}fps`,
+        `Native ${useNativeScene ? 'scene' : 'raw'} stream started at ${nativeProfile.width}x${nativeProfile.height} ${nativeProfile.fps}fps`,
         'success',
       );
       startStatsPolling();
@@ -950,12 +1459,31 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       return startResponse.message;
     } catch (err) {
       closeBridgeSocket('start failed');
+      closeAllSourceBridgeSockets('start failed');
+      sourceBridgeUrlRef.current = null;
       canvasRef.current = null;
+      sourceCaptureRef.current = null;
+      activeNativeSourceIdsRef.current.clear();
+      sourceStoreOwnedSourceIdsRef.current.clear();
+      lastSyncedBrowserSourceIdsRef.current.clear();
+      lastOwnedSourceIdsKeyRef.current = '';
+      sourceCaptureFailureKeysRef.current.clear();
+      frameModeRef.current = 'raw';
       isStreamingRef.current = false;
       setIsStreaming(false);
       throw err;
     }
-  }, [addServerLog, captureAndSendFrame, closeBridgeSocket, connectBridgeSocket, encoderInfo, options, startStatsPolling]);
+  }, [
+    addServerLog,
+    captureAndSendFrame,
+    closeBridgeSocket,
+    closeAllSourceBridgeSockets,
+    connectBridgeSocket,
+    encoderInfo,
+    options,
+    startStatsPolling,
+    syncSourceInventory,
+  ]);
 
   const stopStream = useCallback(async () => {
     if (frameLoopRef.current !== null) {
@@ -966,10 +1494,21 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     isStreamingRef.current = false;
     stopStatsPolling();
     closeBridgeSocket('stop streaming');
+    closeAllSourceBridgeSockets('stop streaming');
     transportModeRef.current = 'invoke';
     bridgeUrlRef.current = null;
+    sourceBridgeUrlRef.current = null;
     lastNativeStateRef.current = null;
     lastSceneRevisionRef.current = 0;
+    lastSourceInventoryHashRef.current = '';
+    sourceCaptureRef.current = null;
+    activeNativeSourceIdsRef.current.clear();
+    sourceStoreOwnedSourceIdsRef.current.clear();
+    lastSyncedBrowserSourceIdsRef.current.clear();
+    lastOwnedSourceIdsKeyRef.current = '';
+    sourceCaptureFailureKeysRef.current.clear();
+    frameModeRef.current = 'raw';
+    sourceScaleCanvasesRef.current.clear();
 
     if (!window.__TAURI_INTERNALS__ || !invokeRef.current) {
       setIsStreaming(false);
@@ -985,27 +1524,39 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     }
 
     setIsStreaming(false);
-      setStats((prev) => ({
-        ...prev,
-        isActive: false,
-        restarting: false,
-        frameTransport: 'unknown',
-        videoStatus: null,
-        audioStatus: null,
-        outputStatuses: [],
-        archiveStatus: null,
-      }));
-  }, [addServerLog, closeBridgeSocket, stopStatsPolling]);
+    if (latestSourceInventoryRef.current.length > 0) {
+      await syncSourceInventory(latestSourceInventoryRef.current);
+    }
+    setStats((prev) => ({
+      ...prev,
+      isActive: false,
+      restarting: false,
+      frameTransport: 'unknown',
+      sourceBridgeConnectedSources: 0,
+      videoStatus: null,
+      sourceStatuses: [],
+      audioStatus: null,
+      outputStatuses: [],
+      archiveStatus: null,
+    }));
+  }, [addServerLog, closeAllSourceBridgeSockets, closeBridgeSocket, stopStatsPolling, syncSourceInventory]);
 
   useEffect(() => {
     return () => {
       stopStatsPolling();
       closeBridgeSocket('unmount');
+      closeAllSourceBridgeSockets('unmount');
+      activeNativeSourceIdsRef.current.clear();
+      sourceStoreOwnedSourceIdsRef.current.clear();
+      lastSyncedBrowserSourceIdsRef.current.clear();
+      lastOwnedSourceIdsKeyRef.current = '';
+      sourceCaptureFailureKeysRef.current.clear();
+      sourceScaleCanvasesRef.current.clear();
       if (frameLoopRef.current !== null) {
         cancelAnimationFrame(frameLoopRef.current);
       }
     };
-  }, [closeBridgeSocket, stopStatsPolling]);
+  }, [closeAllSourceBridgeSockets, closeBridgeSocket, stopStatsPolling]);
 
   const isAvailable = !!window.__TAURI_INTERNALS__;
 
@@ -1016,6 +1567,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     encoderInfo,
     audioInfo,
     syncSceneSnapshot,
+    syncSourceInventory,
     startStream,
     stopStream,
     // Transitional aliases while the app migrates off the old hook name.

@@ -3,7 +3,7 @@
 ## Project Overview
 AetherCast is a professional live-broadcast studio app. It supports two streaming paths:
 - **Browser path**: MediaRecorder (H.264 fMP4) → Socket.io → Node.js server → FFmpeg → RTMP
-- **GPU path**: Canvas → JPEG → Tauri IPC → Rust → FFmpeg NVENC → RTMP (desktop only)
+- **Desktop native path**: shared scene schema + native source/runtime → Rust engine → FFmpeg/NVENC → RTMP (desktop only)
 
 Users can connect phones via QR code as wireless cameras, screen-share sources, or audience portals.
 
@@ -25,8 +25,9 @@ Users can connect phones via QR code as wireless cameras, screen-share sources, 
 | `server.ts` | Express server, Socket.io hub, FFmpeg streaming pipeline, AI endpoints |
 | `src/App.tsx` | Top-level router: `?mode=remote` → phone camera, `?mode=screen` → screen share, `?mode=audience` → audience portal |
 | `src/hooks/useStreaming.ts` | Browser MediaRecorder → fMP4 → server path |
-| `src/hooks/useGPUStreaming.ts` | Canvas → JPEG → Tauri → NVENC path |
-| `src-tauri/src/main.rs` | Rust Tauri commands: `start_stream`, `stop_stream`, `write_frame`, `encode_frame` |
+| `src/hooks/useNativeEngine.ts` | Primary desktop control hook for the native engine |
+| `src/hooks/useGPUStreaming.ts` | Transitional compatibility alias for the native desktop hook |
+| `src-tauri/src/main.rs` | Thin Rust Tauri command bootstrap into `src-tauri/src/engine/*` |
 | `src/components/studio/QrModal.tsx` | QR code modal (fetches local IP from `/api/local-ip`) |
 | `src/components/RemoteCameraView.tsx` | Phone camera WebRTC page |
 | `src/components/PhoneScreenView.tsx` | Phone screen-share WebRTC page |
@@ -60,11 +61,13 @@ FFmpeg's MP4 demuxer cannot seek on a pipe and crashes. The `FMP4Demuxer` Transf
 in `server.ts` parses boxes, extracts SPS/PPS from `avcC`, converts NAL units to
 Annex B, and feeds `-f h264` input to FFmpeg directly.
 
-### GPU streaming path
-- Canvas scaled to 640×360 before Tauri IPC (JPEG ~40-80KB vs 921KB raw RGBA)
-- Rust `write_frame` clears stdin on pipe failure and returns `STREAM_DEAD`
-- JS loop in `useGPUStreaming.ts` cancels `requestAnimationFrame` on `STREAM_DEAD`
-- FFmpeg stderr is read on a background thread in Rust and logged with `[ffmpeg]` prefix
+### Desktop native path
+- Desktop mode now prefers raw RGBA / native-scene transport through `src/hooks/useNativeEngine.ts`
+- Rust owns the stream runtime under `src-tauri/src/engine/`
+- Native scene rendering and source inventory live in `src-tauri/src/engine/video.rs` and `src-tauri/src/engine/source.rs`
+- Local desktop camera sources can now be acquired natively through `src-tauri/src/engine/capture.rs`
+- Screen share, remote phone feeds, and media-loop sources now feed the native source store as source-level frames during desktop native-scene streaming
+- FFmpeg stderr is read on background threads in Rust and logged with worker/source prefixes
 
 ### Phone QR / WebRTC
 - `/api/local-ip` returns `{ ip, port }` for the LAN-accessible URL in the QR code

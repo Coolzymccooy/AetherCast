@@ -45,6 +45,34 @@ fn default_audio_channels() -> u32 {
 fn default_audio_bitrate() -> u32 {
     160
 }
+fn default_native_source_width() -> u32 {
+    1280
+}
+fn default_native_source_height() -> u32 {
+    720
+}
+fn default_native_source_fps() -> u32 {
+    30
+}
+fn default_native_source_backend() -> String {
+    "dshow".into()
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct NativeVideoSourceConfig {
+    #[serde(alias = "sourceId")]
+    pub source_id: String,
+    #[serde(alias = "deviceName")]
+    pub device_name: String,
+    #[serde(default = "default_native_source_backend")]
+    pub backend: String,
+    #[serde(default = "default_native_source_width")]
+    pub width: u32,
+    #[serde(default = "default_native_source_height")]
+    pub height: u32,
+    #[serde(default = "default_native_source_fps")]
+    pub fps: u32,
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct GPUStreamConfig {
@@ -75,6 +103,8 @@ pub struct GPUStreamConfig {
     pub include_microphone: bool,
     #[serde(default = "default_true", alias = "includeSystemAudio")]
     pub include_system_audio: bool,
+    #[serde(default, alias = "nativeVideoSources")]
+    pub native_video_sources: Vec<NativeVideoSourceConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +126,19 @@ pub enum NativeAudioSourceKind {
     System,
     Virtual,
     Synthetic,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSourceKind {
+    Camera,
+    Screen,
+    Remote,
+    Browser,
+    Media,
+    Overlay,
+    Background,
     Unknown,
 }
 
@@ -122,6 +165,24 @@ pub struct NativeAudioStatus {
     pub last_error: Option<String>,
     pub last_event: Option<String>,
     pub last_update_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeSourceStatus {
+    pub source_id: String,
+    pub label: String,
+    pub source_kind: NativeSourceKind,
+    pub state: EngineHealthState,
+    pub source_status: Option<String>,
+    pub resolution: Option<String>,
+    pub fps: Option<u32>,
+    pub audio_level: Option<f32>,
+    pub browser_owned: bool,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub last_frame_ms: u64,
+    pub last_inventory_sync_ms: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,7 +325,13 @@ pub struct NativeStreamStats {
     pub bridge_frames_received: u64,
     pub bridge_bytes_received: u64,
     pub bridge_last_error: Option<String>,
+    pub source_bridge_url: Option<String>,
+    pub source_bridge_connected_sources: u32,
+    pub source_bridge_frames_received: u64,
+    pub source_bridge_bytes_received: u64,
+    pub source_bridge_last_error: Option<String>,
     pub video_status: NativeVideoStatus,
+    pub source_statuses: Vec<NativeSourceStatus>,
     pub audio_status: NativeAudioStatus,
     pub output_statuses: Vec<OutputStatus>,
     pub archive_status: ArchiveStatus,
@@ -290,7 +357,9 @@ pub struct NativeVideoStatus {
     pub layout: Option<String>,
     pub node_count: usize,
     pub visible_node_count: usize,
+    pub source_frame_count: usize,
     pub last_sync_ms: u64,
+    pub last_render_ms: u64,
     pub last_error: Option<String>,
 }
 
@@ -322,10 +391,37 @@ impl Default for FrameBridgeRuntime {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SourceBridgeRuntime {
+    pub session_id: u64,
+    pub url: Option<String>,
+    pub connected_sources: std::collections::HashSet<String>,
+    pub frames_received: u64,
+    pub bytes_received: u64,
+    pub shutdown_tx:
+        Option<std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>>,
+    pub last_error: Option<String>,
+}
+
+impl Default for SourceBridgeRuntime {
+    fn default() -> Self {
+        Self {
+            session_id: 0,
+            url: None,
+            connected_sources: std::collections::HashSet::new(),
+            frames_received: 0,
+            bytes_received: 0,
+            shutdown_tx: None,
+            last_error: None,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct StartStreamResponse {
     pub message: String,
     pub bridge_url: Option<String>,
     pub bridge_token: Option<String>,
+    pub source_bridge_url: Option<String>,
     pub transport: String,
 }

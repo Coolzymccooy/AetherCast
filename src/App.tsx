@@ -20,13 +20,15 @@ import { useReplay } from './hooks/useReplay';
 import { useProject } from './hooks/useProject';
 import { useMIDI } from './hooks/useMIDI';
 import { useNativeEngine } from './hooks/useNativeEngine';
-import { buildNativeSceneSnapshot } from './lib/sceneSchema';
+import { useNativeSourceFeeds } from './hooks/useNativeSourceFeeds';
+import { useBrowserSourceRuntime } from './hooks/useBrowserSourceRuntime';
+import { buildNativeSceneSnapshot, buildNativeSourceInventory } from './lib/sceneSchema';
 
 // --- Studio Components ---
 import { MenuBar } from './components/studio/MenuBar';
 import { TelemetryBar } from './components/studio/TelemetryBar';
 import { SourceRack } from './components/studio/SourceRack';
-import { ProgramView } from './components/studio/ProgramView';
+import { ProgramView, type ProgramViewHandle } from './components/studio/ProgramView';
 import { SceneSwitcher } from './components/studio/SceneSwitcher';
 import { AudioMixer } from './components/studio/AudioMixer';
 import { DirectorRack } from './components/studio/DirectorRack';
@@ -108,6 +110,9 @@ function StudioView() {
   const [showOutputQuality, setShowOutputQuality] = React.useState(false);
   const [showShortcuts, setShowShortcuts] = React.useState(false);
   const [showDownload, setShowDownload] = React.useState(false);
+  const programViewRef = React.useRef<ProgramViewHandle>(null);
+  const lastBrowserSourceNoticeRef = React.useRef<string | null>(null);
+  const [browserSourceUrl, setBrowserSourceUrl] = React.useState(() => localStorage.getItem('aether_browser_source_url') || '');
 
   // View / Zoom state
   const [zoomLevel, setZoomLevel] = React.useState(100);
@@ -179,6 +184,92 @@ function StudioView() {
     onSuccess: (msg) => notify(msg, 'success'),
   });
 
+  const videoInputs = webrtc.devices.filter((device) => device.kind === 'videoinput');
+  const selectedPrimaryVideo =
+    videoInputs.find((device) => device.deviceId === webrtc.selectedVideoDevice) || videoInputs[0];
+  const selectedSecondaryVideo =
+    videoInputs.find((device) => device.deviceId === webrtc.selectedVideoDevice2);
+  const nativeVideoSources = nativeEngine.isAvailable
+    ? [
+        selectedPrimaryVideo?.label
+          ? {
+              sourceId: 'camera:local-1',
+              deviceName: selectedPrimaryVideo.label,
+            }
+          : null,
+        selectedSecondaryVideo?.label
+          && selectedSecondaryVideo.label !== selectedPrimaryVideo?.label
+          ? {
+              sourceId: 'camera:local-2',
+              deviceName: selectedSecondaryVideo.label,
+            }
+          : null,
+      ].filter((source): source is { sourceId: string; deviceName: string } => !!source)
+    : [];
+  const nativeOwnedSourceIds = nativeEngine.isStreaming
+    ? nativeVideoSources.map((source) => source.sourceId)
+    : [];
+  const nativeOwnedSourceIdsKey = nativeOwnedSourceIds.join('|');
+  const mediaCaptureSources = React.useMemo(() => {
+    const element = mediaPlayer.getVideoElement();
+    if (!element || !mediaPlayer.playbackState.currentItem) {
+      return [];
+    }
+
+    return [{
+      sourceId: 'media:loop',
+      element,
+    }];
+  }, [mediaPlayer, mediaPlayer.playbackState.currentItem]);
+  const browserSourceRuntime = useBrowserSourceRuntime(browserSourceUrl);
+  const nativeSourceFeeds = useNativeSourceFeeds({
+    webcamStream: webrtc.webcamStream,
+    screenStream: webrtc.screenStream,
+    remoteStreams: webrtc.remoteStreams,
+    mediaElement: mediaPlayer.playbackState.currentItem ? mediaPlayer.getVideoElement() : null,
+    browserElement: browserSourceRuntime.isCapturable ? browserSourceRuntime.captureElement : null,
+  });
+
+  useEffect(() => {
+    localStorage.setItem('aether_browser_source_url', browserSourceUrl);
+  }, [browserSourceUrl]);
+
+  useEffect(() => {
+    studio.setSources((prev) => prev.map((source) => {
+      if (source.name !== 'Browser Source') {
+        return source;
+      }
+
+      return {
+        ...source,
+        status: browserSourceRuntime.state === 'active'
+          ? 'active'
+          : browserSourceUrl
+            ? 'standby'
+            : 'offline',
+        resolution: browserSourceRuntime.resolution !== 'Unknown'
+          ? browserSourceRuntime.resolution
+          : source.resolution,
+        fps: browserSourceRuntime.fps || source.fps,
+        audioLevel: 0,
+      };
+    }));
+  }, [browserSourceRuntime.fps, browserSourceRuntime.resolution, browserSourceRuntime.state, browserSourceUrl, studio.setSources]);
+
+  useEffect(() => {
+    if (!browserSourceUrl || !browserSourceRuntime.error) {
+      lastBrowserSourceNoticeRef.current = null;
+      return;
+    }
+
+    if (lastBrowserSourceNoticeRef.current === browserSourceRuntime.error) {
+      return;
+    }
+
+    lastBrowserSourceNoticeRef.current = browserSourceRuntime.error;
+    notify(`Browser Source: ${browserSourceRuntime.error}`, 'warning');
+  }, [browserSourceRuntime.error, browserSourceUrl, notify]);
+
   const scriptRunner = useScriptRunner({ scenes: studio.scenes, setActiveScene: studio.setActiveScene });
   useEffect(() => {
     if (!scriptRunner.activeScript) scriptRunner.setActiveScript(SAMPLE_SCRIPT);
@@ -196,6 +287,21 @@ function StudioView() {
     switch (item) {
       case 'Add Camera': studio.setShowHardwareSetup(true); break;
       case 'Add Screen Share': webrtc.startScreenShare(); break;
+      case 'Add Browser Source': {
+        const nextUrl = window.prompt(
+          'Enter a direct image or video URL for Browser Source. Leave blank to clear it.',
+          browserSourceUrl,
+        );
+        if (nextUrl === null) break;
+        const trimmed = nextUrl.trim();
+        setBrowserSourceUrl(trimmed);
+        if (trimmed) {
+          notify('Browser Source configured', 'success');
+        } else {
+          notify('Browser Source cleared', 'info');
+        }
+        break;
+      }
       case 'Exit': webrtc.stopCamera(); window.close(); break;
       case 'Start Streaming': studio.setShowStreamSettings(true); break;
       case 'Stop Streaming':
@@ -253,11 +359,23 @@ function StudioView() {
       remoteSourceCount,
       hasLocalCam2,
     });
+    const sourceInventory = buildNativeSourceInventory({
+      sources: studio.sources,
+      webcamAvailable: !!webrtc.webcamStream,
+      screenAvailable: !!webrtc.screenStream,
+      remoteSourceCount,
+      hasLocalCam2,
+      nativeOwnedSourceIds,
+      mediaAvailable: !!mediaPlayer.playbackState.currentItem,
+      browserAvailable: browserSourceRuntime.isCapturable,
+    });
 
     void nativeEngine.syncSceneSnapshot(snapshot);
+    void nativeEngine.syncSourceInventory(sourceInventory);
   }, [
     nativeEngine.isAvailable,
     nativeEngine.syncSceneSnapshot,
+    nativeEngine.syncSourceInventory,
     studio.activeScene,
     studio.layout,
     studio.transition,
@@ -271,9 +389,12 @@ function StudioView() {
     studio.sourceSwap,
     studio.audienceMessages,
     studio.activeMessageId,
+    nativeEngine.isStreaming,
+    mediaPlayer.playbackState.currentItem,
     webrtc.webcamStream,
     webrtc.screenStream,
     webrtc.remoteStreams,
+    nativeOwnedSourceIdsKey,
   ]);
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -331,6 +452,7 @@ function StudioView() {
         <div className="flex-1 flex flex-col min-w-0 min-h-0">
           <ErrorBoundary name="Compositor" onError={(err) => notify(err.message, 'error')}>
           <ProgramView
+            ref={programViewRef}
             activeScene={studio.activeScene}
             sources={studio.sources}
             isStreaming={studio.isStreaming}
@@ -352,15 +474,17 @@ function StudioView() {
                 if (nativeEngine.isAvailable) {
                   // Desktop (Tauri) — use the native engine with raw RGBA frame transport.
                   // No server-side FFmpeg needed; encoding happens locally.
-                  const canvas = document.querySelector('canvas');
-                  if (canvas) {
+                  const captureSurface = programViewRef.current?.getNativeCaptureSurface();
+                  if (captureSurface?.canvas) {
                     const micChannels = studio.audioChannels.filter((channel) => /^Mic/i.test(channel.name));
                     const systemChannel = studio.audioChannels.find((channel) => channel.name === 'System');
-                    nativeEngine.startStream(canvas as HTMLCanvasElement, activeDestinations, {
+                    nativeEngine.startStream(captureSurface, activeDestinations, {
                       encodingProfile: streaming.encodingProfile,
                       audioMode: 'auto',
                       includeMicrophone: micChannels.some((channel) => !channel.muted && channel.volume > 0),
                       includeSystemAudio: systemChannel ? !systemChannel.muted && systemChannel.volume > 0 : true,
+                      nativeVideoSources,
+                      sourceFeeds: nativeSourceFeeds.getCaptureSources,
                     }).then((msg) => {
                       studio.setIsStreaming(true);
                       notify(`GPU Stream: ${msg}`, 'success');
@@ -370,6 +494,8 @@ function StudioView() {
                       // which crashes on weak servers. Show error and let user retry or use web mode.
                       notify(`GPU stream failed: ${err?.message || err}. Check FFmpeg and retry.`, 'error');
                     });
+                  } else {
+                    notify('Program output is not ready yet. Wait for the preview to initialize and retry.', 'warning');
                   }
                 } else {
                   // Browser-only (web) — stream via Socket.io → server FFmpeg → RTMP
@@ -395,6 +521,7 @@ function StudioView() {
             sourceSwap={studio.sourceSwap}
             audienceMessages={studio.audienceMessages}
             activeMessageId={studio.activeMessageId}
+            extraCaptureSources={mediaCaptureSources}
           />
           </ErrorBoundary>
 

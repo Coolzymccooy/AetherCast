@@ -5,9 +5,14 @@ mod engine;
 
 use engine::service::{
     capture_replay, detect_encoder, encode_frame, get_stream_stats, list_audio_devices,
-    start_replay_buffer, start_stream, stop_replay_buffer, stop_stream, write_frame,
+    render_native_scene_frame, start_replay_buffer, start_stream, stop_replay_buffer,
+    stop_stream, write_frame,
 };
-use engine::video::{get_scene_snapshot, update_scene_snapshot};
+use engine::source::{get_source_inventory, update_source_inventory};
+use engine::video::{
+    clear_scene_source_frame, get_scene_snapshot, update_scene_snapshot,
+    update_scene_source_frame,
+};
 
 fn main() {
     tauri::Builder::default()
@@ -15,11 +20,16 @@ fn main() {
             start_stream,
             stop_stream,
             encode_frame,
+            render_native_scene_frame,
             write_frame,
             get_stream_stats,
             detect_encoder,
             list_audio_devices,
+            update_source_inventory,
+            get_source_inventory,
             update_scene_snapshot,
+            update_scene_source_frame,
+            clear_scene_source_frame,
             get_scene_snapshot,
             start_replay_buffer,
             capture_replay,

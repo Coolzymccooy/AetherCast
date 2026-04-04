@@ -11,8 +11,11 @@ This does not mean "keep hardening the browser path forever." The browser/server
 The current stack has improved materially, but it still falls short of broadcast-grade architecture:
 
 - Browser mode still depends on `MediaRecorder -> Socket.io -> server FFmpeg` in [useStreaming.ts](/c:/Users/segun/source/repos/aether2/src/hooks/useStreaming.ts) and [server.ts](/c:/Users/segun/source/repos/aether2/server.ts).
-- Desktop mode still originates frames from the web compositor canvas in [useGPUStreaming.ts](/c:/Users/segun/source/repos/aether2/src/hooks/useGPUStreaming.ts).
-- Desktop frames no longer have to pass through JPEG/image pipe by default. The native desktop path now prefers raw RGBA frame transport, but the compositor is still browser-owned.
+- Desktop mode no longer has to stream a fully precomposited browser canvas. The native engine can now accept per-source RGBA surfaces from the preview layer and render the final scene in Rust.
+- Desktop frames no longer have to pass through JPEG/image pipe by default. The native desktop path now prefers raw RGBA transport, with native-scene composition available for the primary desktop path.
+- Desktop local camera acquisition no longer has to remain browser-owned during a live native session. The native desktop path can now spawn DirectShow camera workers for local camera sources and feed those frames directly into the Rust source store.
+- Desktop screen, remote phone feeds, and media-loop sources now feed the Rust source store as source-level frames for native-scene streaming, instead of only being sampled through a flat browser compositor output.
+- Desktop browser/WebRTC/media source sync no longer has to rely only on large Tauri invoke payloads. Native-scene desktop sessions now expose a dedicated local source bridge so browser-owned sources can feed the native source store over a native runtime transport with invoke fallback.
 - Desktop audio no longer relies only on blind synthetic fallback. Native device-backed audio planning now lives in `src-tauri/src/engine/audio.rs`, but full broadcast-mixer parity is still outstanding.
 - The Tauri app is stronger than the browser path, but it is still a custom encoder path rather than a full native media runtime.
 
@@ -38,11 +41,22 @@ The current stack has improved materially, but it still falls short of broadcast
   - `src-tauri/src/engine/service.rs` validates raw frame sizing and exposes `frame_transport` in native stats.
   - JPEG/image pipe remains only as legacy compatibility, not the preferred desktop transport.
   - `src/lib/sceneSchema.ts` now builds a shared scene snapshot for the desktop engine.
+  - `src/lib/sceneSchema.ts` now also builds a native source inventory so desktop mode syncs source identity and availability into Rust.
   - `src-tauri/src/engine/video.rs` now stores native scene revisions and exposes structured video sync state.
+  - `src-tauri/src/engine/source.rs` now owns native source identity, availability, freshness, and frame telemetry for desktop mode.
+  - `src-tauri/src/engine/capture.rs` now owns native local camera acquisition workers for desktop mode and feeds those frames directly into the native source store.
   - `src/App.tsx` now syncs scene/layout/overlay changes into the native engine instead of leaving the browser canvas as the only scene authority.
+  - `src/components/Compositor.tsx` and `src/components/studio/ProgramView.tsx` now expose source-level capture surfaces for desktop mode instead of only a flat program canvas.
+  - `src/hooks/useNativeEngine.ts` now switches desktop streaming into `native-scene` mode when those source surfaces are available.
+  - `src/hooks/useNativeEngine.ts` now keeps screen, remote, and media-loop sources synchronized into the native source store and clears stale source frames when those sources disappear.
+  - `src-tauri/src/engine/source.rs` now owns a dedicated source bridge runtime so desktop `native-scene` sessions can ingest browser/WebRTC/media source frames through a native bridge instead of depending only on invoke-based source-frame RPC.
+  - `src/hooks/useNativeEngine.ts` now opens per-source bridge sockets for browser-owned sources and falls back to invoke only when that source bridge is unavailable or backpressured.
+  - app-level source acquisition for webcam/screen/WebRTC/media feeds no longer has to depend on preview-owned compositor elements; `src/hooks/useNativeSourceFeeds.ts` now materializes dedicated capture elements for desktop native-scene streaming.
+  - `src/hooks/useBrowserSourceRuntime.ts` now provides a real browser-source runtime for direct image/video URLs, with app-level capture ownership and native-scene feed integration.
+  - `src-tauri/src/engine/video.rs` now renders the synced scene snapshot natively from per-source RGBA inputs for the core desktop path.
 - Still outstanding before real OBS-class parity:
   - native audio bus graph, monitoring, delay, and metering parity
-  - native video/compositor ownership beyond synced browser-authored scene snapshots
+  - full native acquisition/runtime for WebRTC receive and real browser-source pages, not only app-level managed browser/WebRTC source feeds and direct media/image browser-source runtimes feeding the native runtime
   - output manager split beyond inline FFmpeg session control
   - long-lived native worker/service outside the UI process
 
@@ -434,4 +448,4 @@ The next implementation pass should be:
 1. Extract native service boundary.
 2. Add structured telemetry/state model.
 3. Make browser streaming explicitly secondary.
-4. Then make the `libobs` vs custom-native decision before building more renderer code.
+4. Then prioritize native audio bus/meter/monitor work and broader native source acquisition before claiming parity.
