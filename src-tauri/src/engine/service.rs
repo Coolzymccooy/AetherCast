@@ -37,8 +37,20 @@ use super::video::{current_video_status, render_native_scene_rgba};
 
 const DEFAULT_MAX_RESTARTS: u32 = 48;
 const DEFAULT_OUTPUT_MAX_RESTARTS: u32 = 120;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[allow(dead_code)]
 const RESTART_RESET_AFTER_MS: u64 = 180_000;
+
+fn configure_background_command(command: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
 
 struct OutputWorkerSink {
     session_id: u64,
@@ -512,7 +524,8 @@ fn find_ffmpeg() -> String {
     };
 
     for path in &candidates {
-        if let Ok(status) = Command::new(path)
+        let mut command = Command::new(path);
+        if let Ok(status) = configure_background_command(&mut command)
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -555,10 +568,13 @@ fn detect_gpu_encoder(ffmpeg_bin: &str) -> String {
 }
 
 fn probe_encoder(ffmpeg_bin: &str, encoder: &str) -> bool {
-    Command::new(ffmpeg_bin)
+    let mut command = Command::new(ffmpeg_bin);
+    configure_background_command(&mut command)
         .args(["-hide_banner", "-encoders"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+
+    command
         .output()
         .map(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -568,10 +584,13 @@ fn probe_encoder(ffmpeg_bin: &str, encoder: &str) -> bool {
 }
 
 fn supports_lavfi(ffmpeg_bin: &str) -> bool {
-    Command::new(ffmpeg_bin)
+    let mut command = Command::new(ffmpeg_bin);
+    configure_background_command(&mut command)
         .args(["-hide_banner", "-filters"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+
+    command
         .output()
         .map(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1039,11 +1058,7 @@ fn spawn_output_worker(context: WorkerLaunchContext) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
+    configure_background_command(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -1463,11 +1478,7 @@ fn spawn_ffmpeg_from_runtime() -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
+    configure_background_command(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -2142,7 +2153,8 @@ pub async fn capture_replay(duration_sec: u32) -> Result<String, String> {
     let out_str = out.to_string_lossy().to_string();
     let ffmpeg_bin = find_ffmpeg();
 
-    let mut child = Command::new(&ffmpeg_bin)
+    let mut command = Command::new(&ffmpeg_bin);
+    let mut child = configure_background_command(&mut command)
         .args([
             "-y",
             "-f",

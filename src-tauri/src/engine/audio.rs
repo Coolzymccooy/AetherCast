@@ -7,6 +7,18 @@ use super::state::{
 use super::telemetry::now_ms;
 
 const DEFAULT_AUDIO_BUFFER_MS: u32 = 50;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn configure_background_command(command: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
 
 #[derive(Debug, Clone)]
 pub struct NativeAudioInputSpec {
@@ -41,10 +53,13 @@ pub struct NativeAudioPlan {
 }
 
 pub fn supports_dshow(ffmpeg_bin: &str) -> bool {
-    Command::new(ffmpeg_bin)
+    let mut command = Command::new(ffmpeg_bin);
+    configure_background_command(&mut command)
         .args(["-hide_banner", "-devices"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+
+    command
         .output()
         .map(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
@@ -58,7 +73,8 @@ pub fn list_audio_devices(ffmpeg_bin: &str) -> Vec<NativeAudioInput> {
         return Vec::new();
     }
 
-    let output = match Command::new(ffmpeg_bin)
+    let mut command = Command::new(ffmpeg_bin);
+    let output = match configure_background_command(&mut command)
         .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

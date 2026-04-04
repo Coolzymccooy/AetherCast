@@ -71,3 +71,38 @@ jobs:
           prerelease: false
           tauriScript: npx tauri
           args: --target ${{ matrix.target }}
+
+      - name: Upload stable latest asset aliases
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $targetBundleRoot = Join-Path $PWD "src-tauri\target\${{ matrix.target }}\release\bundle"
+          $bundleRoot = if (Test-Path $targetBundleRoot) { $targetBundleRoot } else { Join-Path $PWD "src-tauri\target\release\bundle" }
+
+          $exe = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $msi = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.msi" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+          if ($null -eq $exe -or $null -eq $msi) {
+            throw "Could not locate Windows release bundles under $bundleRoot"
+          }
+
+          $aliasDir = Join-Path $PWD ".release-aliases"
+          New-Item -ItemType Directory -Force -Path $aliasDir | Out-Null
+
+          $exeAlias = Join-Path $aliasDir "Selton.Studio_latest_x64-setup.exe"
+          $msiAlias = Join-Path $aliasDir "Selton.Studio_latest_x64_en-US.msi"
+
+          Copy-Item $exe.FullName $exeAlias -Force
+          Copy-Item $msi.FullName $msiAlias -Force
+
+          gh release upload "${{ github.ref_name }}" $exeAlias $msiAlias --clobber
+
+      - name: Mark release as latest
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.ref_name }}" --latest

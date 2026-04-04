@@ -8,6 +8,19 @@ use super::source::note_source_error;
 use super::state::{GPUStreamConfig, NativeVideoSourceConfig};
 use super::video::{clear_source_frame, store_source_frame};
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn configure_background_command(command: &mut Command) -> &mut Command {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    command
+}
+
 #[derive(Debug, Clone)]
 struct NativeVideoDevice {
     name: String,
@@ -322,7 +335,8 @@ fn build_native_source_ffmpeg_args(
 }
 
 fn list_video_devices(ffmpeg_bin: &str) -> Vec<NativeVideoDevice> {
-    let output = match Command::new(ffmpeg_bin)
+    let mut command = Command::new(ffmpeg_bin);
+    let output = match configure_background_command(&mut command)
         .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
