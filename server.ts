@@ -1291,7 +1291,7 @@ If no switch needed, respond with exactly: STAY`;
   app.get('/api/lumina/rooms/:roomId/status', (req, res) => {
     const roomId = String(req.params.roomId || '').trim();
     const lastSeen = luminaRoomLastPing.get(roomId) ?? null;
-    const connected = lastSeen !== null && Date.now() - lastSeen < 15_000;
+    const connected = lastSeen !== null && Date.now() - lastSeen < 300_000; // 5 min window
     res.json({ connected, lastSeenMs: lastSeen });
   });
 

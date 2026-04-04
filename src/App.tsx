@@ -197,7 +197,7 @@ function StudioView() {
     onLuminaConnected: () => {
       setLuminaConnected(true);
       if (luminaConnectedTimerRef.current) clearTimeout(luminaConnectedTimerRef.current);
-      luminaConnectedTimerRef.current = setTimeout(() => setLuminaConnected(false), 15_000);
+      luminaConnectedTimerRef.current = setTimeout(() => setLuminaConnected(false), 300_000); // 5 min
     },
   });
 
