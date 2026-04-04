@@ -584,10 +584,11 @@ export function useWebRTC({
     let serverUrl: string | undefined = undefined;
 
     if (window.__TAURI_INTERNALS__) {
-      // Tauri production builds run on tauri.localhost and should use the public cloud
-      // signaling server. Only local dev builds should target localhost:3001.
-      const isTauriDevHost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
-      serverUrl = isTauriDevHost ? 'http://localhost:3001' : CLOUD_URL;
+      // Tauri production builds load from tauri://localhost (protocol = 'tauri:').
+      // Only Tauri dev mode loads via http://localhost:3001 (protocol = 'http:').
+      // We must check the protocol — hostname alone is 'localhost' in both cases.
+      const isTauriDev = window.location.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(window.location.hostname);
+      serverUrl = isTauriDev ? 'http://localhost:3001' : CLOUD_URL;
     }
 
     // Audience bridge: when Tauri connects to localhost, audience phones reach the cloud.

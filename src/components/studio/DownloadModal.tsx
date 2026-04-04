@@ -254,8 +254,6 @@ export const DownloadModal: React.FC<DownloadModalProps> = ({ onClose }) => {
                       <a
                         key={file.label}
                         href={file.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
                         className="inline-flex items-center gap-2 px-4 py-2 bg-accent-cyan hover:bg-cyan-400 text-black text-[10px] font-bold uppercase rounded-lg transition-all active:scale-95"
                       >
                         <Download size={12} />
