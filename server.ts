@@ -286,7 +286,7 @@ async function startServer() {
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, x-lumina-event, x-lumina-workspace, x-lumina-session, x-lumina-token, Authorization'
+      'Content-Type, x-lumina-event, x-lumina-workspace, x-lumina-session, x-lumina-token, x-lumina-room, Authorization'
     );
     if (req.method === 'OPTIONS') {
       res.status(204).end();
@@ -1235,6 +1235,7 @@ If no switch needed, respond with exactly: STAY`;
     const workspaceId = String(req.headers['x-lumina-workspace'] || '').trim();
     const sessionId = String(req.headers['x-lumina-session'] || '').trim();
     const token = String(req.headers['x-lumina-token'] || '').trim();
+    const roomId = String(req.headers['x-lumina-room'] || '').trim();
 
     if (!eventType || !workspaceId || !sessionId) {
       res.status(400).json({ ok: false, message: 'missing_required_headers' });
@@ -1266,9 +1267,13 @@ If no switch needed, respond with exactly: STAY`;
       ts: Date.now(),
     };
 
-    io.emit('lumina-event', bridgeEvent);
-
-    console.log(`[lumina-bridge] ${eventType} → ${io.engine.clientsCount} client(s)`);
+    if (roomId) {
+      io.to(roomId).emit('lumina-event', bridgeEvent);
+      console.log(`[lumina-bridge] ${eventType} → room=${roomId}`);
+    } else {
+      io.emit('lumina-event', bridgeEvent);
+      console.log(`[lumina-bridge] ${eventType} → ${io.engine.clientsCount} client(s) (broadcast)`);
+    }
     res.status(200).json({ ok: true, message: 'accepted' });
   });
 
