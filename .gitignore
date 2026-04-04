@@ -18,5 +18,8 @@ app-icon.png
 # Claude settings (may contain tokens)
 .claude/
 
+# Tauri signing keys (never commit these)
+~/.tauri/
+
 # APK binaries (large files — only track intentional releases)
 # public/downloads/*.apk
