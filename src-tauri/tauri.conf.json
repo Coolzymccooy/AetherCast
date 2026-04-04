@@ -1,6 +1,6 @@
 {
   "productName": "Selton Studio",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "identifier": "com.selton.studio",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -24,6 +24,14 @@
     ],
     "security": {
       "csp": null
+    },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/Coolzymccooy/AetherCast/releases/latest/download/latest.json"
+      ],
+      "dialog": false,
+      "pubkey": ""
     }
   },
   "bundle": {

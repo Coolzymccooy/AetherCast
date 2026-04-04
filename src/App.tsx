@@ -46,6 +46,7 @@ import { ProjectDialog } from './components/studio/ProjectDialog';
 import { OutputQualityModal } from './components/studio/OutputQualityModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { DownloadModal } from './components/studio/DownloadModal';
+import { CheckForUpdatesModal } from './components/studio/CheckForUpdatesModal';
 import { KeyboardShortcuts } from './components/studio/KeyboardShortcuts';
 
 // --- Other Views ---
@@ -122,6 +123,7 @@ function StudioView() {
   const [showOutputQuality, setShowOutputQuality] = React.useState(false);
   const [showShortcuts, setShowShortcuts] = React.useState(false);
   const [showDownload, setShowDownload] = React.useState(false);
+  const [showCheckUpdates, setShowCheckUpdates] = React.useState(false);
   const programViewRef = React.useRef<ProgramViewHandle>(null);
   const lastBrowserSourceNoticeRef = React.useRef<string | null>(null);
   const [browserSourceUrl, setBrowserSourceUrl] = React.useState(() => localStorage.getItem('aether_browser_source_url') || '');
@@ -539,6 +541,13 @@ function StudioView() {
         return false;
       }
 
+      const activeSourceFeeds = nativeSourceFeeds.getCaptureSources();
+      if (nativeVideoSources.length === 0 && activeSourceFeeds.length === 0) {
+        appendStudioLog(`${origin} could not start streaming because the compositor has no active sources.`, 'warning');
+        notify('Your program view is empty — add a camera, screen, or media source before going live.', 'warning');
+        return false;
+      }
+
       const micChannels = studio.audioChannels.filter((channel) => /^Mic/i.test(channel.name));
       const systemChannel = studio.audioChannels.find((channel) => channel.name === 'System');
 
@@ -668,6 +677,7 @@ function StudioView() {
       case 'Toggle Telemetry': setShowTelemetry(prev => !prev); break;
       case 'Keyboard Shortcuts': setShowShortcuts(true); break;
       case 'Download Desktop App': setShowDownload(true); break;
+      case 'Check for Updates': setShowCheckUpdates(true); break;
       case 'About Aether Studio': setShowDownload(true); break;
       default: break;
     }
@@ -1205,6 +1215,9 @@ function StudioView() {
 
       {/* Download Desktop App Modal */}
       {showDownload && <DownloadModal onClose={() => setShowDownload(false)} />}
+
+      {/* Check for Updates Modal */}
+      {showCheckUpdates && <CheckForUpdatesModal onClose={() => setShowCheckUpdates(false)} />}
     </div>
   );
 }
