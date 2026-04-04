@@ -20,7 +20,8 @@
     "mobile:sync": "npm run build && npx cap sync android",
     "mobile:open": "npx cap open android",
     "mobile:build": "npm run build && npx cap sync android && npx cap build android",
-    "diagnostics:check": "node scripts/analyze-native-diagnostics.mjs"
+    "diagnostics:check": "node scripts/analyze-native-diagnostics.mjs",
+    "lumina:bridge": "node scripts/send-lumina-bridge-event.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.3.0",
