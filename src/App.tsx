@@ -23,6 +23,7 @@ import { useNativeEngine, type NativeAudioBusConfig } from './hooks/useNativeEng
 import { useNativeSourceFeeds } from './hooks/useNativeSourceFeeds';
 import { useBrowserSourceRuntime } from './hooks/useBrowserSourceRuntime';
 import { buildNativeSceneSnapshot, buildNativeSourceInventory } from './lib/sceneSchema';
+import { type EncodingProfile, type StreamDestination, type ServerLog } from './types';
 
 // --- Studio Components ---
 import { MenuBar } from './components/studio/MenuBar';
@@ -69,6 +70,13 @@ declare global {
   }
 }
 
+type LuminaStreamRequest = {
+  event: string;
+  payload: Record<string, unknown>;
+  workspaceId?: string;
+  sessionId?: string;
+};
+
 // ──────────────────────────────────────────────────────────────────────────────
 // App Router
 // ──────────────────────────────────────────────────────────────────────────────
@@ -114,6 +122,7 @@ function StudioView() {
   const programViewRef = React.useRef<ProgramViewHandle>(null);
   const lastBrowserSourceNoticeRef = React.useRef<string | null>(null);
   const [browserSourceUrl, setBrowserSourceUrl] = React.useState(() => localStorage.getItem('aether_browser_source_url') || '');
+  const luminaStreamRequestHandlerRef = React.useRef<(request: LuminaStreamRequest) => void>(() => {});
 
   // View / Zoom state
   const [zoomLevel, setZoomLevel] = React.useState(100);
@@ -178,6 +187,9 @@ function StudioView() {
       notify(`Phone ${label} connected`, 'success');
       // Auto-dismiss the QR modal so the camera fills the canvas immediately
       studio.setShowQrModal(false);
+    },
+    onLuminaStreamRequest: (request) => {
+      luminaStreamRequestHandlerRef.current(request);
     },
   });
 
@@ -304,7 +316,316 @@ function StudioView() {
     setActiveScene: studio.setActiveScene, addLog: studio.addLog,
   });
 
+  const appendStudioLog = React.useCallback((message: string, type: ServerLog['type'] = 'info') => {
+    studio.setServerLogs((prev) => [
+      { message, type, id: Date.now() + Math.random() } as ServerLog,
+      ...prev,
+    ].slice(0, 50));
+  }, [studio.setServerLogs]);
+
   // ── Menu Handler ──────────────────────────────────────────────────────────
+  const resolveLuminaProfile = React.useCallback((payload?: Record<string, unknown>): EncodingProfile | null => {
+    if (!payload) return null;
+
+    const candidate = [
+      payload.profile,
+      payload.encodingProfile,
+      payload.outputProfile,
+      payload.quality,
+    ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+    if (!candidate) {
+      return null;
+    }
+
+    const normalized = candidate.trim().toLowerCase().replace(/\s+/g, '');
+    const profileMap: Record<string, EncodingProfile> = {
+      '1080p60': '1080p60',
+      '1080p30': '1080p30',
+      '1080p': '1080p30',
+      '720p30': '720p30',
+      '720p': '720p30',
+      '480p30': '480p30',
+      '480p': '480p30',
+    };
+
+    const resolved = profileMap[normalized];
+    if (!resolved) {
+      appendStudioLog(`Lumina requested unsupported profile '${candidate}'. Using the current Aether profile instead.`, 'warning');
+      return null;
+    }
+
+    return resolved;
+  }, [appendStudioLog]);
+
+  const resolveLuminaDestinations = React.useCallback((payload?: Record<string, unknown>): StreamDestination[] => {
+    const enabledDestinations = streaming.destinations.filter((destination) => destination.enabled);
+    if (!payload) {
+      return enabledDestinations;
+    }
+
+    const requestedIds = Array.isArray(payload.destinationIds)
+      ? payload.destinationIds.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    const requestedNames = Array.isArray(payload.destinationNames)
+      ? payload.destinationNames.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    const requestedDestination = typeof payload.destination === 'string' && payload.destination.trim().length > 0
+      ? payload.destination.trim()
+      : null;
+
+    if (!requestedIds.length && !requestedNames.length && !requestedDestination) {
+      return enabledDestinations;
+    }
+
+    const requestedIdSet = new Set(requestedIds.map((value) => value.toLowerCase()));
+    const requestedNameSet = new Set(requestedNames.map((value) => value.toLowerCase()));
+    if (requestedDestination) {
+      requestedIdSet.add(requestedDestination.toLowerCase());
+      requestedNameSet.add(requestedDestination.toLowerCase());
+    }
+
+    const matches = streaming.destinations.filter((destination) =>
+      requestedIdSet.has(destination.id.toLowerCase()) ||
+      requestedNameSet.has(destination.name.trim().toLowerCase()),
+    );
+
+    if (!matches.length) {
+      appendStudioLog('Lumina requested destinations that do not match any saved Aether destinations.', 'warning');
+      return [];
+    }
+
+    const deduped = new Map<string, StreamDestination>();
+    for (const destination of matches) {
+      deduped.set(destination.id, {
+        ...destination,
+        enabled: true,
+      });
+    }
+
+    return Array.from(deduped.values());
+  }, [appendStudioLog, streaming.destinations]);
+
+  const applyLuminaScenePreference = React.useCallback((payload?: Record<string, unknown>) => {
+    if (!payload) return;
+
+    const requestedScene = [
+      payload.sceneName,
+      payload.target,
+      payload.scene,
+      payload.name,
+    ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+    if (requestedScene) {
+      const requestedLower = requestedScene.trim().toLowerCase();
+      const matchingScene = studio.scenes.find((scene) => scene.name.trim().toLowerCase() === requestedLower);
+      if (matchingScene) {
+        studio.setActiveScene(matchingScene);
+        appendStudioLog(`Lumina prepared scene '${matchingScene.name}' before going live.`, 'info');
+        return;
+      }
+
+      const matchingPreset = studio.scenePresets.find((preset) => preset.name.trim().toLowerCase() === requestedLower);
+      if (matchingPreset) {
+        studio.loadScenePreset(matchingPreset.id);
+        appendStudioLog(`Lumina loaded preset '${matchingPreset.name}' before going live.`, 'info');
+        return;
+      }
+    }
+
+    const requestedTheme = [
+      payload.themeName,
+      payload.theme,
+    ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+    if (requestedTheme) {
+      studio.setActiveTheme(requestedTheme);
+      appendStudioLog(`Lumina applied theme '${requestedTheme}' before going live.`, 'info');
+      return;
+    }
+
+    if (requestedScene) {
+      appendStudioLog(`Lumina requested '${requestedScene}' but no saved scene or preset matched.`, 'warning');
+    }
+  }, [
+    appendStudioLog,
+    studio.loadScenePreset,
+    studio.scenePresets,
+    studio.scenes,
+    studio.setActiveScene,
+    studio.setActiveTheme,
+  ]);
+
+  const stopConfiguredStreaming = React.useCallback(async (origin: 'Operator' | 'Lumina') => {
+    if (nativeEngine.isStreaming) {
+      await nativeEngine.stopStream();
+      studio.setIsStreaming(false);
+      appendStudioLog(`${origin} stopped the live stream.`, 'info');
+      if (origin === 'Lumina') {
+        notify('Lumina stopped the live stream.', 'info');
+      }
+      return true;
+    }
+
+    if (studio.isStreaming) {
+      streaming.stopStreaming();
+      studio.setIsStreaming(false);
+      appendStudioLog(`${origin} stopped the browser live stream.`, 'info');
+      if (origin === 'Lumina') {
+        notify('Lumina stopped the live stream.', 'info');
+      }
+      return true;
+    }
+
+    appendStudioLog(`${origin} requested stop, but nothing is live right now.`, 'warning');
+    return false;
+  }, [appendStudioLog, nativeEngine, notify, streaming, studio]);
+
+  const startConfiguredStreaming = React.useCallback(async ({
+    origin,
+    payload,
+  }: {
+    origin: 'Operator' | 'Lumina';
+    payload?: Record<string, unknown>;
+  }) => {
+    if (nativeEngine.isStreaming || studio.isStreaming) {
+      appendStudioLog(`${origin} requested start, but the stream is already live.`, 'warning');
+      return true;
+    }
+
+    if (payload) {
+      applyLuminaScenePreference(payload);
+    }
+
+    const requestedProfile = resolveLuminaProfile(payload) || streaming.encodingProfile;
+    const activeDestinations = resolveLuminaDestinations(payload);
+
+    if (!activeDestinations.length) {
+      appendStudioLog(`${origin} could not start streaming because no saved destinations were selected.`, 'warning');
+      if (origin === 'Operator') {
+        studio.setShowStreamSettings(true);
+      } else {
+        notify('Lumina start ignored: no matching Aether destinations were found.', 'warning');
+      }
+      return false;
+    }
+
+    const incompleteDestination = activeDestinations.find((destination) =>
+      !(destination.rtmpUrl || destination.url) || !destination.streamKey?.trim(),
+    );
+    if (incompleteDestination) {
+      appendStudioLog(`${origin} could not start streaming because '${incompleteDestination.name}' is missing a URL or stream key.`, 'warning');
+      if (origin === 'Operator') {
+        studio.setShowStreamSettings(true);
+      } else {
+        notify(`Lumina start ignored: '${incompleteDestination.name}' is not fully configured in Aether.`, 'warning');
+      }
+      return false;
+    }
+
+    if (nativeEngine.isAvailable) {
+      const captureSurface = programViewRef.current?.getNativeCaptureSurface();
+      if (!captureSurface?.canvas) {
+        appendStudioLog(`${origin} could not start streaming because the program output is not ready.`, 'warning');
+        notify('Program output is not ready yet. Wait for the preview to initialize and retry.', 'warning');
+        return false;
+      }
+
+      const micChannels = studio.audioChannels.filter((channel) => /^Mic/i.test(channel.name));
+      const systemChannel = studio.audioChannels.find((channel) => channel.name === 'System');
+
+      try {
+        const message = await nativeEngine.startStream(captureSurface, activeDestinations, {
+          encodingProfile: requestedProfile,
+          audioMode: 'auto',
+          includeMicrophone: micChannels.some((channel) => !channel.muted && channel.volume > 0),
+          includeSystemAudio: systemChannel ? !systemChannel.muted && systemChannel.volume > 0 : true,
+          audioBuses: nativeAudioBuses,
+          nativeVideoSources,
+          sourceFeeds: nativeSourceFeeds.getCaptureSources,
+        });
+
+        studio.setIsStreaming(true);
+        appendStudioLog(`${origin} started the live stream (${requestedProfile}, ${activeDestinations.length} destination${activeDestinations.length === 1 ? '' : 's'}).`, 'success');
+        notify(origin === 'Lumina' ? 'Lumina started the live stream.' : `GPU Stream: ${message}`, 'success');
+        return true;
+      } catch (error: any) {
+        const message = error?.message || String(error);
+        appendStudioLog(`${origin} failed to start the live stream: ${message}`, 'error');
+        notify(`GPU stream failed: ${message}. Check FFmpeg and retry.`, 'error');
+        return false;
+      }
+    }
+
+    if (origin === 'Lumina') {
+      appendStudioLog('Lumina start requests are desktop-only. Browser mode ignored the command.', 'warning');
+      notify('Lumina live control is available only in the desktop app.', 'warning');
+      return false;
+    }
+
+    streaming.startStreaming(() => studio.setShowStreamSettings(true));
+    appendStudioLog(`Operator started browser streaming (${requestedProfile}).`, 'info');
+    return true;
+  }, [
+    appendStudioLog,
+    applyLuminaScenePreference,
+    nativeAudioBuses,
+    nativeEngine,
+    nativeSourceFeeds,
+    nativeVideoSources,
+    notify,
+    resolveLuminaDestinations,
+    resolveLuminaProfile,
+    streaming,
+    studio,
+  ]);
+
+  const handleLuminaStreamRequest = React.useCallback((request: LuminaStreamRequest) => {
+    const payload = request.payload || {};
+
+    if (!window.__TAURI_INTERNALS__) {
+      appendStudioLog('Lumina stream control is available only in the desktop app. Browser mode ignored the request.', 'warning');
+      return;
+    }
+
+    const action = [
+      payload.action,
+      payload.command,
+      payload.state,
+    ].find((value): value is string => typeof value === 'string' && value.trim().length > 0);
+
+    if (!action) {
+      appendStudioLog('Lumina stream request arrived without an action.', 'warning');
+      return;
+    }
+
+    const normalizedAction = action.trim().toLowerCase();
+    appendStudioLog(`Lumina stream request: ${normalizedAction}`, 'info');
+
+    if (normalizedAction === 'start') {
+      void startConfiguredStreaming({ origin: 'Lumina', payload });
+      return;
+    }
+
+    if (normalizedAction === 'stop') {
+      void stopConfiguredStreaming('Lumina');
+      return;
+    }
+
+    if (normalizedAction === 'toggle') {
+      if (nativeEngine.isStreaming || studio.isStreaming) {
+        void stopConfiguredStreaming('Lumina');
+      } else {
+        void startConfiguredStreaming({ origin: 'Lumina', payload });
+      }
+      return;
+    }
+
+    appendStudioLog(`Lumina requested unsupported stream action '${action}'.`, 'warning');
+  }, [appendStudioLog, nativeEngine.isStreaming, startConfiguredStreaming, stopConfiguredStreaming, studio.isStreaming]);
+
+  luminaStreamRequestHandlerRef.current = handleLuminaStreamRequest;
+
   const handleMenuAction = (action: string) => {
     const [, item] = action.split(':');
     switch (item) {
@@ -328,8 +649,7 @@ function StudioView() {
       case 'Exit': webrtc.stopCamera(); window.close(); break;
       case 'Start Streaming': studio.setShowStreamSettings(true); break;
       case 'Stop Streaming':
-        if (nativeEngine.isStreaming) nativeEngine.stopStream();
-        else streaming.stopStreaming();
+        void stopConfiguredStreaming('Operator');
         break;
       case 'Stream Settings': studio.setShowStreamSettings(true); break;
       case 'Output Quality': setShowOutputQuality(true); break;
@@ -494,12 +814,12 @@ function StudioView() {
             isRecording={streaming.isRecording}
             onToggleStreaming={() => {
               if (studio.isStreaming || nativeEngine.isStreaming) {
-                // Stop whichever is active
-                if (nativeEngine.isStreaming) nativeEngine.stopStream();
-                else streaming.stopStreaming();
-                studio.setIsStreaming(false);
+                void stopConfiguredStreaming('Operator');
+                return;
               } else {
                 // Start — prefer GPU path if available
+                void startConfiguredStreaming({ origin: 'Operator' });
+                return;
                 const activeDestinations = streaming.destinations.filter(d => d.enabled);
                 if (activeDestinations.length === 0 || !activeDestinations.every(d => d.streamKey)) {
                   studio.setShowStreamSettings(true);
@@ -726,7 +1046,9 @@ function StudioView() {
             destinations={streaming.destinations}
             setDestinations={streaming.setDestinations}
             onClose={() => studio.setShowStreamSettings(false)}
-            onStart={() => streaming.startStreaming(() => {})}
+            onStart={() => {
+              void startConfiguredStreaming({ origin: 'Operator' });
+            }}
           />
         )}
 

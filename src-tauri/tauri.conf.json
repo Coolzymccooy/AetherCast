@@ -1,6 +1,6 @@
 {
   "productName": "Selton Studio",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "identifier": "com.selton.studio",
   "build": {
     "beforeDevCommand": "npm run dev",

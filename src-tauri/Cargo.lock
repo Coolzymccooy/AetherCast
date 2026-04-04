@@ -2843,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "selton-studio"
-version = "1.0.12"
+version = "1.0.13"
 dependencies = [
  "base64 0.22.1",
  "bytes",

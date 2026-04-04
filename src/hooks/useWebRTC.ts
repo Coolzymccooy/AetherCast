@@ -25,6 +25,12 @@ interface UseWebRTCOptions {
   setSources: React.Dispatch<React.SetStateAction<Source[]>>;
   onError?: (message: string) => void;
   onPhoneConnected?: (role: string) => void;
+  onLuminaStreamRequest?: (request: {
+    event: string;
+    payload: Record<string, unknown>;
+    workspaceId?: string;
+    sessionId?: string;
+  }) => void;
 }
 
 export function useWebRTC({
@@ -40,6 +46,7 @@ export function useWebRTC({
   setSources,
   onError,
   onPhoneConnected,
+  onLuminaStreamRequest,
 }: UseWebRTCOptions) {
   const roomId = ROOM_ID;
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
@@ -70,6 +77,8 @@ export function useWebRTC({
   onErrorRef.current = onError;
   const onPhoneConnectedRef = useRef(onPhoneConnected);
   onPhoneConnectedRef.current = onPhoneConnected;
+  const onLuminaStreamRequestRef = useRef(onLuminaStreamRequest);
+  onLuminaStreamRequestRef.current = onLuminaStreamRequest;
   const scenesRef = useRef(scenes);
   scenesRef.current = scenes;
   const scenePresetsRef = useRef(scenePresets);
@@ -431,6 +440,17 @@ export function useWebRTC({
           ? payload.contentMode
           : 'sync';
       appendServerLog(`Lumina state sync received (${mode})`, 'info');
+      return;
+    }
+
+    if (eventName === 'lumina.stream.request') {
+      appendServerLog('Lumina stream control request received', 'info');
+      onLuminaStreamRequestRef.current?.({
+        event: eventName,
+        payload,
+        workspaceId: msg.workspaceId,
+        sessionId: msg.sessionId,
+      });
       return;
     }
 
