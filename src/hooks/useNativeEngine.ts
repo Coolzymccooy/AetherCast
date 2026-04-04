@@ -54,6 +54,7 @@ interface NativeArchiveStatus {
   state: NativeHealthState;
   path_pattern?: string | null;
   segment_seconds: number;
+  restart_count: number;
   last_error?: string | null;
   last_update_ms: number;
 }
@@ -63,6 +64,31 @@ interface NativeAudioInput {
   alternative_name?: string | null;
   kind: NativeAudioKind;
   backend: string;
+}
+
+export interface NativeAudioBusConfig {
+  busId: string;
+  name: string;
+  sourceKind: NativeAudioKind | 'media' | 'unknown';
+  volume: number;
+  muted: boolean;
+  delayMs: number;
+  monitorEnabled: boolean;
+}
+
+interface NativeAudioBusStatus {
+  bus_id: string;
+  name: string;
+  source_kind: NativeAudioKind;
+  input_name?: string | null;
+  volume: number;
+  muted: boolean;
+  delay_ms: number;
+  monitor_enabled: boolean;
+  state: NativeHealthState;
+  last_error?: string | null;
+  last_event?: string | null;
+  last_update_ms: number;
 }
 
 interface NativeAudioStatus {
@@ -75,6 +101,7 @@ interface NativeAudioStatus {
   bitrate_kbps: number;
   source_summary: string;
   inputs: NativeAudioInput[];
+  buses: NativeAudioBusStatus[];
   using_synthetic: boolean;
   last_error?: string | null;
   last_event?: string | null;
@@ -138,6 +165,7 @@ interface NativeStreamStats {
   bytes_written: number;
   write_failures: number;
   keepalive_frames: number;
+  watchdog_renders: number;
   archive_path_pattern?: string | null;
   archive_segment_seconds: number;
   last_restart_delay_ms: number;
@@ -184,6 +212,7 @@ interface GPUStreamStats {
   restarting: boolean;
   restartCount: number;
   keepaliveFrames: number;
+  watchdogRenders: number;
   bitrateKbps: number;
   width: number;
   height: number;
@@ -199,6 +228,11 @@ interface GPUStreamStats {
   audioStatus: NativeAudioStatus | null;
   outputStatuses: NativeOutputStatus[];
   archiveStatus: NativeArchiveStatus | null;
+}
+
+interface NativeDiagnosticsSnapshot {
+  capturedAt: number;
+  stats: NativeStreamStats;
 }
 
 type NativeCaptureProfile = {
@@ -351,6 +385,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     restarting: false,
     restartCount: 0,
     keepaliveFrames: 0,
+    watchdogRenders: 0,
     bitrateKbps: 0,
     width: 0,
     height: 0,
@@ -372,6 +407,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
   const frameLoopRef = useRef<number | null>(null);
   const statsPollRef = useRef<number | null>(null);
+  const diagnosticsHistoryRef = useRef<NativeDiagnosticsSnapshot[]>([]);
   const lastFrameTimeRef = useRef(0);
   const frameCountRef = useRef(0);
   const droppedRef = useRef(0);
@@ -610,6 +646,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       restarting: native.restarting,
       restartCount: native.restart_count,
       keepaliveFrames: native.keepalive_frames,
+      watchdogRenders: native.watchdog_renders,
       bitrateKbps: native.bitrate_kbps,
       width: native.width,
       height: native.height,
@@ -668,6 +705,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           bitrate_kbps: 160,
           source_summary: 'No native audio input',
           inputs: [],
+          buses: [],
           using_synthetic: false,
           last_error: null,
           last_event: null,
@@ -700,12 +738,20 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           state: 'inactive',
           path_pattern: null,
           segment_seconds: 0,
+          restart_count: 0,
           last_error: null,
           last_update_ms: 0,
         },
         ...parsed,
       } as NativeStreamStats;
       const previous = lastNativeStateRef.current;
+      diagnosticsHistoryRef.current.push({
+        capturedAt: Date.now(),
+        stats: native,
+      });
+      if (diagnosticsHistoryRef.current.length > 7200) {
+        diagnosticsHistoryRef.current.splice(0, diagnosticsHistoryRef.current.length - 7200);
+      }
 
       if (native.restarting && !previous?.restarting) {
         addServerLog(
@@ -1311,6 +1357,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       audioDevice?: string;
       includeMicrophone?: boolean;
       includeSystemAudio?: boolean;
+      audioBuses?: NativeAudioBusConfig[];
       nativeVideoSources?: NativeVideoSourceConfig[];
       sourceFeeds?: () => NativeSceneCaptureSource[];
     },
@@ -1381,6 +1428,15 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           audio_bitrate: 160,
           include_microphone: startOptions?.includeMicrophone ?? true,
           include_system_audio: startOptions?.includeSystemAudio ?? true,
+          audio_buses: (startOptions?.audioBuses || []).map((bus) => ({
+            busId: bus.busId,
+            name: bus.name,
+            sourceKind: bus.sourceKind,
+            volume: bus.volume,
+            muted: bus.muted,
+            delayMs: bus.delayMs,
+            monitorEnabled: bus.monitorEnabled,
+          })),
           native_video_sources: nativeVideoSources.map((source) => ({
             sourceId: source.sourceId,
             deviceName: source.deviceName,
@@ -1431,6 +1487,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       droppedRef.current = 0;
       lastFrameTimeRef.current = 0;
       lastNativeStateRef.current = null;
+      diagnosticsHistoryRef.current = [];
       setIsStreaming(true);
       if (latestSourceInventoryRef.current.length > 0) {
         await syncSourceInventory(latestSourceInventoryRef.current);
@@ -1470,6 +1527,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       sourceCaptureFailureKeysRef.current.clear();
       frameModeRef.current = 'raw';
       isStreamingRef.current = false;
+      diagnosticsHistoryRef.current = [];
       setIsStreaming(false);
       throw err;
     }
@@ -1509,6 +1567,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     sourceCaptureFailureKeysRef.current.clear();
     frameModeRef.current = 'raw';
     sourceScaleCanvasesRef.current.clear();
+    diagnosticsHistoryRef.current = [];
 
     if (!window.__TAURI_INTERNALS__ || !invokeRef.current) {
       setIsStreaming(false);
@@ -1552,6 +1611,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastOwnedSourceIdsKeyRef.current = '';
       sourceCaptureFailureKeysRef.current.clear();
       sourceScaleCanvasesRef.current.clear();
+      diagnosticsHistoryRef.current = [];
       if (frameLoopRef.current !== null) {
         cancelAnimationFrame(frameLoopRef.current);
       }
@@ -1559,6 +1619,25 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   }, [closeAllSourceBridgeSockets, closeBridgeSocket, stopStatsPolling]);
 
   const isAvailable = !!window.__TAURI_INTERNALS__;
+
+  const exportDiagnostics = useCallback(() => {
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      encoderInfo,
+      audioInfo,
+      latest: lastNativeStateRef.current,
+      history: diagnosticsHistoryRef.current,
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `aether-native-diagnostics-${Date.now()}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    return payload;
+  }, [audioInfo, encoderInfo]);
 
   return {
     isAvailable,
@@ -1570,6 +1649,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     syncSourceInventory,
     startStream,
     stopStream,
+    exportDiagnostics,
     // Transitional aliases while the app migrates off the old hook name.
     startGPUStream: startStream,
     stopGPUStream: stopStream,

@@ -19,7 +19,7 @@ import { useMediaPlayer } from './hooks/useMediaPlayer';
 import { useReplay } from './hooks/useReplay';
 import { useProject } from './hooks/useProject';
 import { useMIDI } from './hooks/useMIDI';
-import { useNativeEngine } from './hooks/useNativeEngine';
+import { useNativeEngine, type NativeAudioBusConfig } from './hooks/useNativeEngine';
 import { useNativeSourceFeeds } from './hooks/useNativeSourceFeeds';
 import { useBrowserSourceRuntime } from './hooks/useBrowserSourceRuntime';
 import { buildNativeSceneSnapshot, buildNativeSourceInventory } from './lib/sceneSchema';
@@ -65,6 +65,7 @@ import MobileHome from './components/MobileHome';
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
+    __AETHER_EXPORT_NATIVE_DIAGNOSTICS__?: (() => unknown) | undefined;
   }
 }
 
@@ -229,6 +230,24 @@ function StudioView() {
     mediaElement: mediaPlayer.playbackState.currentItem ? mediaPlayer.getVideoElement() : null,
     browserElement: browserSourceRuntime.isCapturable ? browserSourceRuntime.captureElement : null,
   });
+  const nativeAudioBuses = React.useMemo<NativeAudioBusConfig[]>(() => {
+    return studio.audioChannels.map((channel) => ({
+      busId: channel.name.toLowerCase().replace(/\s+/g, '-'),
+      name: channel.name,
+      sourceKind:
+        /^Mic/i.test(channel.name)
+          ? 'microphone'
+          : channel.name === 'System'
+            ? 'system'
+            : channel.name === 'Media'
+              ? 'media'
+              : 'unknown',
+      volume: channel.volume,
+      muted: channel.muted,
+      delayMs: channel.delayMs || 0,
+      monitorEnabled: !!channel.monitorEnabled,
+    }));
+  }, [studio.audioChannels]);
 
   useEffect(() => {
     localStorage.setItem('aether_browser_source_url', browserSourceUrl);
@@ -397,6 +416,18 @@ function StudioView() {
     nativeOwnedSourceIdsKey,
   ]);
 
+  useEffect(() => {
+    if (!nativeEngine.isAvailable) {
+      window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__ = undefined;
+      return;
+    }
+
+    window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__ = nativeEngine.exportDiagnostics;
+    return () => {
+      window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__ = undefined;
+    };
+  }, [nativeEngine.exportDiagnostics, nativeEngine.isAvailable]);
+
   // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-bg text-gray-300 overflow-hidden select-none font-sans">
@@ -483,6 +514,7 @@ function StudioView() {
                       audioMode: 'auto',
                       includeMicrophone: micChannels.some((channel) => !channel.muted && channel.volume > 0),
                       includeSystemAudio: systemChannel ? !systemChannel.muted && systemChannel.volume > 0 : true,
+                      audioBuses: nativeAudioBuses,
                       nativeVideoSources,
                       sourceFeeds: nativeSourceFeeds.getCaptureSources,
                     }).then((msg) => {

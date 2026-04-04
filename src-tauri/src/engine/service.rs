@@ -35,7 +35,8 @@ use super::state::{
 use super::telemetry::{build_archive_status, now_ms, set_archive_state};
 use super::video::{current_video_status, render_native_scene_rgba};
 
-const DEFAULT_MAX_RESTARTS: u32 = 12;
+const DEFAULT_MAX_RESTARTS: u32 = 48;
+const DEFAULT_OUTPUT_MAX_RESTARTS: u32 = 120;
 #[allow(dead_code)]
 const RESTART_RESET_AFTER_MS: u64 = 180_000;
 
@@ -43,6 +44,7 @@ struct OutputWorkerSink {
     session_id: u64,
     kind: OutputWorkerKind,
     recovery_delay_ms: u64,
+    spawned_at_ms: u64,
     child: Arc<Mutex<Child>>,
     stdin: std::process::ChildStdin,
 }
@@ -124,6 +126,19 @@ fn restart_delay_ms(restart_count: u32) -> u64 {
         4 => 8_000,
         _ => 15_000,
     }
+}
+
+fn worker_recovery_delay_ms(base_delay_ms: u64, restart_count: u32) -> u64 {
+    let multiplier = match restart_count {
+        0 | 1 => 1,
+        2 | 3 => 2,
+        4..=7 => 4,
+        8..=15 => 8,
+        _ => 16,
+    };
+    base_delay_ms
+        .saturating_mul(multiplier)
+        .clamp(base_delay_ms.max(1), 60_000)
 }
 
 fn stop_frame_bridge() {
@@ -1050,6 +1065,7 @@ fn spawn_output_worker(context: WorkerLaunchContext) -> Result<(), String> {
                 session_id: context.session_id,
                 kind: context.worker.kind.clone(),
                 recovery_delay_ms: context.worker.recovery_delay_ms,
+                spawned_at_ms: now_ms(),
                 child: child_handle.clone(),
                 stdin: stdin_handle,
             },
@@ -1149,27 +1165,32 @@ fn spawn_output_worker_monitor(
             }
         };
 
-        {
+        let worker_started_at_ms = {
+            let mut started_at_ms = 0;
             if let Ok(mut sinks) = output_worker_sinks().lock() {
                 if let Some(sink) = sinks.get(&context.worker.worker_id) {
                     if sink.session_id == context.session_id {
+                        started_at_ms = sink.spawned_at_ms;
                         sinks.remove(&context.worker.worker_id);
                     }
                 }
             }
-        }
+            started_at_ms
+        };
 
         let remaining_workers = output_worker_sinks()
             .lock()
             .map(|sinks| sinks.len())
             .unwrap_or(0);
         let mut should_restart = false;
+        let mut restart_delay_ms = context.worker.recovery_delay_ms;
         {
             let mut state = match stream_runtime().lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
             };
             state.active = remaining_workers > 0;
+            let exit_at_ms = now_ms();
             state.last_exit_status = Some(format!("{}: {}", context.worker.worker_id, status_text));
             state.last_error = Some(last_error_line.clone().unwrap_or_else(|| {
                 format!(
@@ -1177,12 +1198,42 @@ fn spawn_output_worker_monitor(
                     context.worker.worker_id, status_text
                 )
             }));
+            let worker_runtime_ms = if worker_started_at_ms > 0 {
+                exit_at_ms.saturating_sub(worker_started_at_ms)
+            } else {
+                0
+            };
 
-            if state.desired_active && state.restart_count < state.max_restarts {
+            let worker_restart_count = match context.worker.kind {
+                OutputWorkerKind::Destination => {
+                    if let Some(output) = state
+                        .output_statuses
+                        .iter_mut()
+                        .find(|output| output.worker_id == context.worker.worker_id)
+                    {
+                        if worker_runtime_ms >= RESTART_RESET_AFTER_MS {
+                            output.restart_count = 0;
+                        }
+                        output.restart_count
+                    } else {
+                        0
+                    }
+                }
+                OutputWorkerKind::Archive => {
+                    if worker_runtime_ms >= RESTART_RESET_AFTER_MS {
+                        state.archive_status.restart_count = 0;
+                    }
+                    state.archive_status.restart_count
+                }
+            };
+
+            if state.desired_active && worker_restart_count < DEFAULT_OUTPUT_MAX_RESTARTS {
                 state.restart_count += 1;
                 state.restarting = true;
-                state.last_restart_at_ms = now_ms();
-                state.last_restart_delay_ms = context.worker.recovery_delay_ms;
+                state.last_restart_at_ms = exit_at_ms;
+                restart_delay_ms =
+                    worker_recovery_delay_ms(context.worker.recovery_delay_ms, worker_restart_count);
+                state.last_restart_delay_ms = restart_delay_ms;
                 should_restart = true;
                 let last_error = state.last_error.clone();
                 set_audio_state(
@@ -1190,8 +1241,8 @@ fn spawn_output_worker_monitor(
                     EngineHealthState::Recovering,
                     last_error.clone(),
                     Some(format!(
-                        "Restarting audio with worker {}",
-                        context.worker.worker_id
+                        "Restarting worker {} after {}ms",
+                        context.worker.worker_id, restart_delay_ms
                     )),
                 );
                 match context.worker.kind {
@@ -1259,9 +1310,7 @@ fn spawn_output_worker_monitor(
         }
 
         if should_restart {
-            std::thread::sleep(Duration::from_millis(
-                context.worker.recovery_delay_ms.max(1),
-            ));
+            std::thread::sleep(Duration::from_millis(restart_delay_ms.max(1)));
             let _ = spawn_output_worker(context);
         }
     });
@@ -1299,7 +1348,7 @@ fn stop_output_workers() {
 
 fn start_keepalive_loop(session_id: u64) {
     std::thread::spawn(move || loop {
-        let (should_run, current_session_id, fps, last_frame, last_frame_at_ms) = {
+        let (should_run, current_session_id, mode, width, height, fps, last_frame, last_frame_at_ms) = {
             let state = match stream_runtime().lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
@@ -1307,6 +1356,13 @@ fn start_keepalive_loop(session_id: u64) {
             (
                 state.desired_active,
                 state.session_id,
+                state
+                    .config
+                    .as_ref()
+                    .map(|cfg| cfg.mode.clone())
+                    .unwrap_or_else(|| "raw".into()),
+                state.config.as_ref().map(|cfg| cfg.width).unwrap_or(1280),
+                state.config.as_ref().map(|cfg| cfg.height).unwrap_or(720),
                 state.config.as_ref().map(|cfg| cfg.fps).unwrap_or(30),
                 state.last_frame.clone(),
                 state.last_frame_at_ms,
@@ -1319,11 +1375,35 @@ fn start_keepalive_loop(session_id: u64) {
 
         let frame_interval_ms = u64::from(1000 / fps.max(1));
         let now = now_ms();
-        let should_duplicate = last_frame.is_some()
-            && now.saturating_sub(last_frame_at_ms) >= frame_interval_ms.saturating_mul(2);
+        let frame_age_ms = now.saturating_sub(last_frame_at_ms);
+        let should_duplicate = last_frame.is_some() && frame_age_ms >= frame_interval_ms.saturating_mul(2);
+        let should_render_natively =
+            mode == "native-scene" && frame_age_ms >= frame_interval_ms.saturating_mul(4);
 
-        if should_duplicate {
-            let bytes = last_frame.unwrap_or_default();
+        if should_duplicate || should_render_natively {
+            let keepalive_frame = if should_render_natively {
+                match render_native_scene_rgba(width, height) {
+                    Ok(frame) => Some((frame, true)),
+                    Err(err) => {
+                        if let Ok(mut state) = stream_runtime().lock() {
+                            if state.session_id != session_id {
+                                return;
+                            }
+                            state.last_error =
+                                Some(format!("Watchdog native scene render failed: {}", err));
+                        }
+                        last_frame.map(|frame| (frame, false))
+                    }
+                }
+            } else {
+                last_frame.map(|frame| (frame, false))
+            };
+
+            let Some((bytes, rendered_natively)) = keepalive_frame else {
+                std::thread::sleep(Duration::from_millis(frame_interval_ms.max(16)));
+                continue;
+            };
+
             match write_bytes_to_workers(&bytes) {
                 Ok(()) => {
                     if let Ok(mut state) = stream_runtime().lock() {
@@ -1331,6 +1411,11 @@ fn start_keepalive_loop(session_id: u64) {
                             return;
                         }
                         state.keepalive_frames += 1;
+                        state.last_frame_at_ms = now_ms();
+                        state.last_frame = Some(bytes);
+                        if rendered_natively {
+                            state.watchdog_renders += 1;
+                        }
                     }
                 }
                 Err(_) => {
@@ -1682,6 +1767,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         state.bytes_written = 0;
         state.write_failures = 0;
         state.keepalive_frames = 0;
+        state.watchdog_renders = 0;
         state.last_frame = None;
         state.audio_status = audio_status;
         state.output_statuses = output_statuses;
@@ -1939,6 +2025,7 @@ pub async fn get_stream_stats() -> Result<String, String> {
         bytes_written: state.bytes_written,
         write_failures: state.write_failures,
         keepalive_frames: state.keepalive_frames,
+        watchdog_renders: state.watchdog_renders,
         archive_path_pattern: state.archive_path_pattern,
         archive_segment_seconds: if state.archive_status.segment_seconds > 0 {
             state.archive_status.segment_seconds

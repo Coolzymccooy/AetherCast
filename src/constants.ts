@@ -19,10 +19,10 @@ export const SOURCES: Source[] = [
 ];
 
 export const AUDIO_CHANNELS: AudioChannel[] = [
-  { name: 'Mic 1', level: 0, volume: 0.6, peak: 0, muted: false },
-  { name: 'Mic 2', level: 0, volume: 0.2, peak: 0, muted: true },
-  { name: 'System', level: 0, volume: 0.4, peak: 0, muted: false },
-  { name: 'Media', level: 0, volume: 0.0, peak: 0, muted: false },
+  { name: 'Mic 1', level: 0, volume: 0.6, peak: 0, muted: false, delayMs: 0, monitorEnabled: false },
+  { name: 'Mic 2', level: 0, volume: 0.2, peak: 0, muted: true, delayMs: 0, monitorEnabled: false },
+  { name: 'System', level: 0, volume: 0.4, peak: 0, muted: false, delayMs: 0, monitorEnabled: false },
+  { name: 'Media', level: 0, volume: 0.0, peak: 0, muted: false, delayMs: 0, monitorEnabled: false },
 ];
 
 export const SAMPLE_SCRIPT: Script = {

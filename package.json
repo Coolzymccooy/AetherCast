@@ -1,7 +1,7 @@
 {
   "name": "aether-studio",
   "private": true,
-  "version": "1.0.9",
+  "version": "1.0.10",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -19,7 +19,8 @@
     "mobile:init": "npx cap add android",
     "mobile:sync": "npm run build && npx cap sync android",
     "mobile:open": "npx cap open android",
-    "mobile:build": "npm run build && npx cap sync android && npx cap build android"
+    "mobile:build": "npm run build && npx cap sync android && npx cap build android",
+    "diagnostics:check": "node scripts/analyze-native-diagnostics.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.3.0",

@@ -101,6 +101,8 @@ export type AudioChannel = {
   volume: number;
   peak: number;
   muted: boolean;
+  delayMs?: number;
+  monitorEnabled?: boolean;
 };
 
 export type ScenePreset = {

@@ -18,6 +18,7 @@ pub fn build_archive_status(
         state,
         path_pattern,
         segment_seconds,
+        restart_count: 0,
         last_error: None,
         last_update_ms: now_ms(),
     }
@@ -28,7 +29,10 @@ pub fn set_archive_state(
     next: EngineHealthState,
     error: Option<String>,
 ) {
-    archive.state = next;
+    archive.state = next.clone();
     archive.last_error = error;
     archive.last_update_ms = now_ms();
+    if next == EngineHealthState::Recovering {
+        archive.restart_count += 1;
+    }
 }

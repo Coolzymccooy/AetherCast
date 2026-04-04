@@ -45,6 +45,9 @@ fn default_audio_channels() -> u32 {
 fn default_audio_bitrate() -> u32 {
     160
 }
+fn default_audio_bus_volume() -> f32 {
+    1.0
+}
 fn default_native_source_width() -> u32 {
     1280
 }
@@ -72,6 +75,24 @@ pub struct NativeVideoSourceConfig {
     pub height: u32,
     #[serde(default = "default_native_source_fps")]
     pub fps: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct NativeAudioBusConfig {
+    #[serde(alias = "busId")]
+    pub bus_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, alias = "sourceKind")]
+    pub source_kind: String,
+    #[serde(default = "default_audio_bus_volume")]
+    pub volume: f32,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default, alias = "delayMs")]
+    pub delay_ms: u32,
+    #[serde(default, alias = "monitorEnabled")]
+    pub monitor_enabled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -103,6 +124,8 @@ pub struct GPUStreamConfig {
     pub include_microphone: bool,
     #[serde(default = "default_true", alias = "includeSystemAudio")]
     pub include_system_audio: bool,
+    #[serde(default, alias = "audioBuses")]
+    pub audio_buses: Vec<NativeAudioBusConfig>,
     #[serde(default, alias = "nativeVideoSources")]
     pub native_video_sources: Vec<NativeVideoSourceConfig>,
 }
@@ -151,6 +174,22 @@ pub struct NativeAudioInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeAudioBusStatus {
+    pub bus_id: String,
+    pub name: String,
+    pub source_kind: NativeAudioSourceKind,
+    pub input_name: Option<String>,
+    pub volume: f32,
+    pub muted: bool,
+    pub delay_ms: u32,
+    pub monitor_enabled: bool,
+    pub state: EngineHealthState,
+    pub last_error: Option<String>,
+    pub last_event: Option<String>,
+    pub last_update_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeAudioStatus {
     pub state: EngineHealthState,
     pub mode: String,
@@ -161,6 +200,7 @@ pub struct NativeAudioStatus {
     pub bitrate_kbps: u32,
     pub source_summary: String,
     pub inputs: Vec<NativeAudioInput>,
+    pub buses: Vec<NativeAudioBusStatus>,
     pub using_synthetic: bool,
     pub last_error: Option<String>,
     pub last_event: Option<String>,
@@ -205,6 +245,7 @@ pub struct ArchiveStatus {
     pub state: EngineHealthState,
     pub path_pattern: Option<String>,
     pub segment_seconds: u32,
+    pub restart_count: u32,
     pub last_error: Option<String>,
     pub last_update_ms: u64,
 }
@@ -233,6 +274,7 @@ pub struct NativeStreamRuntime {
     pub bytes_written: u64,
     pub write_failures: u64,
     pub keepalive_frames: u64,
+    pub watchdog_renders: u64,
     pub last_frame: Option<Vec<u8>>,
     pub audio_status: NativeAudioStatus,
     pub output_statuses: Vec<OutputStatus>,
@@ -264,6 +306,7 @@ impl Default for NativeStreamRuntime {
             bytes_written: 0,
             write_failures: 0,
             keepalive_frames: 0,
+            watchdog_renders: 0,
             last_frame: None,
             audio_status: NativeAudioStatus {
                 state: EngineHealthState::Inactive,
@@ -275,6 +318,7 @@ impl Default for NativeStreamRuntime {
                 bitrate_kbps: default_audio_bitrate(),
                 source_summary: "No native audio input".into(),
                 inputs: Vec::new(),
+                buses: Vec::new(),
                 using_synthetic: false,
                 last_error: None,
                 last_event: None,
@@ -285,6 +329,7 @@ impl Default for NativeStreamRuntime {
                 state: EngineHealthState::Inactive,
                 path_pattern: None,
                 segment_seconds: 0,
+                restart_count: 0,
                 last_error: None,
                 last_update_ms: 0,
             },
@@ -309,6 +354,7 @@ pub struct NativeStreamStats {
     pub bytes_written: u64,
     pub write_failures: u64,
     pub keepalive_frames: u64,
+    pub watchdog_renders: u64,
     pub archive_path_pattern: Option<String>,
     pub archive_segment_seconds: u32,
     pub last_restart_delay_ms: u64,

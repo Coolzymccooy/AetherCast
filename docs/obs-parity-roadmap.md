@@ -17,6 +17,7 @@ The current stack has improved materially, but it still falls short of broadcast
 - Desktop screen, remote phone feeds, and media-loop sources now feed the Rust source store as source-level frames for native-scene streaming, instead of only being sampled through a flat browser compositor output.
 - Desktop browser/WebRTC/media source sync no longer has to rely only on large Tauri invoke payloads. Native-scene desktop sessions now expose a dedicated local source bridge so browser-owned sources can feed the native source store over a native runtime transport with invoke fallback.
 - Desktop audio no longer relies only on blind synthetic fallback. Native device-backed audio planning now lives in `src-tauri/src/engine/audio.rs`, but full broadcast-mixer parity is still outstanding.
+- Desktop native audio now honors per-bus mute/volume/delay settings from the studio layer, and native diagnostics can be exported/analyzed for soak sessions.
 - The Tauri app is stronger than the browser path, but it is still a custom encoder path rather than a full native media runtime.
 
 ## Implementation Progress
@@ -54,10 +55,13 @@ The current stack has improved materially, but it still falls short of broadcast
   - app-level source acquisition for webcam/screen/WebRTC/media feeds no longer has to depend on preview-owned compositor elements; `src/hooks/useNativeSourceFeeds.ts` now materializes dedicated capture elements for desktop native-scene streaming.
   - `src/hooks/useBrowserSourceRuntime.ts` now provides a real browser-source runtime for direct image/video URLs, with app-level capture ownership and native-scene feed integration.
   - `src-tauri/src/engine/video.rs` now renders the synced scene snapshot natively from per-source RGBA inputs for the core desktop path.
+  - `src-tauri/src/engine/audio.rs` now applies native per-bus gain/mute/delay settings during desktop live sessions instead of flattening everything into one blind mix.
+  - `src/hooks/useNativeEngine.ts` now records a rolling native diagnostics history and can export a desktop diagnostics bundle for soak/fault analysis.
+  - `scripts/analyze-native-diagnostics.mjs` now validates exported native diagnostics for restart spikes, frame stalls, archive failures, and output error states.
 - Still outstanding before real OBS-class parity:
-  - native audio bus graph, monitoring, delay, and metering parity
-  - full native acquisition/runtime for WebRTC receive and real browser-source pages, not only app-level managed browser/WebRTC source feeds and direct media/image browser-source runtimes feeding the native runtime
-  - output manager split beyond inline FFmpeg session control
+  - native audio monitoring/metering parity and a fuller bus graph beyond gain/mute/delay
+  - true Rust-side native WebRTC receive, not only app-managed acquisition bridged into the native runtime
+  - real browser-page runtime/capture, not only direct media/image browser-source runtimes
   - long-lived native worker/service outside the UI process
 
 ## Recommended Direction

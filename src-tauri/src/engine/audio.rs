@@ -1,8 +1,8 @@
 use std::process::{Command, Stdio};
 
 use super::state::{
-    EngineHealthState, GPUStreamConfig, NativeAudioDiscovery, NativeAudioInput,
-    NativeAudioSourceKind, NativeAudioStatus,
+    EngineHealthState, GPUStreamConfig, NativeAudioBusConfig, NativeAudioBusStatus,
+    NativeAudioDiscovery, NativeAudioInput, NativeAudioSourceKind, NativeAudioStatus,
 };
 use super::telemetry::now_ms;
 
@@ -14,6 +14,18 @@ pub struct NativeAudioInputSpec {
     pub alternative_name: Option<String>,
     pub kind: NativeAudioSourceKind,
     pub backend: String,
+    pub bus: NativeAudioBusRuntime,
+}
+
+#[derive(Debug, Clone)]
+pub struct NativeAudioBusRuntime {
+    pub bus_id: String,
+    pub name: String,
+    pub source_kind: NativeAudioSourceKind,
+    pub volume: f32,
+    pub muted: bool,
+    pub delay_ms: u32,
+    pub monitor_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +103,10 @@ pub fn build_audio_plan(
 
     if mode == "device" && !explicit.is_empty() {
         match find_device_by_name(&devices, explicit) {
-            Some(device) => inputs.push(to_audio_input_spec(device)),
+            Some(device) => inputs.push(to_audio_input_spec(
+                device,
+                resolve_bus_runtime(config, Some(device)),
+            )),
             None => {
                 selection_note = Some(format!(
                     "Requested audio device '{}' was not found, using fallback audio mode",
@@ -109,7 +124,7 @@ pub fn build_audio_plan(
         if want_system {
             if let Some(device) = select_preferred_device(&devices, DevicePreference::System, &inputs)
             {
-                inputs.push(to_audio_input_spec(device));
+                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
             }
         }
 
@@ -117,19 +132,19 @@ pub fn build_audio_plan(
             if let Some(device) =
                 select_preferred_device(&devices, DevicePreference::Microphone, &inputs)
             {
-                inputs.push(to_audio_input_spec(device));
+                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
             }
         }
 
         if inputs.is_empty() && mode == "microphone" {
             if let Some(device) = select_preferred_device(&devices, DevicePreference::Any, &inputs) {
-                inputs.push(to_audio_input_spec(device));
+                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
             }
         }
 
         if inputs.is_empty() && matches!(mode, "system" | "auto" | "hybrid") {
             if let Some(device) = select_preferred_device(&devices, DevicePreference::Any, &inputs) {
-                inputs.push(to_audio_input_spec(device));
+                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
             }
         }
     }
@@ -161,7 +176,7 @@ pub fn build_audio_plan(
 
 pub fn build_audio_status(plan: &NativeAudioPlan, state: EngineHealthState) -> NativeAudioStatus {
     NativeAudioStatus {
-        state,
+        state: state.clone(),
         mode: plan.mode.clone(),
         backend: plan.backend.clone(),
         input_count: plan.inputs.len() as u32,
@@ -177,6 +192,28 @@ pub fn build_audio_status(plan: &NativeAudioPlan, state: EngineHealthState) -> N
                 alternative_name: input.alternative_name.clone(),
                 kind: input.kind.clone(),
                 backend: input.backend.clone(),
+            })
+            .collect(),
+        buses: plan
+            .inputs
+            .iter()
+            .map(|input| NativeAudioBusStatus {
+                bus_id: input.bus.bus_id.clone(),
+                name: input.bus.name.clone(),
+                source_kind: input.bus.source_kind.clone(),
+                input_name: Some(input.name.clone()),
+                volume: input.bus.volume,
+                muted: input.bus.muted,
+                delay_ms: input.bus.delay_ms,
+                monitor_enabled: input.bus.monitor_enabled,
+                state: state.clone(),
+                last_error: None,
+                last_event: if input.bus.monitor_enabled {
+                    Some("Monitor requested".into())
+                } else {
+                    None
+                },
+                last_update_ms: now_ms(),
             })
             .collect(),
         using_synthetic: plan.using_synthetic,
@@ -202,6 +239,7 @@ pub fn detect_audio_engine(ffmpeg_bin: &str, lavfi_enabled: bool) -> NativeAudio
         audio_bitrate: 160,
         include_microphone: true,
         include_system_audio: true,
+        audio_buses: Vec::new(),
         native_video_sources: Vec::new(),
     };
     let devices = list_audio_devices(ffmpeg_bin);
@@ -256,23 +294,20 @@ pub fn append_audio_output_args(args: &mut Vec<String>, plan: &NativeAudioPlan) 
         return;
     }
 
-    if plan.inputs.len() == 1 {
-        args.extend(["-map".into(), "1:a".into()]);
-    } else {
-        let mut filter = String::new();
-        for idx in 0..plan.inputs.len() {
-            filter.push_str(&format!("[{}:a]", idx + 1));
-        }
-        filter.push_str(&format!(
-            "amix=inputs={}:duration=longest:normalize=0,aresample=async=1:min_hard_comp=0.100:first_pts=0[a_mix]",
-            plan.inputs.len()
-        ));
+    let filter_graph = build_audio_filter_graph(plan);
+    if let Some(filter_graph) = filter_graph {
         args.extend([
             "-filter_complex".into(),
-            filter,
+            filter_graph,
             "-map".into(),
-            "[a_mix]".into(),
+            if plan.inputs.len() == 1 {
+                "[a_bus_0]".into()
+            } else {
+                "[a_mix]".into()
+            },
         ]);
+    } else if plan.inputs.len() == 1 {
+        args.extend(["-map".into(), "1:a".into()]);
     }
 
     args.extend([
@@ -286,7 +321,7 @@ pub fn append_audio_output_args(args: &mut Vec<String>, plan: &NativeAudioPlan) 
         plan.channels.to_string(),
     ]);
 
-    if plan.inputs.len() == 1 {
+    if plan.inputs.len() == 1 && build_audio_filter_graph(plan).is_none() {
         args.extend([
             "-af".into(),
             "aresample=async=1:min_hard_comp=0.100:first_pts=0".into(),
@@ -307,7 +342,7 @@ pub fn set_audio_state(
             | EngineHealthState::Active
             | EngineHealthState::Stopped
     );
-    status.state = next;
+    status.state = next.clone();
     status.last_error = error;
     if let Some(event) = event {
         status.last_event = Some(event);
@@ -315,6 +350,12 @@ pub fn set_audio_state(
         status.last_event = None;
     }
     status.last_update_ms = now_ms();
+    for bus in &mut status.buses {
+        bus.state = next.clone();
+        bus.last_error = status.last_error.clone();
+        bus.last_event = status.last_event.clone();
+        bus.last_update_ms = status.last_update_ms;
+    }
 }
 
 pub fn apply_audio_runtime_signal(line: &str, status: &mut NativeAudioStatus) {
@@ -358,7 +399,22 @@ pub fn apply_audio_runtime_signal(line: &str, status: &mut NativeAudioStatus) {
     };
 
     if let Some(next) = next {
-        set_audio_state(status, next, Some(line.to_string()), Some(line.to_string()));
+        set_audio_state(
+            status,
+            next.clone(),
+            Some(line.to_string()),
+            Some(line.to_string()),
+        );
+        for bus in &mut status.buses {
+            bus.state = next.clone();
+            bus.last_error = if matches!(next, EngineHealthState::Error) {
+                Some(line.to_string())
+            } else {
+                None
+            };
+            bus.last_event = Some(line.to_string());
+            bus.last_update_ms = now_ms();
+        }
     }
 }
 
@@ -424,6 +480,15 @@ fn fallback_silence_plan(
                 alternative_name: None,
                 kind: NativeAudioSourceKind::Synthetic,
                 backend: "lavfi".into(),
+                bus: NativeAudioBusRuntime {
+                    bus_id: "silent".into(),
+                    name: "Silent".into(),
+                    source_kind: NativeAudioSourceKind::Synthetic,
+                    volume: 0.0,
+                    muted: true,
+                    delay_ms: 0,
+                    monitor_enabled: false,
+                },
             }]
         } else {
             Vec::new()
@@ -581,13 +646,151 @@ fn score_audio_device(device: &NativeAudioInput, preference: DevicePreference) -
     base + preference_bonus + name_bonus
 }
 
-fn to_audio_input_spec(device: &NativeAudioInput) -> NativeAudioInputSpec {
+fn to_audio_input_spec(
+    device: &NativeAudioInput,
+    bus: NativeAudioBusRuntime,
+) -> NativeAudioInputSpec {
     NativeAudioInputSpec {
         name: device.name.clone(),
         alternative_name: device.alternative_name.clone(),
         kind: device.kind.clone(),
         backend: device.backend.clone(),
+        bus,
     }
+}
+
+fn resolve_bus_runtime(
+    config: &GPUStreamConfig,
+    device: Option<&NativeAudioInput>,
+) -> NativeAudioBusRuntime {
+    let source_kind = device
+        .map(|candidate| candidate.kind.clone())
+        .unwrap_or(NativeAudioSourceKind::Unknown);
+    let default_name = match source_kind {
+        NativeAudioSourceKind::Microphone => "Microphone",
+        NativeAudioSourceKind::System => "System",
+        NativeAudioSourceKind::Virtual => "Virtual",
+        NativeAudioSourceKind::Synthetic => "Silent",
+        NativeAudioSourceKind::Unknown => "Audio",
+    };
+
+    let selected = config
+        .audio_buses
+        .iter()
+        .find(|bus| audio_bus_matches(bus, &source_kind))
+        .cloned();
+
+    NativeAudioBusRuntime {
+        bus_id: selected
+            .as_ref()
+            .map(|bus| normalized_bus_id(bus))
+            .unwrap_or_else(|| match source_kind {
+                NativeAudioSourceKind::Microphone => "microphone".into(),
+                NativeAudioSourceKind::System => "system".into(),
+                NativeAudioSourceKind::Virtual => "virtual".into(),
+                NativeAudioSourceKind::Synthetic => "silent".into(),
+                NativeAudioSourceKind::Unknown => "audio".into(),
+            }),
+        name: selected
+            .as_ref()
+            .map(|bus| {
+                if bus.name.trim().is_empty() {
+                    default_name.into()
+                } else {
+                    bus.name.trim().into()
+                }
+            })
+            .unwrap_or_else(|| default_name.into()),
+        source_kind,
+        volume: selected
+            .as_ref()
+            .map(|bus| bus.volume.clamp(0.0, 2.0))
+            .unwrap_or(1.0),
+        muted: selected.as_ref().map(|bus| bus.muted).unwrap_or(false),
+        delay_ms: selected
+            .as_ref()
+            .map(|bus| bus.delay_ms.min(2_000))
+            .unwrap_or(0),
+        monitor_enabled: selected
+            .as_ref()
+            .map(|bus| bus.monitor_enabled)
+            .unwrap_or(false),
+    }
+}
+
+fn normalized_bus_id(bus: &NativeAudioBusConfig) -> String {
+    let raw = if bus.bus_id.trim().is_empty() {
+        bus.name.trim()
+    } else {
+        bus.bus_id.trim()
+    };
+    if raw.is_empty() {
+        "audio".into()
+    } else {
+        raw.to_ascii_lowercase().replace(' ', "-")
+    }
+}
+
+fn audio_bus_matches(bus: &NativeAudioBusConfig, kind: &NativeAudioSourceKind) -> bool {
+    let target = bus.source_kind.trim().to_ascii_lowercase();
+    let bus_id = normalized_bus_id(bus);
+    match kind {
+        NativeAudioSourceKind::Microphone => {
+            matches!(target.as_str(), "microphone" | "mic")
+                || bus_id.contains("mic")
+                || bus_id.contains("microphone")
+        }
+        NativeAudioSourceKind::System => {
+            target == "system" || bus_id.contains("system")
+        }
+        NativeAudioSourceKind::Virtual => {
+            target == "virtual" || bus_id.contains("virtual")
+        }
+        NativeAudioSourceKind::Synthetic => {
+            target == "synthetic" || bus_id == "silent"
+        }
+        NativeAudioSourceKind::Unknown => target == "unknown" || bus_id == "audio",
+    }
+}
+
+fn build_audio_filter_graph(plan: &NativeAudioPlan) -> Option<String> {
+    if plan.inputs.is_empty() {
+        return None;
+    }
+
+    let mut graph_parts: Vec<String> = Vec::new();
+
+    for (idx, input) in plan.inputs.iter().enumerate() {
+        let mut filters: Vec<String> = Vec::new();
+        let volume = if input.bus.muted { 0.0 } else { input.bus.volume };
+        if (volume - 1.0).abs() > f32::EPSILON || input.bus.muted {
+            filters.push(format!("volume={:.3}", volume));
+        }
+        if input.bus.delay_ms > 0 {
+            let delay = input.bus.delay_ms;
+            filters.push(format!("adelay={}|{}", delay, delay));
+        }
+        filters.push("aresample=async=1:min_hard_comp=0.100:first_pts=0".into());
+        graph_parts.push(format!(
+            "[{}:a]{}[a_bus_{}]",
+            idx + 1,
+            filters.join(","),
+            idx
+        ));
+    }
+
+    if plan.inputs.len() > 1 {
+        let inputs = (0..plan.inputs.len())
+            .map(|idx| format!("[a_bus_{}]", idx))
+            .collect::<String>();
+        graph_parts.push(format!(
+            "{}amix=inputs={}:duration=longest:normalize=0[a_mix]",
+            inputs,
+            plan.inputs.len()
+        ));
+    }
+
+    Some(graph_parts.join(";"))
 }
 
 fn channel_layout(channels: u32) -> &'static str {
