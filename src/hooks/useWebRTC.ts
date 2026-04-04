@@ -31,6 +31,7 @@ interface UseWebRTCOptions {
     workspaceId?: string;
     sessionId?: string;
   }) => void;
+  onLuminaConnected?: (workspaceId: string) => void;
 }
 
 export function useWebRTC({
@@ -47,6 +48,7 @@ export function useWebRTC({
   onError,
   onPhoneConnected,
   onLuminaStreamRequest,
+  onLuminaConnected,
 }: UseWebRTCOptions) {
   const roomId = ROOM_ID;
   const [webcamStream, setWebcamStream] = useState<MediaStream | null>(null);
@@ -79,6 +81,8 @@ export function useWebRTC({
   onPhoneConnectedRef.current = onPhoneConnected;
   const onLuminaStreamRequestRef = useRef(onLuminaStreamRequest);
   onLuminaStreamRequestRef.current = onLuminaStreamRequest;
+  const onLuminaConnectedRef = useRef(onLuminaConnected);
+  onLuminaConnectedRef.current = onLuminaConnected;
   const scenesRef = useRef(scenes);
   scenesRef.current = scenes;
   const scenePresetsRef = useRef(scenePresets);
@@ -685,6 +689,9 @@ export function useWebRTC({
       setAudienceMessagesRef.current(prev => [message, ...prev].slice(0, 50));
     });
     socket.on('lumina-event', handleLuminaEvent);
+    socket.on('lumina-connected', (data: { workspaceId?: string }) => {
+      onLuminaConnectedRef.current?.(String(data?.workspaceId || ''));
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps -- Intentionally stable: reconnectSocket should only run on mount.
   // All callbacks inside use refs or are stable (setX dispatchers). Including them as deps
   // would cause an infinite connect/disconnect loop because onError and attachIceRestartLogic

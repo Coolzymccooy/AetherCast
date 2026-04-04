@@ -137,6 +137,7 @@ function useModalState() {
   const [showQrModal, setShowQrModal] = useState(false);
   const [qrMode, setQrMode] = useState<QrMode>('camera');
   const [selectedVideo, setSelectedVideo] = useState<Recording | null>(null);
+  const [showLuminaPairModal, setShowLuminaPairModal] = useState(false);
 
   return {
     showRecordingGallery, setShowRecordingGallery,
@@ -146,6 +147,7 @@ function useModalState() {
     showQrModal, setShowQrModal,
     qrMode, setQrMode,
     selectedVideo, setSelectedVideo,
+    showLuminaPairModal, setShowLuminaPairModal,
   };
 }
 

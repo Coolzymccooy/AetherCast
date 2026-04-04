@@ -38,6 +38,7 @@ import { ScriptEditor } from './components/studio/ScriptEditor';
 import { HardwareSetupModal } from './components/studio/HardwareSetupModal';
 import { StreamSettingsModal } from './components/studio/StreamSettingsModal';
 import { QrModal } from './components/studio/QrModal';
+import { LuminaPairModal } from './components/studio/LuminaPairModal';
 import { PeerSettingsModal } from './components/studio/PeerSettingsModal';
 import { ServerLogsPanel } from './components/studio/ServerLogsPanel';
 import { NotificationToast } from './components/studio/NotificationToast';
@@ -115,6 +116,8 @@ function StudioView() {
   });
 
   const [showPeerSettings, setShowPeerSettings] = React.useState(false);
+  const [luminaConnected, setLuminaConnected] = React.useState(false);
+  const luminaConnectedTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showProjectDialog, setShowProjectDialog] = React.useState(false);
   const [showOutputQuality, setShowOutputQuality] = React.useState(false);
   const [showShortcuts, setShowShortcuts] = React.useState(false);
@@ -190,6 +193,11 @@ function StudioView() {
     },
     onLuminaStreamRequest: (request) => {
       luminaStreamRequestHandlerRef.current(request);
+    },
+    onLuminaConnected: () => {
+      setLuminaConnected(true);
+      if (luminaConnectedTimerRef.current) clearTimeout(luminaConnectedTimerRef.current);
+      luminaConnectedTimerRef.current = setTimeout(() => setLuminaConnected(false), 15_000);
     },
   });
 
@@ -788,7 +796,7 @@ function StudioView() {
       </div>
 
       {showTelemetry && (
-        <TelemetryBar telemetry={telemetry} isStreaming={studio.isStreaming} isRecording={streaming.isRecording} />
+        <TelemetryBar telemetry={telemetry} isStreaming={studio.isStreaming} isRecording={streaming.isRecording} luminaConnected={luminaConnected} onOpenLuminaPair={() => studio.setShowLuminaPairModal(true)} />
       )}
 
       <div className="flex-1 flex overflow-hidden" style={{ transform: `scale(${zoomLevel / 100})`, transformOrigin: 'top left', width: `${10000 / zoomLevel}%`, height: `${10000 / zoomLevel}%` }}>
@@ -1054,6 +1062,10 @@ function StudioView() {
 
         {studio.showQrModal && (
           <QrModal qrMode={studio.qrMode} setQrMode={studio.setQrMode} onClose={() => studio.setShowQrModal(false)} />
+        )}
+
+        {studio.showLuminaPairModal && (
+          <LuminaPairModal onClose={() => studio.setShowLuminaPairModal(false)} />
         )}
 
         {showPeerSettings && (

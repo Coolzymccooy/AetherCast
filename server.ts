@@ -1226,16 +1226,21 @@ If no switch needed, respond with exactly: STAY`;
   // ──────────────────────────────────────────────────────────────────────────────
   // Lumina Presenter Bridge
   // Lumina sends POST /api/lumina/bridge with x-lumina-event / x-lumina-workspace /
-  // x-lumina-session headers plus a JSON body. This endpoint validates and
-  // broadcasts the event to all connected Aether Studio clients via Socket.io.
+  // x-lumina-session headers plus a JSON body. Room can be supplied via the
+  // x-lumina-room header OR as a ?room= query param (pairing URL approach).
   // Clients listen for the 'lumina-event' socket event.
   // ──────────────────────────────────────────────────────────────────────────────
+
+  // Tracks last ping timestamp per room — used by the pairing status endpoint.
+  const luminaRoomLastPing = new Map<string, number>();
+
   app.post('/api/lumina/bridge', (req, res) => {
     const eventType = String(req.headers['x-lumina-event'] || '').trim();
     const workspaceId = String(req.headers['x-lumina-workspace'] || '').trim();
     const sessionId = String(req.headers['x-lumina-session'] || '').trim();
     const token = String(req.headers['x-lumina-token'] || '').trim();
-    const roomId = String(req.headers['x-lumina-room'] || '').trim();
+    // Room can come from header (legacy) or query param (pairing URL)
+    const roomId = String(req.headers['x-lumina-room'] || (req.query as Record<string,string>).room || '').trim();
 
     if (!eventType || !workspaceId || !sessionId) {
       res.status(400).json({ ok: false, message: 'missing_required_headers' });
@@ -1253,7 +1258,11 @@ If no switch needed, respond with exactly: STAY`;
     }
 
     if (eventType === 'lumina.bridge.ping') {
-      console.log(`[lumina-bridge] ping from workspace=${workspaceId}`);
+      if (roomId) {
+        luminaRoomLastPing.set(roomId, Date.now());
+        io.to(roomId).emit('lumina-connected', { workspaceId, ts: Date.now() });
+      }
+      console.log(`[lumina-bridge] ping from workspace=${workspaceId} room=${roomId || '(broadcast)'}`);
       res.status(200).json({ ok: true, message: 'accepted' });
       return;
     }
@@ -1268,6 +1277,7 @@ If no switch needed, respond with exactly: STAY`;
     };
 
     if (roomId) {
+      luminaRoomLastPing.set(roomId, Date.now());
       io.to(roomId).emit('lumina-event', bridgeEvent);
       console.log(`[lumina-bridge] ${eventType} → room=${roomId}`);
     } else {
@@ -1275,6 +1285,14 @@ If no switch needed, respond with exactly: STAY`;
       console.log(`[lumina-bridge] ${eventType} → ${io.engine.clientsCount} client(s) (broadcast)`);
     }
     res.status(200).json({ ok: true, message: 'accepted' });
+  });
+
+  // Returns whether a Lumina instance has pinged this room in the last 15 seconds.
+  app.get('/api/lumina/rooms/:roomId/status', (req, res) => {
+    const roomId = String(req.params.roomId || '').trim();
+    const lastSeen = luminaRoomLastPing.get(roomId) ?? null;
+    const connected = lastSeen !== null && Date.now() - lastSeen < 15_000;
+    res.json({ connected, lastSeenMs: lastSeen });
   });
 
   // ──────────────────────────────────────────────────────────────────────────────

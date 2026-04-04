@@ -6,6 +6,8 @@ interface TelemetryBarProps {
   telemetry: Telemetry;
   isStreaming: boolean;
   isRecording: boolean;
+  luminaConnected?: boolean;
+  onOpenLuminaPair?: () => void;
 }
 
 function formatDuration(seconds: number): string {
@@ -16,7 +18,7 @@ function formatDuration(seconds: number): string {
   return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 }
 
-export const TelemetryBar: React.FC<TelemetryBarProps> = ({ telemetry, isStreaming, isRecording }) => {
+export const TelemetryBar: React.FC<TelemetryBarProps> = ({ telemetry, isStreaming, isRecording, luminaConnected = false, onOpenLuminaPair }) => {
   // Stream duration timer
   const [streamDuration, setStreamDuration] = useState(0);
   const [recordDuration, setRecordDuration] = useState(0);
@@ -71,6 +73,22 @@ export const TelemetryBar: React.FC<TelemetryBarProps> = ({ telemetry, isStreami
           )}
         </div>
       </div>
+
+      {/* Lumina pairing indicator */}
+      <button
+        onClick={onOpenLuminaPair}
+        title={luminaConnected ? 'Lumina connected — click to manage pairing' : 'Click to pair with Lumina Presenter'}
+        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md border transition-colors cursor-pointer ${
+          luminaConnected
+            ? 'border-emerald-700/60 bg-emerald-950/30 hover:bg-emerald-950/50'
+            : 'border-zinc-700/50 bg-zinc-900/40 hover:border-zinc-600 hover:bg-zinc-800/50'
+        }`}
+      >
+        <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${luminaConnected ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'}`} />
+        <span className={`text-[9px] font-bold uppercase tracking-widest ${luminaConnected ? 'text-emerald-400' : 'text-zinc-500'}`}>
+          LUMINA
+        </span>
+      </button>
 
       <div className="flex items-center gap-6 text-gray-400">
         <div className="flex items-center gap-2">
