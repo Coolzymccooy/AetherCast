@@ -20,6 +20,7 @@ app-icon.png
 
 # Tauri signing keys (never commit these)
 ~/.tauri/
+signing-keys/
 
 # APK binaries (large files — only track intentional releases)
 # public/downloads/*.apk
