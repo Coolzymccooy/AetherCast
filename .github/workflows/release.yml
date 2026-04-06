@@ -44,9 +44,24 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Build Tauri app
+      - name: Write signing key to temp file
+        shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          $keyPath = Join-Path $env:RUNNER_TEMP "tauri_signing.key"
+          # Preserve actual newlines; handle case where Windows injected literal \n
+          $keyContent = $env:TAURI_SIGNING_PRIVATE_KEY
+          if ($keyContent -notmatch "`n" -and $keyContent -match "\\n") {
+            $keyContent = $keyContent -replace "\\n", "`n"
+          }
+          [System.IO.File]::WriteAllText($keyPath, $keyContent)
+          Write-Host "Signing key written to $keyPath (length: $($keyContent.Length))"
+          "TAURI_KEY_PATH=$keyPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build Tauri app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_KEY_PATH }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: npx tauri build --target ${{ matrix.target }}
 
