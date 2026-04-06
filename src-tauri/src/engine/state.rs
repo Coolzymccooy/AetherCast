@@ -471,3 +471,30 @@ pub struct StartStreamResponse {
     pub source_bridge_url: Option<String>,
     pub transport: String,
 }
+
+#[derive(Debug, Serialize)]
+pub struct VirtualCameraStartResponse {
+    pub message: String,
+    pub bridge_url: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VirtualCameraStatus {
+    pub state: EngineHealthState,
+    pub active: bool,
+    pub desired_active: bool,
+    pub backend: String,
+    pub transport: String,
+    pub os_device_exposed: bool,
+    pub bridge_url: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub consumer_count: u32,
+    pub frames_rendered: u64,
+    pub frames_served: u64,
+    pub uptime_ms: u64,
+    pub last_frame_age_ms: u64,
+    pub note: String,
+    pub last_error: Option<String>,
+}

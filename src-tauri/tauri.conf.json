@@ -24,9 +24,10 @@
     ],
     "security": {
       "csp": null
-    },
+    }
+  },
+  "plugins": {
     "updater": {
-      "active": true,
       "endpoints": [
         "https://github.com/Coolzymccooy/AetherCast/releases/latest/download/latest.json"
       ],
