@@ -47,10 +47,11 @@ async function main() {
   const { key_id, key } = await getRepoPublicKey();
   console.log(`  key_id: ${key_id}`);
 
-  // The key file stores the minisign key as base64; decode it to get the raw key text
-  // that Tauri expects (starting with "untrusted comment: rsign encrypted secret key")
-  const privateKey = Buffer.from(readFileSync('signing-keys/aethercast.key', 'utf8').trim(), 'base64').toString('utf8');
-  const password = 'Bigshegz@27';
+  // Tauri v2 CLI expects the key value to be base64-encoded (it decodes it internally).
+  // The key file already stores the minisign key as a base64 string — use it directly.
+  const privateKey = readFileSync('signing-keys/aethercast.key', 'utf8').trim();
+  const password = process.env.TAURI_KEY_PASSWORD;
+  if (!password) throw new Error('Set TAURI_KEY_PASSWORD env var to the signing key password');
 
   console.log('Encrypting and setting secrets...');
   const [encPrivKey, encPassword] = await Promise.all([
