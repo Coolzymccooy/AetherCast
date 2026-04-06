@@ -116,8 +116,13 @@ jobs:
           $targetBundleRoot = Join-Path $PWD "src-tauri\target\${{ matrix.target }}\release\bundle"
           $bundleRoot = if (Test-Path $targetBundleRoot) { $targetBundleRoot } else { Join-Path $PWD "src-tauri\target\release\bundle" }
 
-          $nsisZip = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.nsis.zip" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          $nsisSig = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.nsis.zip.sig" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          # Use Where-Object instead of -Filter to avoid Windows wildcard quirks with multi-dot names
+          $allBundleFiles = Get-ChildItem -Path $bundleRoot -Recurse | Select-Object -ExpandProperty FullName
+          Write-Host "Bundle files found: $($allBundleFiles.Count)"
+          $allBundleFiles | ForEach-Object { Write-Host "  $_" }
+
+          $nsisZip = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip" -and $_.Name -notlike "*.nsis.zip.sig" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $nsisSig = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip.sig" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 
           if ($null -eq $nsisZip -or $null -eq $nsisSig) {
             Write-Warning "Signed NSIS bundle not found — skipping latest.json generation. Add TAURI_SIGNING_PRIVATE_KEY secret to enable auto-update."
