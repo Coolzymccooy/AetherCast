@@ -49,6 +49,7 @@ import { DownloadModal } from './components/studio/DownloadModal';
 import { CheckForUpdatesModal } from './components/studio/CheckForUpdatesModal';
 import { KeyboardShortcuts } from './components/studio/KeyboardShortcuts';
 import { AboutModal } from './components/studio/AboutModal';
+import { SceneTransitionsModal, type TransitionConfig } from './components/studio/SceneTransitionsModal';
 
 // --- Other Views ---
 import { AudienceLanding } from './components/AudienceLanding';
@@ -126,6 +127,8 @@ function StudioView() {
   const [showDownload, setShowDownload] = React.useState(false);
   const [showCheckUpdates, setShowCheckUpdates] = React.useState(false);
   const [showAbout, setShowAbout] = React.useState(false);
+  const [showTransitions, setShowTransitions] = React.useState(false);
+  const [transitionConfig, setTransitionConfig] = React.useState<TransitionConfig>({ type: 'cut', durationMs: 500 });
   const programViewRef = React.useRef<ProgramViewHandle>(null);
   const lastBrowserSourceNoticeRef = React.useRef<string | null>(null);
   const [browserSourceUrl, setBrowserSourceUrl] = React.useState(() => localStorage.getItem('aether_browser_source_url') || '');
@@ -683,6 +686,7 @@ function StudioView() {
       case 'Download Desktop App': setShowDownload(true); break;
       case 'Check for Updates': setShowCheckUpdates(true); break;
       case 'About Aether Studio': setShowAbout(true); break;
+      case 'Scene Transitions': setShowTransitions(true); break;
       default: break;
     }
   };
@@ -1225,6 +1229,15 @@ function StudioView() {
 
       {/* About Aether Studio Modal */}
       {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
+
+      {/* Scene Transitions Modal */}
+      {showTransitions && (
+        <SceneTransitionsModal
+          config={transitionConfig}
+          onSave={setTransitionConfig}
+          onClose={() => setShowTransitions(false)}
+        />
+      )}
     </div>
   );
 }

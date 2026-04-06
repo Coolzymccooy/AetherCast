@@ -6,3 +6,4 @@ pub mod source;
 pub mod state;
 pub mod telemetry;
 pub mod video;
+pub mod virtual_camera;

@@ -19,6 +19,8 @@ interface ReleaseInfo {
 const GITHUB_LATEST_API = 'https://api.github.com/repos/Coolzymccooy/AetherCast/releases/latest';
 const GITHUB_RELEASES_URL = 'https://github.com/Coolzymccooy/AetherCast/releases';
 
+const isTauri = typeof window !== 'undefined' && !!(window as any).__TAURI_INTERNALS__;
+
 /** Strip leading 'v' from a semver tag: "v1.0.14" → "1.0.14" */
 function stripV(tag: string): string {
   return tag.replace(/^v/, '');
@@ -37,9 +39,9 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-/** Read current version from Tauri's __TAURI_METADATA__ if available, else fallback. */
+/** Read current version from Tauri API if available, else fallback. */
 async function getCurrentVersion(): Promise<string> {
-  if (window.__TAURI_INTERNALS__) {
+  if (isTauri) {
     try {
       const { getVersion } = await import('@tauri-apps/api/app');
       return await getVersion();
@@ -47,15 +49,16 @@ async function getCurrentVersion(): Promise<string> {
       // Tauri API unavailable — use fallback
     }
   }
-  // Injected at build time via Vite define, or hardcoded fallback
   return (window as any).__APP_VERSION__ ?? '1.0.13';
 }
 
 export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onClose }) => {
-  const [status, setStatus] = useState<'checking' | 'up-to-date' | 'update-available' | 'error'>('checking');
+  const [status, setStatus] = useState<'checking' | 'up-to-date' | 'update-available' | 'downloading' | 'error'>('checking');
   const [currentVersion, setCurrentVersion] = useState<string>('…');
   const [release, setRelease] = useState<ReleaseInfo | null>(null);
   const [errorMsg, setErrorMsg] = useState<string>('');
+  const [downloadProgress, setDownloadProgress] = useState<number>(0);
+  const [tauriUpdate, setTauriUpdate] = useState<any>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -65,6 +68,39 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
       if (cancelled) return;
       setCurrentVersion(current);
 
+      // ── Desktop path: use tauri-plugin-updater for native in-app update ──
+      if (isTauri) {
+        try {
+          const { check: tauriCheck } = await import('@tauri-apps/plugin-updater');
+          const update = await tauriCheck();
+          if (cancelled) return;
+
+          if (update?.available) {
+            setTauriUpdate(update);
+            const info: ReleaseInfo = {
+              tagName: update.version ? `v${update.version}` : 'latest',
+              version: update.version ?? current,
+              releaseUrl: GITHUB_RELEASES_URL,
+              publishedAt: update.date ?? null,
+              body: update.body ?? '',
+              exeUrl: null,
+              msiUrl: null,
+            };
+            setRelease(info);
+            setStatus('update-available');
+          } else {
+            setStatus('up-to-date');
+          }
+          return;
+        } catch (err: any) {
+          if (!cancelled) {
+            // Tauri updater failed — fall through to GitHub API check
+            console.warn('[updater] Tauri updater unavailable, falling back to GitHub API:', err?.message);
+          }
+        }
+      }
+
+      // ── Browser path (or Tauri fallback): fetch GitHub API ───────────────
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 10_000);
@@ -118,6 +154,36 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
     return () => { cancelled = true; };
   }, []);
 
+  const handleTauriInstall = async () => {
+    if (!tauriUpdate) return;
+    setStatus('downloading');
+    setDownloadProgress(0);
+    try {
+      let downloaded = 0;
+      let total = 0;
+      await tauriUpdate.downloadAndInstall((event: any) => {
+        switch (event.event) {
+          case 'Started':
+            total = event.data?.contentLength ?? 0;
+            break;
+          case 'Progress':
+            downloaded += event.data?.chunkLength ?? 0;
+            if (total > 0) setDownloadProgress(Math.round((downloaded / total) * 100));
+            break;
+          case 'Finished':
+            setDownloadProgress(100);
+            break;
+        }
+      });
+      // Relaunch after install
+      const { relaunch } = await import('@tauri-apps/plugin-process');
+      await relaunch();
+    } catch (err: any) {
+      setErrorMsg(err?.message ?? 'Update failed');
+      setStatus('error');
+    }
+  };
+
   const formatDate = (iso: string | null): string => {
     if (!iso) return '';
     const d = new Date(iso);
@@ -157,7 +223,7 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
             <span className="font-mono text-white">{currentVersion}</span>
           </div>
 
-          {/* Status */}
+          {/* Status: checking */}
           {status === 'checking' && (
             <div className="flex items-center gap-3 py-4 justify-center">
               <RefreshCw size={18} className="text-accent-cyan animate-spin" />
@@ -165,6 +231,7 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
             </div>
           )}
 
+          {/* Status: up-to-date */}
           {status === 'up-to-date' && (
             <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-emerald-950/40 border border-emerald-800/40">
               <CheckCircle size={18} className="text-emerald-400 shrink-0" />
@@ -178,6 +245,7 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
             </div>
           )}
 
+          {/* Status: update-available */}
           {status === 'update-available' && release && (
             <div className="space-y-3">
               <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-accent-cyan/10 border border-accent-cyan/30">
@@ -193,12 +261,25 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
               {release.body.trim() && (
                 <div className="bg-black/30 rounded-lg p-3 border border-border max-h-32 overflow-y-auto">
                   <p className="text-[9px] text-gray-500 uppercase tracking-wider mb-1">Release notes</p>
-                  <pre className="text-[10px] text-gray-300 whitespace-pre-wrap font-sans leading-relaxed">{release.body.trim().slice(0, 600)}{release.body.trim().length > 600 ? '…' : ''}</pre>
+                  <pre className="text-[10px] text-gray-300 whitespace-pre-wrap font-sans leading-relaxed">
+                    {release.body.trim().slice(0, 600)}{release.body.trim().length > 600 ? '…' : ''}
+                  </pre>
                 </div>
               )}
 
               <div className="flex flex-wrap gap-2">
-                {release.exeUrl && (
+                {/* Tauri desktop: one-click install */}
+                {isTauri && tauriUpdate && (
+                  <button
+                    onClick={handleTauriInstall}
+                    className="inline-flex items-center gap-2 px-4 py-2 bg-accent-cyan hover:bg-cyan-400 text-black text-[10px] font-bold uppercase rounded-lg transition-all active:scale-95"
+                  >
+                    <Download size={12} />
+                    Install Update
+                  </button>
+                )}
+                {/* Browser: direct download links */}
+                {!isTauri && release.exeUrl && (
                   <a
                     href={release.exeUrl}
                     className="inline-flex items-center gap-2 px-4 py-2 bg-accent-cyan hover:bg-cyan-400 text-black text-[10px] font-bold uppercase rounded-lg transition-all active:scale-95"
@@ -207,7 +288,7 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
                     Download Installer (.exe)
                   </a>
                 )}
-                {release.msiUrl && (
+                {!isTauri && release.msiUrl && (
                   <a
                     href={release.msiUrl}
                     className="inline-flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-[10px] font-bold uppercase rounded-lg transition-all active:scale-95 border border-border"
@@ -229,6 +310,27 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
             </div>
           )}
 
+          {/* Status: downloading */}
+          {status === 'downloading' && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-accent-cyan/10 border border-accent-cyan/30">
+                <RefreshCw size={18} className="text-accent-cyan animate-spin shrink-0" />
+                <div>
+                  <p className="text-[12px] font-semibold text-accent-cyan">Downloading update…</p>
+                  <p className="text-[10px] text-gray-400">The app will restart automatically when complete.</p>
+                </div>
+              </div>
+              <div className="w-full bg-white/10 rounded-full h-1.5">
+                <div
+                  className="bg-accent-cyan h-1.5 rounded-full transition-all duration-300"
+                  style={{ width: `${downloadProgress}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-gray-500 text-right font-mono">{downloadProgress}%</p>
+            </div>
+          )}
+
+          {/* Status: error */}
           {status === 'error' && (
             <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-red-950/40 border border-red-800/40">
               <AlertCircle size={18} className="text-red-400 shrink-0" />
@@ -244,7 +346,8 @@ export const CheckForUpdatesModal: React.FC<CheckForUpdatesModalProps> = ({ onCl
         <div className="px-6 pb-5 flex justify-end">
           <button
             onClick={onClose}
-            className="px-5 py-2 bg-transparent hover:bg-white/5 text-white font-bold rounded-lg transition-all uppercase tracking-widest text-[10px] border border-border"
+            disabled={status === 'downloading'}
+            className="px-5 py-2 bg-transparent hover:bg-white/5 text-white font-bold rounded-lg transition-all uppercase tracking-widest text-[10px] border border-border disabled:opacity-40"
           >
             Close
           </button>

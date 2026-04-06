@@ -11,6 +11,9 @@ import crypto from "crypto";
 import os from "os";
 import dotenv from "dotenv";
 import { isValidRoomId, resolveRoomId } from "./src/utils/roomId";
+import { createAiRouter } from "./src/server/ai";
+import { createLuminaRouter } from "./src/server/lumina";
+import { sanitizeText } from "./src/server/sanitize";
 
 dotenv.config();
 
@@ -167,46 +170,30 @@ const __dirname = path.dirname(__filename);
 // Security helpers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/** Simple token for Socket.io auth — set SOCKET_AUTH_TOKEN in .env or auto-generate */
-const SOCKET_AUTH_TOKEN = process.env.SOCKET_AUTH_TOKEN || crypto.randomUUID();
+/** Simple token for Socket.io auth — persisted to disk so server restarts don't disconnect clients */
+const TOKEN_FILE = path.join(os.homedir(), '.aethercast_token');
 
-/**
- * Optional shared secret for the Lumina Presenter bridge endpoint.
- * Set LUMINA_BRIDGE_TOKEN in .env to require Lumina's x-lumina-token header to match.
- * Leave empty to accept all requests (safe behind your own CORS/firewall).
- */
-const LUMINA_BRIDGE_TOKEN = process.env.LUMINA_BRIDGE_TOKEN || '';
+function loadOrCreateToken(): string {
+  if (process.env.SOCKET_AUTH_TOKEN) return process.env.SOCKET_AUTH_TOKEN;
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      const saved = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
+      if (saved.length > 16) return saved;
+    }
+  } catch {
+    // Fall through to generate a new token
+  }
+  const token = crypto.randomUUID();
+  try { fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 }); } catch { /* best effort */ }
+  return token;
+}
 
-const LUMINA_ALLOWED_EVENTS = new Set([
-  'lumina.bridge.ping',
-  'lumina.state.sync',
-  'lumina.scene.switch',
-  'lumina.slide.changed',
-  'lumina.item.started',
-  'lumina.countdown.started',
-  'lumina.countdown.ended',
-  'lumina.service.mode.changed',
-  'lumina.stream.request',
-  'lumina.recording.request',
-]);
+const SOCKET_AUTH_TOKEN = loadOrCreateToken();
 
 /** Allowed origins for CORS */
 const ALLOWED_ORIGINS = process.env.NODE_ENV === 'production' && process.env.PUBLIC_URL
   ? [process.env.PUBLIC_URL, 'tauri://localhost', 'https://tauri.localhost']
   : '*';
-
-/** Sanitize user-supplied strings to prevent injection */
-function sanitizeText(input: string, maxLength = 500): string {
-  if (typeof input !== 'string') return '';
-  return input
-    .slice(0, maxLength)
-    .replace(/[<>&"']/g, (c) => {
-      const map: Record<string, string> = { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#x27;' };
-      return map[c] || c;
-    });
-}
-
-// Note: sanitize logic is also available as a shared module at src/lib/sanitize.ts for client-side use
 
 /** Per-socket rate limiter: max `limit` events per `windowMs` */
 class RateLimiter {
@@ -1007,24 +994,44 @@ async function startServer() {
         return;
       }
 
-      // Start heartbeat monitor — requests a client transport refresh on chunk stalls.
+      // Start heartbeat monitor — checks for chunk stalls AND FFmpeg process liveness.
       lastChunkTime = Date.now();
       let lastHeartbeatWarn = 0;
+      let lastLivenessCheck = Date.now();
       clearHeartbeat();
       heartbeatInterval = setInterval(() => {
-        if (!ffmpegProcess || intentionallyStopped) return;
-        if (!lastChunkTime) return;
-        const elapsed = Date.now() - lastChunkTime;
+        if (intentionallyStopped) return;
         const now = Date.now();
-        if (elapsed > 6_000 && (now - lastRefreshRequestAt) > 12_000) {
-          lastRefreshRequestAt = now;
-          socket.emit('server-log', { message: 'No browser chunks received for 6s — requesting transport refresh', type: 'warning' });
-          socket.emit('stream-refresh-request', { reason: 'server-chunk-stall', elapsedMs: elapsed });
+
+        // ── Chunk stall detection (browser path) ─────────────────────────
+        if (ffmpegProcess && lastChunkTime) {
+          const elapsed = now - lastChunkTime;
+          if (elapsed > 6_000 && (now - lastRefreshRequestAt) > 12_000) {
+            lastRefreshRequestAt = now;
+            socket.emit('server-log', { message: 'No browser chunks received for 6s — requesting transport refresh', type: 'warning' });
+            socket.emit('stream-refresh-request', { reason: 'server-chunk-stall', elapsedMs: elapsed });
+          }
+          if (elapsed > 10_000 && (now - lastHeartbeatWarn) > 30_000) {
+            socket.emit('server-log', { message: 'Warning: No chunks received for 10s — stream may be stalled', type: 'warning' });
+            lastHeartbeatWarn = now;
+          }
         }
-        // Only warn once per 30 seconds to avoid flooding the client
-        if (elapsed > 10_000 && (now - lastHeartbeatWarn) > 30_000) {
-          socket.emit('server-log', { message: 'Warning: No chunks received for 10s — stream may be stalled', type: 'warning' });
-          lastHeartbeatWarn = now;
+
+        // ── FFmpeg process liveness check (every 15s) ─────────────────────
+        // Catches silent stalls where the process dies but no exit event fires
+        if (now - lastLivenessCheck >= 15_000) {
+          lastLivenessCheck = now;
+          if (ffmpegProcess) {
+            const proc = ffmpegProcess;
+            const dead = proc.exitCode !== null || proc.killed || proc.stdin?.writable === false;
+            if (dead) {
+              socket.emit('server-log', { message: 'FFmpeg liveness check: process is dead — triggering recovery', type: 'warning' });
+              clearCurrentPipelineState();
+              if (!intentionallyStopped && lastStartData) {
+                attemptRestart();
+              }
+            }
+          }
         }
       }, 3_000);
     });
@@ -1113,6 +1120,146 @@ async function startServer() {
       destroyActivePipeline(true);
     }
 
+    // ── High-bitrate local recording pipeline ──────────────────────────────
+    // Separate from the stream pipeline — records to disk at full quality
+    // without re-encoding. Uses H.264 codec copy when browser sends H.264.
+
+    let recordingProcess: ChildProcess | null = null;
+    let recordingStream: PassThrough | null = null;
+    let recordingDemuxer: FMP4Demuxer | null = null;
+    let recordingPath: string | null = null;
+
+    type StartRecordingData = {
+      outputDir?: string;
+      quality?: 'high' | 'medium';
+      browserH264?: boolean;
+    };
+
+    function stopRecordingPipeline(planned = true) {
+      if (recordingProcess?.pid && planned) ignoredExitPids.add(recordingProcess.pid);
+      try { recordingProcess?.stdin?.destroy(); } catch { /* best effort */ }
+      try { recordingProcess?.kill('SIGINT'); } catch { /* best effort */ }
+      if (recordingProcess) {
+        setTimeout(() => {
+          try {
+            if (recordingProcess && recordingProcess.exitCode == null && !recordingProcess.killed) {
+              recordingProcess.kill('SIGKILL');
+            }
+          } catch { /* best effort */ }
+        }, 2000);
+      }
+      recordingDemuxer?.destroy();
+      recordingStream?.destroy();
+      recordingProcess = null;
+      recordingStream = null;
+      recordingDemuxer = null;
+    }
+
+    socket.on("start-recording", (data: StartRecordingData) => {
+      if (recordingProcess) {
+        socket.emit('server-log', { message: 'Recording already in progress', type: 'warning' });
+        return;
+      }
+
+      const outputDir = (typeof data.outputDir === 'string' && data.outputDir)
+        ? data.outputDir
+        : path.join(os.homedir(), 'Videos', 'AetherCast');
+
+      try { fs.mkdirSync(outputDir, { recursive: true }); } catch { /* exists */ }
+
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const filename = `aether-recording-${timestamp}.mp4`;
+      recordingPath = path.join(outputDir, filename);
+
+      const browserH264 = data.browserH264 === true;
+      recordingStream = new PassThrough();
+
+      let args: string[];
+
+      if (browserH264) {
+        // Codec copy: fMP4 → Annex B → H.264 → MP4 file (zero CPU, original quality)
+        recordingDemuxer = new FMP4Demuxer(cachedSPS, cachedPPS);
+        recordingDemuxer.on('codec-data', (d: { sps: Buffer; pps: Buffer }) => {
+          cachedSPS = d.sps; cachedPPS = d.pps;
+        });
+
+        args = [
+          '-y', '-hide_banner', '-loglevel', 'warning',
+          '-fflags', '+genpts+discardcorrupt+nobuffer',
+          '-f', 'h264', '-framerate', '30', '-i', 'pipe:0',
+          '-c:v', 'copy', '-an',
+          '-movflags', '+faststart',
+          recordingPath,
+        ];
+      } else {
+        // Re-encode path: high quality libx264 CRF recording
+        const crf = data.quality === 'medium' ? '23' : '18';
+        args = [
+          '-y', '-hide_banner', '-loglevel', 'warning',
+          '-fflags', '+genpts+discardcorrupt+nobuffer',
+          '-f', 'webm', '-i', 'pipe:0',
+          '-c:v', 'libx264', '-crf', crf, '-preset', 'fast',
+          '-pix_fmt', 'yuv420p', '-an',
+          '-movflags', '+faststart',
+          recordingPath,
+        ];
+      }
+
+      const proc = spawn(resolvedFFmpegPath, args, { stdio: ['pipe', 'ignore', 'pipe'] });
+
+      if (browserH264 && recordingDemuxer) {
+        recordingStream.pipe(recordingDemuxer).pipe(proc.stdin!);
+      } else {
+        recordingStream.pipe(proc.stdin!);
+      }
+
+      proc.stdin!.on('error', (err) => {
+        if ((err as any).code !== 'EPIPE') console.error('Recording stdin error:', err.message);
+      });
+
+      proc.stderr?.on('data', (d: Buffer) => {
+        const line = d.toString().trim();
+        if (line && !line.startsWith('frame=') && !line.startsWith('size=')) {
+          socket.emit('server-log', { message: `[rec] ${line}`, type: 'ffmpeg' });
+        }
+      });
+
+      proc.on('error', (err) => {
+        socket.emit('server-log', { message: `Recording error: ${err.message}`, type: 'error' });
+        recordingProcess = null; recordingStream = null; recordingDemuxer = null;
+      });
+
+      proc.on('exit', (code) => {
+        const planned = proc.pid != null && ignoredExitPids.delete(proc.pid);
+        if (!planned) {
+          socket.emit('server-log', { message: `Recording ended (code ${code})`, type: code === 0 ? 'info' : 'warning' });
+        }
+        if (recordingPath) {
+          socket.emit('recording-saved', { path: recordingPath, filename });
+        }
+        recordingProcess = null; recordingStream = null; recordingDemuxer = null; recordingPath = null;
+      });
+
+      recordingProcess = proc;
+      socket.emit('server-log', { message: `Recording started → ${filename}`, type: 'success' });
+      socket.emit('recording-started', { path: recordingPath, filename });
+    });
+
+    socket.on("recording-chunk", (data: { chunk: unknown }) => {
+      if (!recordingStream || !data.chunk) return;
+      const chunk = Buffer.isBuffer(data.chunk) ? data.chunk : Buffer.from(data.chunk as ArrayBuffer);
+      recordingStream.write(chunk);
+    });
+
+    socket.on("stop-recording", () => {
+      if (!recordingProcess) {
+        socket.emit('server-log', { message: 'No recording in progress', type: 'warning' });
+        return;
+      }
+      stopRecordingPipeline(true);
+      socket.emit('server-log', { message: 'Recording stopped', type: 'info' });
+    });
+
     socket.on("stop-stream", () => {
       intentionallyStopped = true;
       clearHeartbeat();
@@ -1128,6 +1275,7 @@ async function startServer() {
       intentionallyStopped = true;
       clearHeartbeat();
       killFFmpeg();
+      stopRecordingPipeline(true);
       finalizeSession();
     });
   });
@@ -1189,133 +1337,12 @@ async function startServer() {
     res.json({ ip: localIp, port: PORT, lanUrl, publicUrl });
   });
 
-  // ──────────────────────────────────────────────────────────────────────────────
-  // AI API endpoints (server-side Gemini calls — keeps API key out of browser)
-  // ──────────────────────────────────────────────────────────────────────────────
+  // ── AI endpoints (Gemini — keeps API key out of browser bundle) ─────────────
+  app.use('/api/ai', createAiRouter());
 
-  app.post('/api/ai/background', async (req, res) => {
-    const { prompt } = req.body;
-    if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt required' });
-
-    const sanitizedPrompt = sanitizeText(prompt, 200);
-
-    try {
-      const { GoogleGenAI } = await import('@google/genai');
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: { parts: [{ text: `A high quality, professional studio background for a live stream. Theme: ${sanitizedPrompt}. Cinematic lighting, 4k resolution.` }] },
-        config: { imageConfig: { aspectRatio: '16:9' } },
-      } as any);
-      const part = response.candidates?.[0]?.content?.parts?.find((p: any) => p.inlineData);
-      if (!part?.inlineData) return res.status(500).json({ error: 'No image generated' });
-      res.json({ imageUrl: `data:image/png;base64,${part.inlineData.data}` });
-    } catch (err: any) {
-      console.error('AI background error:', err.message);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.post('/api/ai/direct', async (req, res) => {
-    const { activeScene, scenes, telemetry } = req.body;
-    if (!activeScene || !scenes || !Array.isArray(scenes)) {
-      return res.status(400).json({ error: 'activeScene and scenes required' });
-    }
-
-    const sanitizedScene = sanitizeText(String(activeScene), 50);
-    const sanitizedScenes = scenes.map((s: any) => sanitizeText(String(s), 50));
-
-    try {
-      const { GoogleGenAI } = await import('@google/genai');
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
-      const prompt = `You are a professional broadcast director.
-Current Scene: ${sanitizedScene}
-Available Scenes: ${sanitizedScenes.join(', ')}
-Telemetry: CPU ${telemetry?.cpu ?? 'N/A'}%, Bitrate ${telemetry?.bitrate ?? 'N/A'}
-
-Decide if we should switch scenes for viewer engagement.
-If yes, respond with ONLY the target scene name from the Available Scenes list.
-If no switch needed, respond with exactly: STAY`;
-      const response = await ai.models.generateContent({ model: 'gemini-2.0-flash', contents: prompt });
-      const decision = response.text?.trim() ?? 'STAY';
-      res.json({ scene: decision });
-    } catch (err: any) {
-      console.error('AI director error:', err.message);
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // ──────────────────────────────────────────────────────────────────────────────
-  // Lumina Presenter Bridge
-  // Lumina sends POST /api/lumina/bridge with x-lumina-event / x-lumina-workspace /
-  // x-lumina-session headers plus a JSON body. Room can be supplied via the
-  // x-lumina-room header OR as a ?room= query param (pairing URL approach).
-  // Clients listen for the 'lumina-event' socket event.
-  // ──────────────────────────────────────────────────────────────────────────────
-
-  // Tracks last ping timestamp per room — used by the pairing status endpoint.
+  // ── Lumina Presenter Bridge ───────────────────────────────────────────────────
   const luminaRoomLastPing = new Map<string, number>();
-
-  app.post('/api/lumina/bridge', (req, res) => {
-    const eventType = String(req.headers['x-lumina-event'] || '').trim();
-    const workspaceId = String(req.headers['x-lumina-workspace'] || '').trim();
-    const sessionId = String(req.headers['x-lumina-session'] || '').trim();
-    const token = String(req.headers['x-lumina-token'] || '').trim();
-    // Room can come from header (legacy) or query param (pairing URL)
-    const roomId = String(req.headers['x-lumina-room'] || (req.query as Record<string,string>).room || '').trim();
-
-    if (!eventType || !workspaceId || !sessionId) {
-      res.status(400).json({ ok: false, message: 'missing_required_headers' });
-      return;
-    }
-
-    if (!LUMINA_ALLOWED_EVENTS.has(eventType)) {
-      res.status(400).json({ ok: false, message: 'unknown_event_type' });
-      return;
-    }
-
-    if (LUMINA_BRIDGE_TOKEN && token !== LUMINA_BRIDGE_TOKEN) {
-      res.status(401).json({ ok: false, message: 'unauthorized' });
-      return;
-    }
-
-    if (eventType === 'lumina.bridge.ping') {
-      if (roomId) {
-        luminaRoomLastPing.set(roomId, Date.now());
-        io.to(roomId).emit('lumina-connected', { workspaceId, ts: Date.now() });
-      }
-      console.log(`[lumina-bridge] ping from workspace=${workspaceId} room=${roomId || '(broadcast)'}`);
-      res.status(200).json({ ok: true, message: 'accepted' });
-      return;
-    }
-
-    const bridgeEvent = {
-      type: 'lumina_event',
-      event: eventType,
-      workspaceId,
-      sessionId,
-      payload: (req.body as Record<string, unknown>)?.payload ?? req.body ?? {},
-      ts: Date.now(),
-    };
-
-    if (roomId) {
-      luminaRoomLastPing.set(roomId, Date.now());
-      io.to(roomId).emit('lumina-event', bridgeEvent);
-      console.log(`[lumina-bridge] ${eventType} → room=${roomId}`);
-    } else {
-      io.emit('lumina-event', bridgeEvent);
-      console.log(`[lumina-bridge] ${eventType} → ${io.engine.clientsCount} client(s) (broadcast)`);
-    }
-    res.status(200).json({ ok: true, message: 'accepted' });
-  });
-
-  // Returns whether a Lumina instance has pinged this room in the last 15 seconds.
-  app.get('/api/lumina/rooms/:roomId/status', (req, res) => {
-    const roomId = String(req.params.roomId || '').trim();
-    const lastSeen = luminaRoomLastPing.get(roomId) ?? null;
-    const connected = lastSeen !== null && Date.now() - lastSeen < 300_000; // 5 min window
-    res.json({ connected, lastSeenMs: lastSeen });
-  });
+  app.use('/api/lumina', createLuminaRouter(io, luminaRoomLastPing));
 
   // ──────────────────────────────────────────────────────────────────────────────
   // Vite / static serving

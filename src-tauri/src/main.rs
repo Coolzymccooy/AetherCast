@@ -13,6 +13,7 @@ use engine::video::{
     clear_scene_source_frame, get_scene_snapshot, update_scene_snapshot,
     update_scene_source_frame,
 };
+use engine::virtual_camera::{get_virtual_camera_status, start_virtual_camera, stop_virtual_camera};
 
 fn main() {
     tauri::Builder::default()
@@ -36,6 +37,9 @@ fn main() {
             start_replay_buffer,
             capture_replay,
             stop_replay_buffer,
+            start_virtual_camera,
+            stop_virtual_camera,
+            get_virtual_camera_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
