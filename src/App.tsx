@@ -580,7 +580,7 @@ function StudioView() {
       return false;
     }
 
-    streaming.startStreaming(() => studio.setShowStreamSettings(true));
+    await streaming.startStreaming(() => studio.setShowStreamSettings(true));
     appendStudioLog(`Operator started browser streaming (${requestedProfile}).`, 'info');
     return true;
   }, [
