@@ -78,8 +78,8 @@ jobs:
           # Create stable-name aliases
           $aliasDir = Join-Path $PWD ".release-aliases"
           New-Item -ItemType Directory -Force -Path $aliasDir | Out-Null
-          $exeAlias = Join-Path $aliasDir "Selton.Studio_latest_x64-setup.exe"
-          $msiAlias = Join-Path $aliasDir "Selton.Studio_latest_x64_en-US.msi"
+          $exeAlias = Join-Path $aliasDir "AetherCast_latest_x64-setup.exe"
+          $msiAlias = Join-Path $aliasDir "AetherCast_latest_x64_en-US.msi"
           Copy-Item $exe.FullName $exeAlias -Force
           Copy-Item $msi.FullName $msiAlias -Force
 
@@ -107,6 +107,9 @@ jobs:
           $assets = @($exe.FullName, $msi.FullName, $exeAlias, $msiAlias)
           if ($null -ne $exeSig) { $assets += $exeSig.FullName; Write-Host "Including exe sig: $($exeSig.Name)" }
           if ($null -ne $msiSig) { $assets += $msiSig.FullName; Write-Host "Including msi sig: $($msiSig.Name)" }
+
+          # Delete existing release if present (can happen on re-run after force-push)
+          gh release delete $tag --yes 2>$null; $true
 
           gh release create $tag `
             --title "AetherCast $tag" `

@@ -1,7 +1,7 @@
 {
-  "productName": "Selton Studio",
+  "productName": "AetherCast",
   "version": "1.0.20",
-  "identifier": "com.selton.studio",
+  "identifier": "com.aethercast.studio",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -12,7 +12,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Selton Studio",
+        "title": "AetherCast",
         "width": 1440,
         "height": 900,
         "minWidth": 1024,
@@ -52,6 +52,6 @@
       "timestampUrl": ""
     },
     "shortDescription": "Professional broadcast studio for live streaming",
-    "longDescription": "Aether Studio is a professional broadcast workstation with GPU-accelerated streaming, multi-destination output, AI-powered scene direction, and real-time audio processing."
+    "longDescription": "AetherCast is a professional broadcast workstation with GPU-accelerated streaming, multi-destination output, AI-powered scene direction, and real-time audio processing."
   }
 }
