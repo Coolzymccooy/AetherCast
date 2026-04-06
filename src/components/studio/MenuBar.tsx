@@ -14,6 +14,8 @@ interface MenuBarProps {
   onOpenSettings?: () => void;
 }
 
+const isTauri = typeof window !== 'undefined' && !!(window as any).__TAURI_INTERNALS__;
+
 const menuConfig: Record<string, string[]> = {
   'File': ['New Project', 'Open...', 'Save', 'Save As...', 'Export Recording', 'Exit'],
   'Edit': ['Undo', 'Redo', 'Cut', 'Copy', 'Paste', 'Preferences'],
@@ -23,7 +25,9 @@ const menuConfig: Record<string, string[]> = {
   'Stream': ['Start Streaming', 'Stop Streaming', 'Stream Settings', 'Output Quality'],
   'Tools': ['AI Director Settings', 'Script Editor', 'Recording Gallery', 'Diagnostics'],
   'Window': ['Audio Mixer', 'Source Rack', 'Director Rack', 'Reset Layout'],
-  'Help': ['Documentation', 'Keyboard Shortcuts', 'Download Desktop App', 'Check for Updates', 'About Aether Studio'],
+  'Help': isTauri
+    ? ['Documentation', 'Keyboard Shortcuts', 'Check for Updates', 'About Aether Studio']
+    : ['Documentation', 'Keyboard Shortcuts', 'Download Desktop App', 'Check for Updates', 'About Aether Studio'],
 };
 
 const DIVIDER_ITEMS = new Set(['Exit', 'Preferences', 'Output Quality', 'Diagnostics', 'About Aether Studio', 'Actual Size', 'Toggle Source Rack', 'Fullscreen', 'Download Desktop App']);
