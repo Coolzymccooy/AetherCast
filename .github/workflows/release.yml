@@ -45,69 +45,80 @@ jobs:
         run: npm run build
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Signing keys for the auto-updater.
-          # Generate once with: npx tauri signer generate -w ~/.tauri/aethercast.key
-          # Then add TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD
-          # as repository secrets in GitHub → Settings → Secrets and variables → Actions.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "AetherCast ${{ github.ref_name }}"
-          releaseBody: |
-            ## AetherCast ${{ github.ref_name }}
+        run: npx tauri build --target ${{ matrix.target }}
 
-            Professional broadcast studio for live streaming.
-
-            ### Downloads
-            - **Windows**: `.msi` or `-setup.exe` installer
-
-            ### Features
-            - GPU-accelerated streaming (NVENC/QSV/AMF)
-            - Multi-destination output (RTMP/RTMPS/SRT/RIST)
-            - Real-time compositor with scene switching
-            - Pro audio processing (compressor, EQ, limiter, LUFS metering)
-            - AI-powered scene direction
-            - Lumina Presenter integration (remote go-live control)
-            - Instant replay buffer
-            - MIDI/Stream Deck support
-          releaseDraft: false
-          prerelease: false
-          tauriScript: npx tauri
-          args: --target ${{ matrix.target }}
-          # Disable tauri-action's own updater JSON generation — it's broken for Tauri v2
-          # and deletes the .nsis.zip files after failing. We generate latest.json ourselves.
-          includeUpdaterJson: false
-
-      - name: Upload stable latest asset aliases
+      - name: Create GitHub Release and upload all assets
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $targetBundleRoot = Join-Path $PWD "src-tauri\target\${{ matrix.target }}\release\bundle"
-          $bundleRoot = if (Test-Path $targetBundleRoot) { $targetBundleRoot } else { Join-Path $PWD "src-tauri\target\release\bundle" }
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          $bundleRoot = Join-Path $PWD "src-tauri\target\${{ matrix.target }}\release\bundle"
 
-          $exe = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*-setup.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          $msi = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.msi" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          Write-Host "Bundle contents:"
+          Get-ChildItem -Path $bundleRoot -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+
+          # Locate the main installers
+          $exe = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*-setup.exe" } | Select-Object -First 1
+          $msi = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Extension -eq ".msi" -and $_.Name -notlike "*.msi.zip" } | Select-Object -First 1
+
+          # Locate the update bundles (for auto-updater)
+          $nsisZip  = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip" -and $_.Name -notlike "*.nsis.zip.sig" } | Select-Object -First 1
+          $nsisSig  = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip.sig" } | Select-Object -First 1
 
           if ($null -eq $exe -or $null -eq $msi) {
-            throw "Could not locate Windows release bundles under $bundleRoot"
+            throw "Could not locate Windows installers under $bundleRoot"
           }
 
+          # Create stable-name aliases
           $aliasDir = Join-Path $PWD ".release-aliases"
           New-Item -ItemType Directory -Force -Path $aliasDir | Out-Null
-
           $exeAlias = Join-Path $aliasDir "Selton.Studio_latest_x64-setup.exe"
           $msiAlias = Join-Path $aliasDir "Selton.Studio_latest_x64_en-US.msi"
-
           Copy-Item $exe.FullName $exeAlias -Force
           Copy-Item $msi.FullName $msiAlias -Force
 
-          gh release upload "${{ github.ref_name }}" $exeAlias $msiAlias --clobber
+          # Create the GitHub release
+          $releaseBody = @"
+          ## AetherCast $tag
+
+          Professional broadcast studio for live streaming.
+
+          ### Downloads
+          - **Windows**: ``.msi`` or ``-setup.exe`` installer
+
+          ### Features
+          - GPU-accelerated streaming (NVENC/QSV/AMF)
+          - Multi-destination output (RTMP/RTMPS/SRT/RIST)
+          - Real-time compositor with scene switching
+          - Pro audio processing (compressor, EQ, limiter, LUFS metering)
+          - AI-powered scene direction
+          - Lumina Presenter integration (remote go-live control)
+          - Instant replay buffer
+          - MIDI/Stream Deck support
+          "@
+
+          gh release create $tag `
+            --title "AetherCast $tag" `
+            --notes $releaseBody `
+            --latest `
+            $exe.FullName `
+            $msi.FullName `
+            $exeAlias `
+            $msiAlias
+
+          # Upload update bundles if present (needed for latest.json auto-updater)
+          if ($null -ne $nsisZip -and $null -ne $nsisSig) {
+            Write-Host "Uploading update bundles: $($nsisZip.Name)"
+            gh release upload $tag $nsisZip.FullName $nsisSig.FullName --clobber
+          } else {
+            Write-Warning "No .nsis.zip found — auto-updater will not work for this release"
+          }
 
       - name: Generate and upload latest.json update manifest
         if: matrix.platform == 'windows-latest'
@@ -115,36 +126,30 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Find the signed .nsis.zip and .nsis.zip.sig produced by tauri-action
-          $targetBundleRoot = Join-Path $PWD "src-tauri\target\${{ matrix.target }}\release\bundle"
-          $bundleRoot = if (Test-Path $targetBundleRoot) { $targetBundleRoot } else { Join-Path $PWD "src-tauri\target\release\bundle" }
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          $bundleRoot = Join-Path $PWD "src-tauri\target\${{ matrix.target }}\release\bundle"
 
-          # Use Where-Object instead of -Filter to avoid Windows wildcard quirks with multi-dot names
-          $allBundleFiles = Get-ChildItem -Path $bundleRoot -Recurse | Select-Object -ExpandProperty FullName
-          Write-Host "Bundle files found: $($allBundleFiles.Count)"
-          $allBundleFiles | ForEach-Object { Write-Host "  $_" }
-
-          $nsisZip = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip" -and $_.Name -notlike "*.nsis.zip.sig" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          $nsisSig = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip.sig" } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          $nsisZip = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip" -and $_.Name -notlike "*.nsis.zip.sig" } | Select-Object -First 1
+          $nsisSig = Get-ChildItem -Path $bundleRoot -Recurse | Where-Object { $_.Name -like "*.nsis.zip.sig" } | Select-Object -First 1
 
           if ($null -eq $nsisZip -or $null -eq $nsisSig) {
-            Write-Warning "Signed NSIS bundle not found — skipping latest.json generation. Add TAURI_SIGNING_PRIVATE_KEY secret to enable auto-update."
+            Write-Warning "Signed NSIS bundle not found — skipping latest.json generation"
             exit 0
           }
 
-          $signature = Get-Content $nsisSig.FullName -Raw
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $signature = (Get-Content $nsisSig.FullName -Raw).Trim()
           $pubDate = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
-          $downloadUrl = "https://github.com/Coolzymccooy/AetherCast/releases/download/${{ github.ref_name }}/$($nsisZip.Name)"
+          $downloadUrl = "https://github.com/Coolzymccooy/AetherCast/releases/download/$tag/$($nsisZip.Name)"
 
           $manifest = @{
             version = $version
-            notes = "AetherCast ${{ github.ref_name }} — see release page for details."
+            notes = "AetherCast $tag — see release page for details."
             pub_date = $pubDate
             platforms = @{
               "windows-x86_64" = @{
                 url = $downloadUrl
-                signature = $signature.Trim()
+                signature = $signature
                 with_elevated_task = $true
               }
             }
@@ -153,12 +158,5 @@ jobs:
           $manifestPath = Join-Path $PWD "latest.json"
           $manifest | Set-Content $manifestPath -Encoding utf8
 
-          gh release upload "${{ github.ref_name }}" $manifestPath --clobber
-
-      - name: Mark release as latest
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release edit "${{ github.ref_name }}" --latest
+          Write-Host "Uploading latest.json pointing to $downloadUrl"
+          gh release upload $tag $manifestPath --clobber
