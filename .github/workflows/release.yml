@@ -78,6 +78,9 @@ jobs:
           prerelease: false
           tauriScript: npx tauri
           args: --target ${{ matrix.target }}
+          # Disable tauri-action's own updater JSON generation — it's broken for Tauri v2
+          # and deletes the .nsis.zip files after failing. We generate latest.json ourselves.
+          includeUpdaterJson: false
 
       - name: Upload stable latest asset aliases
         if: matrix.platform == 'windows-latest'
