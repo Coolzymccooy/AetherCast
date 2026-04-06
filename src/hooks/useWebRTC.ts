@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import Peer from 'simple-peer';
 import PeerJS, { MediaConnection } from 'peerjs';
-import { Scene, Source, ServerLog, AudioChannel, ScenePreset } from '../types';
+import { Scene, Source, ServerLog, AudioChannel, ScenePreset, AudienceMessage } from '../types';
 import { ROOM_ID, CLOUD_URL } from '../constants';
 import { hostPeerId, inferPeerRole } from '../utils/peerId';
 import { getPeerEnv } from '../utils/peerEnv';
@@ -19,7 +19,7 @@ interface UseWebRTCOptions {
   loadScenePreset?: (id: string) => void;
   setActiveTheme?: (theme: string) => void;
   setServerLogs: React.Dispatch<React.SetStateAction<ServerLog[]>>;
-  setAudienceMessages: React.Dispatch<React.SetStateAction<any[]>>;
+  setAudienceMessages: React.Dispatch<React.SetStateAction<AudienceMessage[]>>;
   audioChannels: AudioChannel[];
   setAudioChannels: React.Dispatch<React.SetStateAction<AudioChannel[]>>;
   setSources: React.Dispatch<React.SetStateAction<Source[]>>;

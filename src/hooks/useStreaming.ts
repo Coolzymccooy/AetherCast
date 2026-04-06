@@ -1,13 +1,14 @@
 import { useState, useRef, MutableRefObject, useEffect, useCallback } from 'react';
-import { StreamDestination, Recording, ServerLog, EncodingProfile } from '../types';
+import { Socket } from 'socket.io-client';
+import { StreamDestination, Recording, ServerLog, EncodingProfile, Telemetry } from '../types';
 import { audioEngine } from '../lib/audioEngine';
 
 interface UseStreamingOptions {
-  socketRef: MutableRefObject<any>;
+  socketRef: MutableRefObject<Socket | null>;
   isStreaming: boolean;
   setIsStreaming: (v: boolean) => void;
   setServerLogs: React.Dispatch<React.SetStateAction<ServerLog[]>>;
-  setTelemetry: React.Dispatch<React.SetStateAction<any>>;
+  setTelemetry: React.Dispatch<React.SetStateAction<Telemetry>>;
   onError?: (message: string) => void;
   onSuccess?: (message: string) => void;
 }

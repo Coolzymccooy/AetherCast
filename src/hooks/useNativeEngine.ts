@@ -1,10 +1,12 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
-import type { StreamDestination, ServerLog, EncodingProfile } from '../types';
+import type { StreamDestination, ServerLog, EncodingProfile, Telemetry } from '../types';
 import type { NativeSceneSnapshot, NativeSourceDescriptor } from '../lib/sceneSchema';
 
+type TauriInvoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+
 interface UseNativeEngineOptions {
-  setTelemetry?: Dispatch<SetStateAction<any>>;
+  setTelemetry?: Dispatch<SetStateAction<Telemetry>>;
   setServerLogs?: Dispatch<SetStateAction<ServerLog[]>>;
   onError?: (message: string) => void;
   onSuccess?: (message: string) => void;
@@ -417,7 +419,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   const widthRef = useRef(1280);
   const heightRef = useRef(720);
   const scaleCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const invokeRef = useRef<any>(null);
+  const invokeRef = useRef<TauriInvoke | null>(null);
   const isStreamingRef = useRef(false);
   const lastNativeStateRef = useRef<NativeStreamStats | null>(null);
   const bridgeSocketRef = useRef<WebSocket | null>(null);
@@ -530,7 +532,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         finish(true);
       };
 
-      socket.onerror = () => {
+      socket.onerror = (event) => {
+        addServerLog(`Native frame bridge connection error${reconnectReason ? ` (${reconnectReason})` : ''}: ${(event as ErrorEvent).message || 'WebSocket error'}`, 'warning');
         finish(false);
       };
 
@@ -595,7 +598,8 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         }
       };
 
-      socket.onerror = () => {
+      socket.onerror = (event) => {
+        addServerLog(`Native source bridge connection error for ${sourceId}: ${(event as ErrorEvent).message || 'WebSocket error'}`, 'warning');
         finish(null);
       };
 
@@ -750,7 +754,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         stats: native,
       });
       if (diagnosticsHistoryRef.current.length > 7200) {
-        diagnosticsHistoryRef.current.splice(0, diagnosticsHistoryRef.current.length - 7200);
+        diagnosticsHistoryRef.current = diagnosticsHistoryRef.current.slice(-7200);
       }
 
       if (native.restarting && !previous?.restarting) {

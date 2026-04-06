@@ -542,11 +542,7 @@ function StudioView() {
       }
 
       const activeSourceFeeds = nativeSourceFeeds.getCaptureSources();
-      if (nativeVideoSources.length === 0 && activeSourceFeeds.length === 0) {
-        appendStudioLog(`${origin} could not start streaming because the compositor has no active sources.`, 'warning');
-        notify('Your program view is empty — add a camera, screen, or media source before going live.', 'warning');
-        return false;
-      }
+      const hasVideoSources = nativeVideoSources.length > 0 || activeSourceFeeds.length > 0;
 
       const micChannels = studio.audioChannels.filter((channel) => /^Mic/i.test(channel.name));
       const systemChannel = studio.audioChannels.find((channel) => channel.name === 'System');
@@ -559,7 +555,10 @@ function StudioView() {
           includeSystemAudio: systemChannel ? !systemChannel.muted && systemChannel.volume > 0 : true,
           audioBuses: nativeAudioBuses,
           nativeVideoSources,
-          sourceFeeds: nativeSourceFeeds.getCaptureSources,
+          // Only pass sourceFeeds when there are active WebRTC/media sources.
+          // With no sources, omit this so startStream uses raw canvas mode instead
+          // of native-scene mode (which starts an idle source bridge with no feeds).
+          sourceFeeds: hasVideoSources ? nativeSourceFeeds.getCaptureSources : undefined,
         });
 
         studio.setIsStreaming(true);

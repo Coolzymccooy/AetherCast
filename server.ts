@@ -190,8 +190,10 @@ const LUMINA_ALLOWED_EVENTS = new Set([
   'lumina.recording.request',
 ]);
 
-/** Allowed origins for CORS — allow all origins to support Tauri desktop + web */
-const ALLOWED_ORIGINS = "*";
+/** Allowed origins for CORS */
+const ALLOWED_ORIGINS = process.env.NODE_ENV === 'production' && process.env.PUBLIC_URL
+  ? [process.env.PUBLIC_URL, 'tauri://localhost', 'https://tauri.localhost']
+  : '*';
 
 /** Sanitize user-supplied strings to prevent injection */
 function sanitizeText(input: string, maxLength = 500): string {
@@ -1120,16 +1122,16 @@ async function startServer() {
   // ──────────────────────────────────────────────────────────────────────────────
 
   app.get('/.well-known/assetlinks.json', (_req, res) => {
+    const fingerprint = process.env.APK_CERT_FINGERPRINT;
+    if (!fingerprint || fingerprint === 'REPLACE_WITH_YOUR_SHA256_CERT_FINGERPRINT') {
+      console.warn('[assetlinks] APK_CERT_FINGERPRINT env var is not set — Android App Links will not verify correctly in production.');
+    }
     res.json([{
       relation: ['delegate_permission/common.handle_all_urls'],
       target: {
         namespace: 'android_app',
         package_name: 'com.selton.studio',
-        // TODO: replace with your actual APK release signing certificate SHA256
-        // Get it with: keytool -list -v -keystore release.keystore | grep SHA256
-        sha256_cert_fingerprints: [
-          process.env.APK_CERT_FINGERPRINT ?? 'REPLACE_WITH_YOUR_SHA256_CERT_FINGERPRINT',
-        ],
+        sha256_cert_fingerprints: fingerprint ? [fingerprint] : [],
       },
     }]);
   });
