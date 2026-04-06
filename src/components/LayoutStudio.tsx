@@ -62,6 +62,7 @@ export const LayoutStudio: React.FC<LayoutStudioProps> = ({
   const [applyText, setApplyText] = useState('Apply Layout');
   const [swapText, setSwapText] = useState('Swap Layout');
   const [saveText, setSaveText] = useState('Save Preset');
+  const [isExpanded, setIsExpanded] = useState(true);
 
   const handleApply = () => {
     onApplyLayout();
@@ -94,12 +95,25 @@ export const LayoutStudio: React.FC<LayoutStudioProps> = ({
           <Layers size={18} className="text-accent-cyan" />
           <h2 className="text-sm font-bold tracking-tight">Layout Studio</h2>
         </div>
-        <button className="text-[10px] uppercase font-bold text-gray-500 hover:text-white transition-colors">
-          Toggle
+        <button
+          onClick={() => setIsExpanded(e => !e)}
+          className="text-[10px] uppercase font-bold text-gray-500 hover:text-white transition-colors flex items-center gap-1"
+        >
+          {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+          {isExpanded ? 'Collapse' : 'Expand'}
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto custom-scrollbar p-4 space-y-6">
+      <AnimatePresence initial={false}>
+      {isExpanded && <motion.div
+        key="layout-content"
+        initial={{ height: 0, opacity: 0 }}
+        animate={{ height: 'auto', opacity: 1 }}
+        exit={{ height: 0, opacity: 0 }}
+        transition={{ duration: 0.25, ease: 'easeInOut' }}
+        className="overflow-hidden"
+      >
+      <div className="overflow-y-auto custom-scrollbar p-4 space-y-6">
         {/* Composer Mode Section */}
         <div className="flex items-center justify-between">
           <div>
@@ -232,7 +246,7 @@ export const LayoutStudio: React.FC<LayoutStudioProps> = ({
       </div>
 
       {/* Action Buttons */}
-      <div className="p-4 border-t border-white/5 bg-panel/20">
+      <div className="p-4 border-t border-white/5 bg-panel/20 flex-shrink-0">
         <div className="grid grid-cols-2 gap-2">
           <button 
             onClick={onPreviewLayout}
@@ -266,6 +280,8 @@ export const LayoutStudio: React.FC<LayoutStudioProps> = ({
           </button>
         </div>
       </div>
+      </motion.div>}
+      </AnimatePresence>
     </div>
   );
 };

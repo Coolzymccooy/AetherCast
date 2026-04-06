@@ -907,7 +907,7 @@ function StudioView() {
           />
           </ErrorBoundary>
 
-          <div className="h-72 flex-shrink-0 flex border-t border-border bg-panel overflow-hidden">
+          <div className="h-[22rem] flex-shrink-0 flex border-t border-border bg-panel">
             <ErrorBoundary name="Scene Switcher" onError={(err) => notify(err.message, 'error')}>
             <SceneSwitcher scenes={studio.scenes} activeScene={studio.activeScene} onSceneChange={studio.setActiveScene} />
             </ErrorBoundary>

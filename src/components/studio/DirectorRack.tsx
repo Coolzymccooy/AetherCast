@@ -159,7 +159,8 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
   onOpenQrModal,
   proAudio, mediaPlayer, replay, midi,
 }) => {
-  const TABS: DirectorTab[] = ['CAMO', 'PROP', 'IN', 'AI', 'OPS', 'AUD', 'FX', 'MED', 'RPL', 'MIDI'];
+  const TABS_ROW1: DirectorTab[] = ['CAMO', 'PROP', 'IN', 'AI', 'OPS'];
+  const TABS_ROW2: DirectorTab[] = ['AUD', 'FX', 'MED', 'RPL', 'MIDI'];
 
   const [remoteUrl, setRemoteUrl] = useState<string>('');
   useEffect(() => {
@@ -171,21 +172,25 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
 
   return (
     <div className="w-80 bg-panel border-l border-border flex flex-col shadow-2xl z-20">
-      {/* Tab Navigation */}
-      <div className="flex border-b border-border bg-black/20">
-        {TABS.map(tab => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className={`flex-1 py-3 text-[10px] font-bold tracking-widest transition-all relative ${
-              activeTab === tab ? 'text-accent-cyan bg-white/5' : 'text-gray-500 hover:text-gray-300'
-            }`}
-          >
-            {tab}
-            {activeTab === tab && (
-              <motion.div layoutId="activeTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-cyan" />
-            )}
-          </button>
+      {/* Tab Navigation — 2 rows of 5 */}
+      <div className="border-b border-border bg-black/20">
+        {[TABS_ROW1, TABS_ROW2].map((row, rowIdx) => (
+          <div key={rowIdx} className={`flex ${rowIdx === 0 ? 'border-b border-border/40' : ''}`}>
+            {row.map(tab => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`flex-1 py-2 text-[10px] font-bold tracking-wider transition-all relative ${
+                  activeTab === tab ? 'text-accent-cyan bg-white/5' : 'text-gray-500 hover:text-gray-300'
+                }`}
+              >
+                {tab}
+                {activeTab === tab && (
+                  <motion.div layoutId="activeTab" className="absolute bottom-0 left-0 right-0 h-0.5 bg-accent-cyan" />
+                )}
+              </button>
+            ))}
+          </div>
         ))}
       </div>
 
