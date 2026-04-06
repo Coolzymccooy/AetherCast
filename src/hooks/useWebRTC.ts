@@ -610,8 +610,9 @@ export function useWebRTC({
 
     const socket = io(serverUrl, {
       reconnection: true,
-      reconnectionAttempts: 10,
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 2000,
+      reconnectionDelayMax: 15000,
       timeout: 10000,
     });
     socketRef.current = socket;
@@ -619,6 +620,10 @@ export function useWebRTC({
     socket.on('connect', () => {
       setIsSocketConnected(true);
       appendServerLog(`Socket connected to ${serverUrl || window.location.origin}`, 'success');
+      socket.emit('join-room', roomId);
+    });
+    socket.on('reconnect', (attempt: number) => {
+      appendServerLog(`Socket reconnected after ${attempt} attempt${attempt !== 1 ? 's' : ''}`, 'success');
       socket.emit('join-room', roomId);
     });
     socket.on('disconnect', () => {

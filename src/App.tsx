@@ -48,6 +48,7 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { DownloadModal } from './components/studio/DownloadModal';
 import { CheckForUpdatesModal } from './components/studio/CheckForUpdatesModal';
 import { KeyboardShortcuts } from './components/studio/KeyboardShortcuts';
+import { AboutModal } from './components/studio/AboutModal';
 
 // --- Other Views ---
 import { AudienceLanding } from './components/AudienceLanding';
@@ -124,6 +125,7 @@ function StudioView() {
   const [showShortcuts, setShowShortcuts] = React.useState(false);
   const [showDownload, setShowDownload] = React.useState(false);
   const [showCheckUpdates, setShowCheckUpdates] = React.useState(false);
+  const [showAbout, setShowAbout] = React.useState(false);
   const programViewRef = React.useRef<ProgramViewHandle>(null);
   const lastBrowserSourceNoticeRef = React.useRef<string | null>(null);
   const [browserSourceUrl, setBrowserSourceUrl] = React.useState(() => localStorage.getItem('aether_browser_source_url') || '');
@@ -674,10 +676,13 @@ function StudioView() {
       case 'Toggle Source Rack': setShowSourceRack(prev => !prev); break;
       case 'Toggle Director Rack': setShowDirectorRack(prev => !prev); break;
       case 'Toggle Telemetry': setShowTelemetry(prev => !prev); break;
+      case 'Documentation':
+        window.open('https://github.com/Coolzymccooy/AetherCast', '_blank', 'noopener,noreferrer');
+        break;
       case 'Keyboard Shortcuts': setShowShortcuts(true); break;
       case 'Download Desktop App': setShowDownload(true); break;
       case 'Check for Updates': setShowCheckUpdates(true); break;
-      case 'About Aether Studio': setShowDownload(true); break;
+      case 'About Aether Studio': setShowAbout(true); break;
       default: break;
     }
   };
@@ -1217,6 +1222,9 @@ function StudioView() {
 
       {/* Check for Updates Modal */}
       {showCheckUpdates && <CheckForUpdatesModal onClose={() => setShowCheckUpdates(false)} />}
+
+      {/* About Aether Studio Modal */}
+      {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
     </div>
   );
 }

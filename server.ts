@@ -346,8 +346,9 @@ async function startServer() {
     const ignoredExitPids = new Set<number>();
 
     // ── FFmpeg Watchdog State ─────────────────────────────────────────────
-    const RESTART_LIMIT = 5;
-    const RESTART_WINDOW_MS = 60_000;
+    const RESTART_LIMIT = 10;
+    const RESTART_WINDOW_MS = 120_000;
+    const COOLDOWN_RESTART_DELAY_MS = 120_000; // 2-min cooldown after limit before one final retry
     let restartTimestamps: number[] = [];
     let intentionallyStopped = false;
     let lastFFmpegStartupIssue: 'missing-lavfi' | null = null;
@@ -867,18 +868,37 @@ async function startServer() {
       restartTimestamps = restartTimestamps.filter(t => now - t < RESTART_WINDOW_MS);
 
       if (restartTimestamps.length >= RESTART_LIMIT) {
-        const msg = 'FFmpeg restart limit reached, stream failed';
-        console.error(msg);
-        socket.emit('server-log', { message: msg, type: 'error' });
-        socket.emit('stream-failed', { message: msg });
-        if (currentSession) currentSession.errors.push({ time: now, message: msg });
-        finalizeSession();
+        const cooldownMsg = `FFmpeg restart limit reached (${RESTART_LIMIT} in ${RESTART_WINDOW_MS / 1000}s). Waiting ${COOLDOWN_RESTART_DELAY_MS / 1000}s before one final recovery attempt...`;
+        console.warn(cooldownMsg);
+        socket.emit('server-log', { message: cooldownMsg, type: 'warning' });
+        if (currentSession) currentSession.errors.push({ time: now, message: cooldownMsg });
+
+        // After cooldown, clear the restart window and try once more before giving up
+        setTimeout(() => {
+          if (intentionallyStopped || !lastStartData) return;
+          restartTimestamps = [];
+          destroyActivePipeline(true);
+          lastFFmpegSpawnTime = Date.now();
+          lastChunkTime = Date.now();
+          const success = spawnFFmpeg(lastStartData);
+          if (success) {
+            socket.emit('server-log', { message: 'FFmpeg recovered after cooldown restart', type: 'success' });
+            socket.emit('stream-recovered', { attempt: 'cooldown', timestamp: Date.now() });
+          } else {
+            const failMsg = 'FFmpeg cooldown restart failed — stream stopped';
+            console.error(failMsg);
+            socket.emit('server-log', { message: failMsg, type: 'error' });
+            socket.emit('stream-failed', { message: failMsg });
+            if (currentSession) currentSession.errors.push({ time: Date.now(), message: failMsg });
+            finalizeSession();
+          }
+        }, COOLDOWN_RESTART_DELAY_MS);
         return;
       }
 
       restartTimestamps.push(now);
       const attemptNum = restartTimestamps.length;
-      const msg = `FFmpeg crashed after ${Math.round((now - lastFFmpegSpawnTime) / 1000)}s, attempting restart (${attemptNum}/${RESTART_LIMIT})...`;
+      const msg = `FFmpeg crashed after ${Math.round((now - lastFFmpegSpawnTime) / 1000)}s — attempting restart ${attemptNum}/${RESTART_LIMIT}`;
       console.log(msg);
       socket.emit('server-log', { message: msg, type: 'warning' });
       if (currentSession) {
