@@ -723,8 +723,17 @@ async function startServer() {
           '-y', '-hide_banner', '-loglevel', 'warning',
           '-fflags', '+genpts+discardcorrupt+nobuffer',
           '-thread_queue_size', '4096',
+          // Give FFmpeg time to find SPS/PPS before giving up on codec params.
+          // Pipes default to analyzeduration=0 which causes "unspecified size" on reconnect.
+          '-analyzeduration', '5000000',
+          '-probesize', '10000000',
+          // Use wall-clock timestamps so FLV muxer gets valid PTS/DTS.
+          // Raw H.264 Annex B has no embedded timing — without this Twitch
+          // receives packets with unset timestamps and won't start the broadcast.
+          '-use_wallclock_as_timestamps', '1',
           '-f', 'h264',
           '-framerate', '30',
+          '-r', '30',
           '-i', 'pipe:0',
           ...(disableSyntheticAudio ? [] : ['-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo']),
           '-map', '0:v:0',
