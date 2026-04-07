@@ -170,6 +170,22 @@ for (const p of FFMPEG_PATHS) {
 }
 // Also check PATH as fallback (works if terminal was restarted after install)
 
+// Probe FFmpeg for TLS/RTMPS protocol support at startup
+{
+  const probe = spawn(resolvedFFmpegPath, ['-protocols', '-hide_banner'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let probeOut = '';
+  probe.stdout?.on('data', (d: Buffer) => { probeOut += d.toString(); });
+  probe.stderr?.on('data', (d: Buffer) => { probeOut += d.toString(); });
+  probe.on('close', () => {
+    const hasTls = /\btls\b/.test(probeOut);
+    const hasRtmps = /\brtmps\b/.test(probeOut);
+    console.log(`[ffmpeg-probe] TLS: ${hasTls}, RTMPS: ${hasRtmps}`);
+    if (!hasTls) {
+      console.warn('[ffmpeg-probe] WARNING: FFmpeg has no TLS support — RTMPS to Twitch will fail. Ensure ca-certificates + openssl are installed.');
+    }
+  });
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 

@@ -14,8 +14,9 @@ RUN npm run build
 # ── Stage 2: Production runtime ─────────────────────────────────────────────
 FROM node:22-alpine AS runtime
 
-# Install FFmpeg plus curl for Coolify HTTP health checks
-RUN apk add --no-cache ffmpeg ffmpeg-libs curl
+# Install FFmpeg plus TLS support for RTMPS (Twitch/YouTube) and health check
+RUN apk add --no-cache ffmpeg ffmpeg-libs curl ca-certificates openssl && \
+    update-ca-certificates
 
 WORKDIR /app
 
