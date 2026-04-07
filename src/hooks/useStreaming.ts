@@ -44,7 +44,7 @@ const BROWSER_STREAM_PROFILES: Record<EncodingProfile, BrowserStreamProfile> = {
   '480p30': { captureFps: 30, videoBitsPerSecond: 2_000_000 },
 };
 
-const RECORDER_TIMESLICE_MS = 1000;
+const RECORDER_TIMESLICE_MS = 33; // ~1 frame at 30fps; prevents 30-frame bursts that cause non-monotonic DTS on Twitch
 const HEALTH_CHECK_INTERVAL_MS = 2000;
 const REQUEST_DATA_AFTER_MS = 2500;
 const RESTART_AFTER_MS = 6000;
