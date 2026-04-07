@@ -797,7 +797,7 @@ function StudioView() {
         <div className="flex items-center gap-2 mr-auto">
           <div className={`w-2 h-2 rounded-full ${webrtc.isSocketConnected ? 'bg-accent-cyan animate-pulse' : 'bg-accent-red'}`} />
           <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
-            {webrtc.isSocketConnected ? 'Engine Connected' : 'Engine Offline'}
+            {webrtc.isSocketConnected ? 'Server Connected' : 'Server Offline'}
           </span>
           {!webrtc.isSocketConnected && (
             <button onClick={webrtc.reconnectSocket} className="text-[10px] text-accent-cyan underline hover:text-white ml-2">

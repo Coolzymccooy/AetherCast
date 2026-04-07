@@ -84,6 +84,13 @@ class FMP4Demuxer extends Transform {
           this.parseAvcC(data.subarray(i + 8, i + size));
           // Emit codec data for caching (used on watchdog restarts)
           this.emit('codec-data', { sps: this.sps, pps: this.pps });
+          // Push SPS/PPS immediately so FFmpeg gets codec params without
+          // waiting for the first mdat — prevents "unspecified size" probe error
+          if (this.sps && !this.headerSent) {
+            this.push(ANNEXB_START_CODE); this.push(this.sps);
+            if (this.pps) { this.push(ANNEXB_START_CODE); this.push(this.pps); }
+            this.headerSent = true;
+          }
         }
         break;
       }
@@ -192,7 +199,7 @@ const SOCKET_AUTH_TOKEN = loadOrCreateToken();
 
 /** Allowed origins for CORS */
 const ALLOWED_ORIGINS = process.env.NODE_ENV === 'production' && process.env.PUBLIC_URL
-  ? [process.env.PUBLIC_URL, 'tauri://localhost', 'https://tauri.localhost']
+  ? [process.env.PUBLIC_URL, 'tauri://localhost', 'https://tauri.localhost', 'http://tauri.localhost']
   : '*';
 
 /** Per-socket rate limiter: max `limit` events per `windowMs` */
