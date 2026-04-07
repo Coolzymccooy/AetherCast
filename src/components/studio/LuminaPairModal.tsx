@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { X, Copy, Check, RefreshCw, Link, Wifi, WifiOff } from 'lucide-react';
 import { motion } from 'motion/react';
 import { getRoomIdFromSearch, isValidRoomId } from '../../utils/roomId';
+import { CLOUD_URL } from '../../constants';
 
 interface LuminaPairModalProps {
   onClose: () => void;
@@ -26,27 +27,36 @@ export const LuminaPairModal: React.FC<LuminaPairModalProps> = ({ onClose }) => 
   const [copied, setCopied] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // In Tauri production the webview origin is http://tauri.localhost — no local server
+  // is reachable, so always use the cloud URL for both the pairing link and API calls.
+  const isTauri = !!(window as any).__TAURI_INTERNALS__;
+  const apiBase = isTauri ? CLOUD_URL : '';
+
   // Resolve base URL from server (same logic as QrModal)
   useEffect(() => {
+    if (isTauri) {
+      setBaseUrl(CLOUD_URL);
+      return;
+    }
     fetch('/api/local-ip')
       .then(r => r.json())
       .then(({ lanUrl, publicUrl }: { lanUrl?: string; publicUrl?: string | null }) => {
         setBaseUrl(publicUrl || lanUrl || window.location.origin);
       })
       .catch(() => setBaseUrl(window.location.origin));
-  }, []);
+  }, [isTauri]);
 
   // Poll Lumina connection status every 5 s
   const pollStatus = useCallback(() => {
     if (!roomId) return;
-    fetch(`/api/lumina/rooms/${encodeURIComponent(roomId)}/status`)
+    fetch(`${apiBase}/api/lumina/rooms/${encodeURIComponent(roomId)}/status`)
       .then(r => r.json())
       .then(({ connected: c, lastSeenMs: ts }: { connected: boolean; lastSeenMs: number | null }) => {
         setConnected(c);
         setLastSeenMs(ts);
       })
       .catch(() => {/* ignore */});
-  }, [roomId]);
+  }, [roomId, apiBase]);
 
   useEffect(() => {
     pollStatus();

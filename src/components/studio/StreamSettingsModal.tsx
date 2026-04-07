@@ -13,7 +13,8 @@ interface StreamSettingsModalProps {
 const PRESETS = [
   { name: 'YouTube', url: 'rtmp://a.rtmp.youtube.com/live2', icon: '🔴', color: 'text-red-500' },
   { name: 'YouTube (RTMPS)', url: 'rtmps://a.rtmp.youtube.com:443/live2', icon: '🔴', color: 'text-red-500' },
-  { name: 'Twitch', url: 'rtmp://live.twitch.tv/app', icon: '🟣', color: 'text-purple-500' },
+  { name: 'Twitch (RTMPS)', url: 'rtmps://live.twitch.tv:443/app', icon: '🟣', color: 'text-purple-500' },
+  { name: 'Twitch (RTMP)', url: 'rtmp://live.twitch.tv/app', icon: '🟣', color: 'text-purple-400' },
   { name: 'Facebook', url: 'rtmps://live-api-s.facebook.com:443/rtmp/', icon: '🔵', color: 'text-blue-500' },
   { name: 'Custom RTMP', url: '', icon: '🌐', color: 'text-gray-400' },
   { name: 'Custom SRT', url: 'srt://', icon: '📡', color: 'text-cyan-400' },

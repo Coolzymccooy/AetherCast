@@ -523,7 +523,12 @@ async function startServer() {
       for (const dest of rtmpDests) {
         // Strip librtmp-style "key=" prefix if someone pasted it — FFmpeg's internal RTMP handler rejects it
         const cleanKey = (dest.streamKey || '').replace(/^key=/i, '');
-        const url = `${(dest.rtmpUrl || dest.url).replace(/\/$/, '')}/${cleanKey}`;
+        let destUrl = (dest.rtmpUrl || dest.url).replace(/\/$/, '');
+        // Auto-upgrade Twitch RTMP → RTMPS: ISPs commonly block outbound port 1935
+        if (/^rtmp:\/\/live\.twitch\.tv/.test(destUrl)) {
+          destUrl = destUrl.replace('rtmp://live.twitch.tv', 'rtmps://live.twitch.tv:443');
+        }
+        const url = `${destUrl}/${cleanKey}`;
         teeSegments.push(`[f=flv:onfail=ignore]${url}`);
       }
 

@@ -513,7 +513,16 @@ function StudioView() {
     }
 
     const requestedProfile = resolveLuminaProfile(payload) || streaming.encodingProfile;
-    const activeDestinations = resolveLuminaDestinations(payload);
+    const rawDestinations = resolveLuminaDestinations(payload);
+    // Auto-upgrade Twitch RTMP → RTMPS (port 1935 is commonly blocked by ISPs)
+    const activeDestinations = rawDestinations.map((d) => {
+      const url = d.rtmpUrl || d.url || '';
+      if (/^rtmp:\/\/live\.twitch\.tv/.test(url)) {
+        const upgraded = url.replace('rtmp://live.twitch.tv', 'rtmps://live.twitch.tv:443');
+        return { ...d, rtmpUrl: upgraded, url: upgraded };
+      }
+      return d;
+    });
 
     if (!activeDestinations.length) {
       appendStudioLog(`${origin} could not start streaming because no saved destinations were selected.`, 'warning');
@@ -836,7 +845,7 @@ function StudioView() {
             ref={programViewRef}
             activeScene={studio.activeScene}
             sources={studio.sources}
-            isStreaming={studio.isStreaming}
+            isStreaming={studio.isStreaming || nativeEngine.isStreaming}
             isRecording={streaming.isRecording}
             onToggleStreaming={() => {
               if (studio.isStreaming || nativeEngine.isStreaming) {
