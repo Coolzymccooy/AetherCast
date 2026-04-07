@@ -527,6 +527,7 @@ function StudioView() {
     if (!activeDestinations.length) {
       appendStudioLog(`${origin} could not start streaming because no saved destinations were selected.`, 'warning');
       if (origin === 'Operator') {
+        notify('No stream destinations configured. Add a destination to start.', 'warning');
         studio.setShowStreamSettings(true);
       } else {
         notify('Lumina start ignored: no matching Aether destinations were found.', 'warning');
@@ -540,6 +541,7 @@ function StudioView() {
     if (incompleteDestination) {
       appendStudioLog(`${origin} could not start streaming because '${incompleteDestination.name}' is missing a URL or stream key.`, 'warning');
       if (origin === 'Operator') {
+        notify(`'${incompleteDestination.name}' is missing a stream key. Update it to start.`, 'warning');
         studio.setShowStreamSettings(true);
       } else {
         notify(`Lumina start ignored: '${incompleteDestination.name}' is not fully configured in Aether.`, 'warning');
