@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { X, Camera, Mic, Check, Monitor, RefreshCw, AlertTriangle, Volume2, Speaker } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { X, Camera, Mic, Check, Monitor, RefreshCw, AlertTriangle, Volume2 } from 'lucide-react';
 import { motion } from 'motion/react';
 
 interface HardwareSetupModalProps {
@@ -11,7 +11,7 @@ interface HardwareSetupModalProps {
   selectedAudioDevice: string;
   setSelectedAudioDevice: (id: string) => void;
   onClose: () => void;
-  onStart: () => void;
+  onStart: () => Promise<boolean | void> | boolean | void;
   onRefreshDevices?: () => Promise<MediaDeviceInfo[] | void>;
 }
 
@@ -25,76 +25,118 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
   const audioInputDevices = devices.filter(d => d.kind === 'audioinput');
   const audioOutputDevices = devices.filter(d => d.kind === 'audiooutput');
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(false);
   const [selectedAudioOutput, setSelectedAudioOutput] = useState('');
   const [previewStream, setPreviewStream] = useState<MediaStream | null>(null);
+  const previewStreamRef = React.useRef<MediaStream | null>(null);
   const previewRef = React.useRef<HTMLVideoElement>(null);
 
-  // Auto-refresh devices on mount if none are available
-  useEffect(() => {
-    if (devices.length === 0 && onRefreshDevices) {
-      handleRefresh();
+  const stopPreview = React.useCallback(async () => {
+    const activePreview = previewStreamRef.current;
+    previewStreamRef.current = null;
+
+    if (previewRef.current) {
+      previewRef.current.srcObject = null;
+    }
+
+    if (activePreview) {
+      activePreview.getTracks().forEach(track => track.stop());
+    }
+
+    setPreviewStream(null);
+
+    if (activePreview) {
+      // Some Windows camera drivers need a beat after stop() before reopening.
+      await new Promise(resolve => window.setTimeout(resolve, 150));
     }
   }, []);
 
-  // Preview selected camera
-  useEffect(() => {
-    if (!selectedVideoDevice) {
-      if (previewStream) {
-        previewStream.getTracks().forEach(t => t.stop());
-        setPreviewStream(null);
-      }
-      return;
-    }
-
-    let cancelled = false;
-    navigator.mediaDevices.getUserMedia({
-      video: { deviceId: { exact: selectedVideoDevice }, width: { ideal: 640 }, height: { ideal: 360 } },
-      audio: false,
-    }).then(stream => {
-      if (cancelled) { stream.getTracks().forEach(t => t.stop()); return; }
-      setPreviewStream(stream);
-      if (previewRef.current) {
-        previewRef.current.srcObject = stream;
-        previewRef.current.play().catch(() => {});
-      }
-    }).catch(() => { /* preview failed — non-critical */ });
-
-    return () => {
-      cancelled = true;
-      if (previewStream) {
-        previewStream.getTracks().forEach(t => t.stop());
-      }
-    };
-  }, [selectedVideoDevice]);
-
-  // Clean up preview on unmount
-  useEffect(() => {
-    return () => {
-      if (previewStream) previewStream.getTracks().forEach(t => t.stop());
-    };
-  }, []);
-
-  const handleRefresh = async () => {
+  const handleRefresh = React.useCallback(async () => {
     setIsRefreshing(true);
     try {
       await onRefreshDevices?.();
     } finally {
       setIsRefreshing(false);
     }
-  };
+  }, [onRefreshDevices]);
 
-  const handleStart = () => {
-    // Stop preview before starting real capture
-    if (previewStream) {
-      previewStream.getTracks().forEach(t => t.stop());
-      setPreviewStream(null);
+  useEffect(() => {
+    if (devices.length === 0 && onRefreshDevices) {
+      void handleRefresh();
     }
-    onStart();
+  }, [devices.length, handleRefresh, onRefreshDevices]);
+
+  useEffect(() => {
+    if (!selectedVideoDevice) {
+      void stopPreview();
+      return;
+    }
+
+    let cancelled = false;
+    let localPreview: MediaStream | null = null;
+
+    const startPreview = async () => {
+      await stopPreview();
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            deviceId: { exact: selectedVideoDevice },
+            width: { ideal: 640 },
+            height: { ideal: 360 },
+          },
+          audio: false,
+        });
+
+        if (cancelled) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
+        localPreview = stream;
+        previewStreamRef.current = stream;
+        setPreviewStream(stream);
+
+        if (previewRef.current) {
+          previewRef.current.srcObject = stream;
+          previewRef.current.play().catch(() => {});
+        }
+      } catch {
+        // Preview is best-effort. Real initialization surfaces actionable errors.
+      }
+    };
+
+    void startPreview();
+
+    return () => {
+      cancelled = true;
+      if (localPreview) {
+        localPreview.getTracks().forEach(track => track.stop());
+        if (previewStreamRef.current === localPreview) {
+          previewStreamRef.current = null;
+        }
+      }
+    };
+  }, [selectedVideoDevice, stopPreview]);
+
+  useEffect(() => {
+    return () => {
+      void stopPreview();
+    };
+  }, [stopPreview]);
+
+  const handleStart = async () => {
+    setIsInitializing(true);
+    try {
+      await stopPreview();
+      await onStart();
+    } finally {
+      setIsInitializing(false);
+    }
   };
 
   const getDeviceLabel = (device: MediaDeviceInfo, fallback: string): string => {
     if (device.label) return device.label;
-    // Unlabeled device — permission not yet granted
     return `${fallback} (${device.deviceId.slice(0, 8)}...)`;
   };
 
@@ -120,21 +162,23 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
           </div>
           <div className="flex items-center gap-2">
             <button
-              onClick={handleRefresh}
-              disabled={isRefreshing}
+              onClick={() => { void handleRefresh(); }}
+              disabled={isRefreshing || isInitializing}
               className="p-2 text-gray-500 hover:text-accent-cyan hover:bg-white/10 rounded-full transition-colors disabled:opacity-50"
               title="Refresh device list"
             >
               <RefreshCw size={16} className={isRefreshing ? 'animate-spin' : ''} />
             </button>
-            <button onClick={onClose} className="p-2 text-gray-500 hover:text-white hover:bg-white/10 rounded-full transition-colors">
+            <button
+              onClick={onClose}
+              className="p-2 text-gray-500 hover:text-white hover:bg-white/10 rounded-full transition-colors"
+            >
               <X size={20} />
             </button>
           </div>
         </div>
 
         <div className="p-6 space-y-5 flex-1 overflow-y-auto">
-          {/* Permission warning */}
           {noDevices && (
             <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-4 flex items-start gap-3">
               <AlertTriangle size={18} className="text-yellow-500 shrink-0 mt-0.5" />
@@ -148,7 +192,6 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
             </div>
           )}
 
-          {/* Video Inputs */}
           <div className="bg-black/40 border border-border rounded-xl p-4 space-y-4">
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
@@ -160,7 +203,6 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
               </span>
             </div>
 
-            {/* Camera Preview */}
             {selectedVideoDevice && (
               <div className="aspect-video bg-black rounded-lg overflow-hidden border border-white/10 relative">
                 <video
@@ -205,7 +247,7 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
               >
                 <option value="">None</option>
                 {videoDevices
-                  .filter(d => d.deviceId !== selectedVideoDevice) // Don't show same device as primary
+                  .filter(d => d.deviceId !== selectedVideoDevice)
                   .map(d => (
                     <option key={d.deviceId} value={d.deviceId}>
                       {getDeviceLabel(d, 'Camera')}
@@ -215,7 +257,6 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
             </div>
           </div>
 
-          {/* Audio Inputs */}
           <div className="bg-black/40 border border-border rounded-xl p-4 space-y-4">
             <div className="flex items-center justify-between mb-2">
               <div className="flex items-center gap-2">
@@ -244,7 +285,6 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
             </div>
           </div>
 
-          {/* Audio Output (Monitor) */}
           {audioOutputDevices.length > 0 && (
             <div className="bg-black/40 border border-border rounded-xl p-4 space-y-4">
               <div className="flex items-center justify-between mb-2">
@@ -275,7 +315,6 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
             </div>
           )}
 
-          {/* Device Summary */}
           <div className="grid grid-cols-3 gap-3">
             <div className="bg-black/40 border border-border rounded-lg p-3 text-center">
               <Camera size={16} className="text-accent-cyan mx-auto mb-1" />
@@ -303,11 +342,11 @@ export const HardwareSetupModal: React.FC<HardwareSetupModalProps> = ({
             Cancel
           </button>
           <button
-            onClick={handleStart}
-            disabled={!selectedVideoDevice && !selectedAudioDevice}
+            onClick={() => { void handleStart(); }}
+            disabled={(!selectedVideoDevice && !selectedAudioDevice) || isInitializing}
             className="px-8 py-2.5 bg-accent-cyan hover:bg-cyan-400 text-black font-bold rounded-lg transition-all uppercase tracking-widest text-[10px] shadow-[0_0_15px_rgba(0,229,255,0.3)] flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            <Check size={14} /> Initialize Hardware
+            <Check size={14} /> {isInitializing ? 'Initializing...' : 'Initialize Hardware'}
           </button>
         </div>
       </motion.div>

@@ -11,6 +11,8 @@ export type Source = {
   resolution: string;
   fps: number;
   audioLevel: number; // 0 to 1
+  kind?: 'camera' | 'screen' | 'remote' | 'media' | 'browser' | 'ndi';
+  ndiSourceName?: string;
 };
 
 export type Telemetry = {

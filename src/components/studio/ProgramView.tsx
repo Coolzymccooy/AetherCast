@@ -1,5 +1,5 @@
 import React, { useImperativeHandle, useRef } from 'react';
-import { Maximize2, ExternalLink, Radio, Play, Square } from 'lucide-react';
+import { Maximize2, ExternalLink, Radio, Play, Square, Network } from 'lucide-react';
 import { motion } from 'motion/react';
 import { Scene, Source, CamoSettings, AudienceMessage, LowerThirds, Graphics } from '../../types';
 import { Compositor, type CompositorHandle, type NativeCaptureSource } from '../Compositor';
@@ -9,7 +9,11 @@ interface ProgramViewProps {
   sources: Source[];
   isStreaming: boolean;
   isRecording: boolean;
+  streamSummary?: string;
+  ndiSummary?: string;
+  isNdiActive?: boolean;
   onToggleStreaming: () => void;
+  onToggleNdi?: () => void;
   onToggleRecording: () => void;
   webcamStream: MediaStream | null;
   remoteStreams: Map<string, MediaStream>;
@@ -40,7 +44,8 @@ export interface ProgramViewHandle {
 
 export const ProgramView = React.forwardRef<ProgramViewHandle, ProgramViewProps>(({
   activeScene, sources, isStreaming, isRecording,
-  onToggleStreaming, onToggleRecording,
+  streamSummary, ndiSummary, isNdiActive = false,
+  onToggleStreaming, onToggleNdi, onToggleRecording,
   webcamStream, remoteStreams, screenStream,
   transitionType, layout, lowerThirds, graphics,
   backgroundImage, theme, background, frameStyle, motionStyle,
@@ -85,7 +90,7 @@ export const ProgramView = React.forwardRef<ProgramViewHandle, ProgramViewProps>
           </motion.div>
         )}
         <div className="bg-black/60 backdrop-blur-md border border-white/10 text-white text-[10px] font-mono px-2 py-0.5 rounded-sm">
-          1080p | 60fps | {isStreaming ? '4.2 Mbps' : 'IDLE'}
+          {isStreaming ? (streamSummary || 'LIVE') : 'IDLE'}
         </div>
       </div>
 
@@ -145,6 +150,16 @@ export const ProgramView = React.forwardRef<ProgramViewHandle, ProgramViewProps>
             <Radio size={12} />
             {isStreaming ? 'Stop Streaming' : 'Start Streaming'}
           </button>
+          {onToggleNdi && (
+            <button
+              onClick={onToggleNdi}
+              title={ndiSummary || 'NDI 5 output'}
+              className={`btn-hardware flex items-center gap-2 transition-colors ${isNdiActive ? 'text-accent-green border-accent-green/30 bg-accent-green/10' : 'text-gray-400'}`}
+            >
+              <Network size={12} />
+              {isNdiActive ? 'Stop NDI' : 'Start NDI'}
+            </button>
+          )}
         </div>
       </div>
     </div>

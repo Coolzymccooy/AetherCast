@@ -44,8 +44,8 @@ Steps:
 3. Switch scenes every 5 to 10 minutes.
 4. Observe the stream every 30 minutes.
 5. After 8 hours, stop the stream cleanly.
-6. Export diagnostics with `window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__?.()`.
-7. Run `npm run diagnostics:check -- <diagnostics-file.json>`.
+6. Export and check diagnostics with `window.__AETHER_EXPORT_AND_CHECK_NATIVE_DIAGNOSTICS__?.()`.
+7. Confirm the returned result shows the saved artifact path and a passing diagnostics check.
 
 Pass criteria:
 - no unexpected stream stop
@@ -199,9 +199,10 @@ Pass criteria:
 For every soak/fault run:
 
 1. Export diagnostics:
-   - `window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__?.()`
+   - Preferred: `window.__AETHER_EXPORT_AND_CHECK_NATIVE_DIAGNOSTICS__?.()`
+   - Manual fallback: `window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__?.()`
 2. Run:
-   - `npm run diagnostics:check -- <diagnostics-file.json>`
+   - If you used the manual fallback: `npm run diagnostics:check -- <diagnostics-file.json>`
 3. Review manually:
    - `restartCount`
    - `watchdogRenders`

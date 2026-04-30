@@ -213,6 +213,9 @@ pub struct NativeSourceStatus {
     pub label: String,
     pub source_kind: NativeSourceKind,
     pub state: EngineHealthState,
+    pub recovery_delay_ms: u64,
+    pub restart_count: u32,
+    pub last_event: Option<String>,
     pub source_status: Option<String>,
     pub resolution: Option<String>,
     pub fps: Option<u32>,
@@ -222,6 +225,7 @@ pub struct NativeSourceStatus {
     pub frame_height: u32,
     pub last_frame_ms: u64,
     pub last_inventory_sync_ms: u64,
+    pub last_update_ms: u64,
     pub last_error: Option<String>,
 }
 
@@ -238,6 +242,16 @@ pub struct OutputStatus {
     pub state: EngineHealthState,
     pub last_error: Option<String>,
     pub last_update_ms: u64,
+    pub target_width: Option<u32>,
+    pub target_height: Option<u32>,
+    pub target_fps: Option<u32>,
+    pub target_bitrate_kbps: Option<u32>,
+    pub measured_fps: Option<f32>,
+    pub measured_bitrate_kbps: Option<f32>,
+    pub encoder_speed: Option<f32>,
+    pub first_progress_ms: Option<u64>,
+    pub last_progress_ms: Option<u64>,
+    pub performance_warning_since_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,7 +259,9 @@ pub struct ArchiveStatus {
     pub state: EngineHealthState,
     pub path_pattern: Option<String>,
     pub segment_seconds: u32,
+    pub recovery_delay_ms: u64,
     pub restart_count: u32,
+    pub last_event: Option<String>,
     pub last_error: Option<String>,
     pub last_update_ms: u64,
 }
@@ -329,7 +345,9 @@ impl Default for NativeStreamRuntime {
                 state: EngineHealthState::Inactive,
                 path_pattern: None,
                 segment_seconds: 0,
+                recovery_delay_ms: 0,
                 restart_count: 0,
+                last_event: None,
                 last_error: None,
                 last_update_ms: 0,
             },
@@ -345,6 +363,7 @@ pub struct NativeStreamStats {
     pub restarting: bool,
     pub restart_count: u32,
     pub max_restarts: u32,
+    pub session_id: u64,
     pub encoder: String,
     pub is_gpu: bool,
     pub width: u32,
@@ -361,6 +380,7 @@ pub struct NativeStreamStats {
     pub last_error: Option<String>,
     pub last_exit_status: Option<String>,
     pub ffmpeg_path: String,
+    pub started_at_ms: u64,
     pub last_frame_age_ms: u64,
     pub uptime_ms: u64,
     pub lavfi_enabled: bool,
@@ -381,6 +401,8 @@ pub struct NativeStreamStats {
     pub audio_status: NativeAudioStatus,
     pub output_statuses: Vec<OutputStatus>,
     pub archive_status: ArchiveStatus,
+    pub ndi_status: NdiStatus,
+    pub ndi_input_status: NdiInputStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -497,4 +519,148 @@ pub struct VirtualCameraStatus {
     pub last_frame_age_ms: u64,
     pub note: String,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NdiHealth {
+    pub ok: bool,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub mock: bool,
+}
+
+impl Default for NdiHealth {
+    fn default() -> Self {
+        Self {
+            ok: false,
+            error: None,
+            mock: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NdiSourceStatus {
+    pub key: String,
+    pub name: String,
+    pub state: EngineHealthState,
+    pub frames_sent: u64,
+    pub dropped_frames: u64,
+    pub last_frame_ms: u64,
+    pub last_frame_age_ms: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NdiStatus {
+    pub state: EngineHealthState,
+    pub health: NdiHealth,
+    pub active: bool,
+    pub desired_active: bool,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub alpha_enabled: bool,
+    pub frames_sent: u64,
+    pub dropped_frames: u64,
+    pub started_at_ms: u64,
+    pub uptime_ms: u64,
+    pub last_frame_ms: u64,
+    pub last_frame_age_ms: u64,
+    pub last_error: Option<String>,
+    pub sources: Vec<NdiSourceStatus>,
+}
+
+impl Default for NdiStatus {
+    fn default() -> Self {
+        Self {
+            state: EngineHealthState::Inactive,
+            health: NdiHealth::default(),
+            active: false,
+            desired_active: false,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            alpha_enabled: true,
+            frames_sent: 0,
+            dropped_frames: 0,
+            started_at_ms: 0,
+            uptime_ms: 0,
+            last_frame_ms: 0,
+            last_frame_age_ms: 0,
+            last_error: None,
+            sources: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NdiDiscoveredSource {
+    pub name: String,
+    pub url_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NdiInputStatus {
+    pub state: EngineHealthState,
+    pub active: bool,
+    pub desired_active: bool,
+    pub source_name: Option<String>,
+    pub routed_source_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub frames_received: u64,
+    pub dropped_frames: u64,
+    pub started_at_ms: u64,
+    pub uptime_ms: u64,
+    pub last_frame_ms: u64,
+    pub last_frame_age_ms: u64,
+    pub last_error: Option<String>,
+}
+
+impl Default for NdiInputStatus {
+    fn default() -> Self {
+        Self {
+            state: EngineHealthState::Inactive,
+            active: false,
+            desired_active: false,
+            source_name: None,
+            routed_source_id: "camera:local-2".into(),
+            width: 0,
+            height: 0,
+            frames_received: 0,
+            dropped_frames: 0,
+            started_at_ms: 0,
+            uptime_ms: 0,
+            last_frame_ms: 0,
+            last_frame_age_ms: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NdiInputConfig {
+    #[serde(alias = "sourceName")]
+    pub source_name: String,
+    #[serde(default = "default_ndi_input_route", alias = "routedSourceId")]
+    pub routed_source_id: String,
+}
+
+fn default_ndi_input_route() -> String {
+    "camera:local-2".into()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NdiConfig {
+    #[serde(default = "default_ndi_resolution")]
+    pub resolution: String,
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+    #[serde(default = "default_true", alias = "alphaEnabled")]
+    pub alpha_enabled: bool,
+}
+
+fn default_ndi_resolution() -> String {
+    "1080p".into()
 }

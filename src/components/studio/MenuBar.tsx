@@ -20,7 +20,7 @@ const menuConfig: Record<string, string[]> = {
   'File': ['New Project', 'Open...', 'Save', 'Save As...', 'Export Recording', 'Exit'],
   'Edit': ['Undo', 'Redo', 'Cut', 'Copy', 'Paste', 'Preferences'],
   'View': ['Zoom In', 'Zoom Out', 'Reset Zoom', 'Actual Size', 'Toggle Source Rack', 'Toggle Director Rack', 'Toggle Telemetry', 'Fullscreen'],
-  'Sources': ['Add Camera', 'Add Screen Share', 'Add Media File', 'Add Browser Source'],
+  'Sources': ['Add Camera', 'Add NDI Source', 'Add Screen Share', 'Add Media File', 'Add Browser Source'],
   'Scenes': ['New Scene', 'Duplicate Scene', 'Delete Scene', 'Scene Transitions'],
   'Stream': ['Start Streaming', 'Stop Streaming', 'Stream Settings', 'Output Quality'],
   'Tools': ['AI Director Settings', 'Script Editor', 'Recording Gallery', 'Diagnostics'],

@@ -1,5 +1,7 @@
 pub mod audio;
 pub mod capture;
+pub mod diagnostics;
+pub mod ndi;
 pub mod output;
 pub mod service;
 pub mod source;

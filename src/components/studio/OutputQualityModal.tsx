@@ -1,12 +1,16 @@
 import React from 'react';
 import { X, Settings2, Monitor, Zap, Gauge } from 'lucide-react';
 import { motion } from 'motion/react';
-import type { EncodingProfile } from '../../types';
+import type { EncodingProfile, StreamDestination } from '../../types';
+import { resolveNativeCaptureProfile } from '../../lib/nativeStreaming';
 
 interface OutputQualityModalProps {
   encodingProfile: EncodingProfile;
   setEncodingProfile: (p: EncodingProfile) => void;
   onClose: () => void;
+  isNativeDesktop?: boolean;
+  isGPU?: boolean;
+  destinations?: Array<Pick<StreamDestination, 'enabled' | 'protocol' | 'rtmpUrl' | 'url'>>;
 }
 
 const PROFILES: Array<{
@@ -54,7 +58,7 @@ const PROFILES: Array<{
 ];
 
 export const OutputQualityModal: React.FC<OutputQualityModalProps> = ({
-  encodingProfile, setEncodingProfile, onClose,
+  encodingProfile, setEncodingProfile, onClose, isNativeDesktop = false, isGPU = true, destinations = [],
 }) => {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
@@ -80,49 +84,76 @@ export const OutputQualityModal: React.FC<OutputQualityModalProps> = ({
         </div>
 
         <div className="p-6 space-y-3">
-          {PROFILES.map(profile => (
-            <button
-              key={profile.id}
-              onClick={() => setEncodingProfile(profile.id)}
-              className={`w-full text-left p-4 rounded-xl border transition-all ${
-                encodingProfile === profile.id
-                  ? 'bg-accent-cyan/10 border-accent-cyan'
-                  : 'bg-black/40 border-border hover:border-white/20'
-              }`}
-            >
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center gap-2">
-                  <span className={`text-sm font-bold ${encodingProfile === profile.id ? 'text-accent-cyan' : 'text-white'}`}>
-                    {profile.name}
-                  </span>
-                  {profile.recommended && (
-                    <span className="text-[8px] font-bold bg-accent-cyan/20 text-accent-cyan px-2 py-0.5 rounded-full">
-                      RECOMMENDED
+          {PROFILES.map(profile => {
+            const runtimeProfile = isNativeDesktop
+              ? resolveNativeCaptureProfile(profile.id, isGPU, {
+                mode: 'native-scene',
+                destinations,
+              })
+              : null;
+            const displayedResolution = runtimeProfile
+              ? `${runtimeProfile.width}x${runtimeProfile.height}`
+              : profile.resolution;
+            const displayedFps = runtimeProfile
+              ? `${runtimeProfile.fps} FPS`
+              : profile.fps;
+            const displayedBitrate = runtimeProfile
+              ? `${runtimeProfile.bitrate.toLocaleString()} kbps`
+              : profile.bitrate;
+
+            return (
+              <button
+                key={profile.id}
+                onClick={() => setEncodingProfile(profile.id)}
+                className={`w-full text-left p-4 rounded-xl border transition-all ${
+                  encodingProfile === profile.id
+                    ? 'bg-accent-cyan/10 border-accent-cyan'
+                    : 'bg-black/40 border-border hover:border-white/20'
+                }`}
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-sm font-bold ${encodingProfile === profile.id ? 'text-accent-cyan' : 'text-white'}`}>
+                      {profile.name}
                     </span>
-                  )}
+                    {profile.recommended && (
+                      <span className="text-[8px] font-bold bg-accent-cyan/20 text-accent-cyan px-2 py-0.5 rounded-full">
+                        RECOMMENDED
+                      </span>
+                    )}
+                    {runtimeProfile?.reliabilityMode && (
+                      <span className="text-[8px] font-bold bg-amber-500/15 text-amber-300 px-2 py-0.5 rounded-full">
+                        LIVE DELIVERY
+                      </span>
+                    )}
+                  </div>
+                  <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                    encodingProfile === profile.id ? 'border-accent-cyan' : 'border-gray-600'
+                  }`}>
+                    {encodingProfile === profile.id && <div className="w-2 h-2 rounded-full bg-accent-cyan" />}
+                  </div>
                 </div>
-                <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
-                  encodingProfile === profile.id ? 'border-accent-cyan' : 'border-gray-600'
-                }`}>
-                  {encodingProfile === profile.id && <div className="w-2 h-2 rounded-full bg-accent-cyan" />}
-                </div>
-              </div>
 
-              <div className="flex items-center gap-4 mb-2">
-                <div className="flex items-center gap-1 text-[10px] text-gray-400">
-                  <Monitor size={10} /> {profile.resolution}
+                <div className="flex items-center gap-4 mb-2">
+                  <div className="flex items-center gap-1 text-[10px] text-gray-400">
+                    <Monitor size={10} /> {displayedResolution}
+                  </div>
+                  <div className="flex items-center gap-1 text-[10px] text-gray-400">
+                    <Zap size={10} /> {displayedFps}
+                  </div>
+                  <div className="flex items-center gap-1 text-[10px] text-gray-400">
+                    <Gauge size={10} /> {displayedBitrate}
+                  </div>
                 </div>
-                <div className="flex items-center gap-1 text-[10px] text-gray-400">
-                  <Zap size={10} /> {profile.fps}
-                </div>
-                <div className="flex items-center gap-1 text-[10px] text-gray-400">
-                  <Gauge size={10} /> {profile.bitrate}
-                </div>
-              </div>
 
-              <p className="text-[10px] text-gray-500">{profile.description}</p>
-            </button>
-          ))}
+                <p className="text-[10px] text-gray-500">
+                  {runtimeProfile?.reliabilityMode
+                    ? `${profile.description} Desktop native live path is currently capped here to keep Twitch stable.`
+                    : profile.description}
+                </p>
+              </button>
+            );
+          })}
         </div>
 
         <div className="p-5 border-t border-border bg-black/20 flex justify-end">

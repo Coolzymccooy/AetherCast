@@ -12,6 +12,9 @@ import { applyVideoTrackProfile } from '../utils/videoQuality';
 
 export type PeerConnectionState = 'connecting' | 'connected' | 'disconnected' | 'failed';
 
+const MEDIA_START_TIMEOUT_MS = 15000;
+const DEVICE_PROBE_TIMEOUT_MS = 2500;
+
 interface UseWebRTCOptions {
   scenes: Scene[];
   scenePresets?: ScenePreset[];
@@ -72,6 +75,7 @@ export function useWebRTC({
   const iceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const phonePeerRolesRef = useRef<Map<string, string>>(new Map());
   const screenPeerIdRef = useRef<string | null>(null);
+  const deviceRefreshPromiseRef = useRef<Promise<MediaDeviceInfo[]> | null>(null);
 
   // Stable refs for callbacks used inside reconnectSocket to avoid stale closures
   // without adding them as dependencies (which would cause reconnect loops)
@@ -103,6 +107,42 @@ export function useWebRTC({
       { message, type, id: Date.now() + Math.random() } as ServerLog,
       ...prev,
     ].slice(0, 20));
+  }, []);
+
+  const getUserMediaWithTimeout = useCallback(async (
+    constraints: MediaStreamConstraints,
+    timeoutMessage: string,
+    timeoutMs = MEDIA_START_TIMEOUT_MS,
+  ) => {
+    let timedOut = false;
+    let timeoutId: number | null = null;
+    const timeoutError = new DOMException(timeoutMessage, 'TimeoutError');
+
+    const streamPromise = navigator.mediaDevices.getUserMedia(constraints).then(stream => {
+      if (timedOut) {
+        stream.getTracks().forEach(track => track.stop());
+        throw timeoutError;
+      }
+      return stream;
+    });
+
+    // Avoid an unhandled rejection if the timeout wins and the media promise settles later.
+    streamPromise.catch(() => {});
+
+    const timeoutPromise = new Promise<MediaStream>((_, reject) => {
+      timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        reject(timeoutError);
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([streamPromise, timeoutPromise]);
+    } finally {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    }
   }, []);
 
   // --- Helper: update peer state ---
@@ -226,20 +266,63 @@ export function useWebRTC({
   // Browsers require a getUserMedia() call before enumerateDevices() returns labels.
   // We request a temporary stream to trigger the permission prompt, enumerate, then release it.
   const refreshDevices = useCallback(async () => {
-    try {
+    if (deviceRefreshPromiseRef.current) {
+      return deviceRefreshPromiseRef.current;
+    }
+
+    const pendingRefresh = (async () => {
+      try {
+      const initialDevs = await navigator.mediaDevices.enumerateDevices();
+      const initialInputs = initialDevs.filter(device =>
+        device.kind === 'videoinput' || device.kind === 'audioinput',
+      );
+
+      if (initialInputs.length > 0) {
+        setDevices(initialDevs);
+
+        const videoDevs = initialDevs.filter(d => d.kind === 'videoinput');
+        const audioDevs = initialDevs.filter(d => d.kind === 'audioinput');
+
+        if (videoDevs.length > 0 && !selectedVideoDevice) {
+          setSelectedVideoDevice(videoDevs[0].deviceId);
+        }
+        if (audioDevs.length > 0 && !selectedAudioDevice) {
+          setSelectedAudioDevice(audioDevs[0].deviceId);
+        }
+
+        navigator.mediaDevices.ondevicechange = async () => {
+          deviceRefreshPromiseRef.current = null;
+          await refreshDevices();
+        };
+
+        return initialDevs;
+      }
+
       // First, request a temporary stream to trigger permission prompt
       // This is the ONLY way to get device labels on most browsers
       let tempStream: MediaStream | null = null;
       try {
-        tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        tempStream = await getUserMediaWithTimeout(
+          { video: true, audio: false },
+          'Timeout probing video devices.',
+          DEVICE_PROBE_TIMEOUT_MS,
+        );
       } catch {
         // User denied or no devices — try video-only
         try {
-          tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          tempStream = await getUserMediaWithTimeout(
+            { video: false, audio: true },
+            'Timeout probing audio devices.',
+            DEVICE_PROBE_TIMEOUT_MS,
+          );
         } catch {
           // Try audio-only
           try {
-            tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            tempStream = await getUserMediaWithTimeout(
+              { video: false, audio: true },
+              'Timeout probing audio devices.',
+              DEVICE_PROBE_TIMEOUT_MS,
+            );
           } catch {
             // No permission at all — enumerate anyway (will get unlabeled results)
           }
@@ -272,13 +355,19 @@ export function useWebRTC({
         setDevices(updated);
       };
 
-      return devs;
-    } catch (err) {
-      console.error('Error enumerating devices:', err);
-      onError?.('Could not detect media devices. Check browser permissions.');
-      return [];
-    }
-  }, [selectedVideoDevice, selectedAudioDevice, onError]);
+        return devs;
+      } catch (err) {
+        console.error('Error enumerating devices:', err);
+        onError?.('Could not detect media devices. Check browser permissions.');
+        return [];
+      } finally {
+        deviceRefreshPromiseRef.current = null;
+      }
+    })();
+
+    deviceRefreshPromiseRef.current = pendingRefresh;
+    return pendingRefresh;
+  }, [getUserMediaWithTimeout, selectedVideoDevice, selectedAudioDevice, onError]);
 
   useEffect(() => {
     refreshDevices();
@@ -598,7 +687,12 @@ export function useWebRTC({
       audienceBridgeSocketRef.current = null;
     }
     if (serverUrl === 'http://localhost:3001') {
-      const bridge = io(CLOUD_URL, { reconnection: true, reconnectionAttempts: Infinity, reconnectionDelay: 3000 });
+      const bridge = io(CLOUD_URL, {
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 3000,
+        transports: ['websocket'],
+      });
       audienceBridgeSocketRef.current = bridge;
       bridge.on('connect', () => {
         bridge.emit('join-room', roomId);
@@ -614,6 +708,7 @@ export function useWebRTC({
       reconnectionDelay: 2000,
       reconnectionDelayMax: 15000,
       timeout: 10000,
+      transports: ['websocket'],
     });
     socketRef.current = socket;
 
@@ -720,34 +815,132 @@ export function useWebRTC({
 
   // --- Camera ---
   const startCamera = async (videoId?: string, audioId?: string, videoId2?: string) => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: videoId
-          ? { deviceId: { exact: videoId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } }
-          : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
-        audio: audioId ? { deviceId: { exact: audioId } } : true,
-      });
-      applyVideoTrackProfile(stream.getVideoTracks()[0], 'camera');
-      setWebcamStream(stream);
+    if (!videoId && !audioId) {
+      onError?.('Select a camera or microphone before initializing hardware.');
+      return false;
+    }
 
-      if (videoId2) {
-        const stream2 = await navigator.mediaDevices.getUserMedia({
-          video: { deviceId: { exact: videoId2 }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 } },
-        });
-        applyVideoTrackProfile(stream2.getVideoTracks()[0], 'camera');
-        setRemoteStreams(prev => { const next = new Map(prev); next.set('local-cam-2', stream2); return next; });
+    let primaryStream: MediaStream | null = null;
+
+    try {
+      const selectedVideoIds = [videoId, videoId2].filter((id): id is string => Boolean(id));
+      const needsRefresh = devices.length === 0
+        || selectedVideoIds.some(id => !devices.some(device => device.kind === 'videoinput' && device.deviceId === id))
+        || (Boolean(audioId) && !devices.some(device => device.kind === 'audioinput' && device.deviceId === audioId));
+
+      const availableDevices = needsRefresh ? await refreshDevices() : devices;
+
+      if (videoId && !availableDevices.some(device => device.kind === 'videoinput' && device.deviceId === videoId)) {
+        onError?.('Selected camera is no longer available. Refresh devices and try again.');
+        return false;
       }
 
-      setSources(prev => prev.map(s => s.name === 'Cam 1' ? { ...s, status: 'active' as const } : s));
+      if (videoId2 && !availableDevices.some(device => device.kind === 'videoinput' && device.deviceId === videoId2)) {
+        onError?.('Selected secondary camera is no longer available. Refresh devices and try again.');
+        return false;
+      }
+
+      if (audioId && !availableDevices.some(device => device.kind === 'audioinput' && device.deviceId === audioId)) {
+        onError?.('Selected microphone is no longer available. Refresh devices and try again.');
+        return false;
+      }
+
+      if (webcamStream) {
+        webcamStream.getTracks().forEach(track => track.stop());
+        setWebcamStream(null);
+      }
+
+      const existingCam2 = remoteStreams.get('local-cam-2');
+      if (existingCam2) {
+        existingCam2.getTracks().forEach(track => track.stop());
+        setRemoteStreams(prev => {
+          const next = new Map(prev);
+          next.delete('local-cam-2');
+          return next;
+        });
+      }
+
+      primaryStream = await getUserMediaWithTimeout({
+        video: videoId
+          ? {
+              deviceId: { exact: videoId },
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+              frameRate: { ideal: 30, max: 30 },
+            }
+          : false,
+        audio: audioId ? { deviceId: { exact: audioId } } : false,
+      }, 'Timeout starting selected camera or microphone.');
+
+      const primaryVideoTrack = primaryStream.getVideoTracks()[0];
+      if (primaryVideoTrack) {
+        applyVideoTrackProfile(primaryVideoTrack, 'camera');
+      }
+
+      setWebcamStream(primaryStream);
+
+      let hasSecondaryVideo = false;
+      if (videoId2) {
+        try {
+          const secondaryStream = await getUserMediaWithTimeout({
+            video: {
+              deviceId: { exact: videoId2 },
+              width: { ideal: 1920 },
+              height: { ideal: 1080 },
+              frameRate: { ideal: 30, max: 30 },
+            },
+            audio: false,
+          }, 'Timeout starting secondary camera.');
+          const secondaryTrack = secondaryStream.getVideoTracks()[0];
+          if (secondaryTrack) {
+            applyVideoTrackProfile(secondaryTrack, 'camera');
+          }
+          hasSecondaryVideo = secondaryStream.getVideoTracks().length > 0;
+          setRemoteStreams(prev => {
+            const next = new Map(prev);
+            next.set('local-cam-2', secondaryStream);
+            return next;
+          });
+        } catch (secondaryErr: any) {
+          console.error('App: Error accessing secondary camera:', secondaryErr);
+          onError?.(`Secondary camera error: ${secondaryErr?.message || 'Unknown error'}`);
+        }
+      }
+
+      const hasPrimaryVideo = primaryStream.getVideoTracks().length > 0;
+      setSources(prev => prev.map(source => {
+        if (source.name === 'Cam 1') {
+          return { ...source, status: hasPrimaryVideo ? 'active' as const : 'standby' as const };
+        }
+        if (source.name === 'Cam 2') {
+          return { ...source, status: hasSecondaryVideo ? 'active' as const : 'standby' as const };
+        }
+        return source;
+      }));
+
+      return true;
     } catch (err: any) {
+      if (primaryStream) {
+        primaryStream.getTracks().forEach(track => track.stop());
+      }
       console.error('App: Error accessing camera:', err);
+      const errorMessage = String(err?.message || 'Unknown error');
+      const loweredMessage = errorMessage.toLowerCase();
+
       if (err?.name === 'NotAllowedError') {
         onError?.('Camera permission denied. Please allow camera access in your browser settings.');
       } else if (err?.name === 'NotFoundError') {
         onError?.('No camera found. Please connect a camera and try again.');
+      } else if (
+        err?.name === 'NotReadableError'
+        || err?.name === 'TimeoutError'
+        || loweredMessage.includes('timeout starting video source')
+      ) {
+        onError?.('Camera did not start in time. Close other apps using the camera, refresh devices, and try again.');
       } else {
-        onError?.(`Camera error: ${err?.message || 'Unknown error'}`);
+        onError?.(`Camera error: ${errorMessage}`);
       }
+      return false;
     }
   };
 
@@ -755,7 +948,6 @@ export function useWebRTC({
     if (webcamStream) {
       webcamStream.getTracks().forEach(t => t.stop());
       setWebcamStream(null);
-      setSources(prev => prev.map(s => s.name === 'Cam 1' ? { ...s, status: 'standby' as const } : s));
     }
     // Also stop second local camera if active
     const cam2 = remoteStreams.get('local-cam-2');
@@ -767,6 +959,12 @@ export function useWebRTC({
         return next;
       });
     }
+    setSources(prev => prev.map(source => {
+      if (source.name === 'Cam 1' || source.name === 'Cam 2') {
+        return { ...source, status: 'standby' as const };
+      }
+      return source;
+    }));
   };
 
   const startScreenShare = async () => {

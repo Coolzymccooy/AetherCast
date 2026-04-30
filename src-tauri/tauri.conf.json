@@ -1,6 +1,6 @@
 {
   "productName": "AetherCast",
-  "version": "1.0.21",
+  "version": "1.0.22",
   "identifier": "com.aethercast.studio",
   "build": {
     "beforeDevCommand": "npm run dev",

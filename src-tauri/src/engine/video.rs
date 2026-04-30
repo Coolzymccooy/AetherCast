@@ -3,7 +3,9 @@ use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-use super::source::{latest_source_frame_count, note_source_error, note_source_frame};
+use super::source::{
+    latest_source_frame_count, note_native_source_frame, note_source_error, note_source_frame,
+};
 use super::state::{EngineHealthState, NativeVideoStatus};
 use super::telemetry::now_ms;
 
@@ -99,7 +101,12 @@ pub fn current_video_status() -> NativeVideoStatus {
             scene_type: Some(stored.snapshot.scene_type),
             layout: Some(stored.snapshot.layout),
             node_count: stored.snapshot.nodes.len(),
-            visible_node_count: stored.snapshot.nodes.iter().filter(|node| node.visible).count(),
+            visible_node_count: stored
+                .snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.visible)
+                .count(),
             source_frame_count,
             last_sync_ms: stored.synced_at_ms,
             last_render_ms: stored.last_render_ms,
@@ -155,10 +162,26 @@ fn blend_pixel(dest: &mut [u8], src: [u8; 4]) {
         return;
     }
 
-    dest[0] = ((src[0] as f32 * alpha) + (dest[0] as f32 * (1.0 - alpha))).round() as u8;
-    dest[1] = ((src[1] as f32 * alpha) + (dest[1] as f32 * (1.0 - alpha))).round() as u8;
-    dest[2] = ((src[2] as f32 * alpha) + (dest[2] as f32 * (1.0 - alpha))).round() as u8;
-    dest[3] = 255;
+    let dest_alpha = dest[3] as f32 / 255.0;
+    let out_alpha = alpha + dest_alpha * (1.0 - alpha);
+    if out_alpha <= 0.0 {
+        dest[0] = 0;
+        dest[1] = 0;
+        dest[2] = 0;
+        dest[3] = 0;
+        return;
+    }
+
+    dest[0] = (((src[0] as f32 * alpha) + (dest[0] as f32 * dest_alpha * (1.0 - alpha)))
+        / out_alpha)
+        .round() as u8;
+    dest[1] = (((src[1] as f32 * alpha) + (dest[1] as f32 * dest_alpha * (1.0 - alpha)))
+        / out_alpha)
+        .round() as u8;
+    dest[2] = (((src[2] as f32 * alpha) + (dest[2] as f32 * dest_alpha * (1.0 - alpha)))
+        / out_alpha)
+        .round() as u8;
+    dest[3] = (out_alpha * 255.0).round() as u8;
 }
 
 fn set_pixel(buffer: &mut [u8], width: u32, x: i32, y: i32, color: [u8; 4]) {
@@ -413,7 +436,16 @@ fn draw_overlay(
         fill_rect(buffer, width, height, x, y, 8, rect_height, accent);
     }
 
-    fill_rect(buffer, width, height, x, y, rect_width, 2, [255, 255, 255, 42]);
+    fill_rect(
+        buffer,
+        width,
+        height,
+        x,
+        y,
+        rect_width,
+        2,
+        [255, 255, 255, 42],
+    );
     fill_rect(
         buffer,
         width,
@@ -502,6 +534,7 @@ pub fn store_source_frame(
     width: u32,
     height: u32,
     frame_data: Vec<u8>,
+    from_native: bool,
 ) -> Result<(), String> {
     let expected = (width as usize)
         .saturating_mul(height as usize)
@@ -529,7 +562,11 @@ pub fn store_source_frame(
         },
     );
     drop(guard);
-    note_source_frame(source_id, width, height);
+    if from_native {
+        note_native_source_frame(source_id, width, height);
+    } else {
+        note_source_frame(source_id, width, height);
+    }
     Ok(())
 }
 
@@ -539,7 +576,11 @@ pub fn clear_source_frame(source_id: &str) {
     }
 }
 
-pub fn render_native_scene_rgba(target_width: u32, target_height: u32) -> Result<Vec<u8>, String> {
+fn render_native_scene_rgba_mode(
+    target_width: u32,
+    target_height: u32,
+    alpha_mode: bool,
+) -> Result<Vec<u8>, String> {
     let stored_snapshot = scene_snapshot_store()
         .lock()
         .map_err(|e| e.to_string())?
@@ -548,13 +589,15 @@ pub fn render_native_scene_rgba(target_width: u32, target_height: u32) -> Result
 
     let mut buffer = vec![0u8; (target_width * target_height * 4) as usize];
     let snapshot = stored_snapshot.snapshot;
-    fill_background(
-        &mut buffer,
-        target_width,
-        target_height,
-        &snapshot.background,
-        &snapshot.brand_color,
-    );
+    if !alpha_mode {
+        fill_background(
+            &mut buffer,
+            target_width,
+            target_height,
+            &snapshot.background,
+            &snapshot.brand_color,
+        );
+    }
 
     let source_frames = source_frame_store().lock().map_err(|e| e.to_string())?;
     let mut nodes = snapshot
@@ -565,36 +608,69 @@ pub fn render_native_scene_rgba(target_width: u32, target_height: u32) -> Result
         .collect::<Vec<_>>();
     nodes.sort_by_key(|node| node.z_index);
 
+    // Scale node coordinates from canvas space into the target output space so
+    // lower-resolution native outputs render the full scene instead of cropping.
+    let x_scale = target_width as f32 / snapshot.canvas_width.max(1) as f32;
+    let y_scale = target_height as f32 / snapshot.canvas_height.max(1) as f32;
+
     for node in &nodes {
-        match node.node_type.as_str() {
+        if alpha_mode && node.node_type != "overlay" {
+            continue;
+        }
+
+        let mut scaled_node = node.clone();
+        scaled_node.x = node.x * x_scale;
+        scaled_node.y = node.y * y_scale;
+        scaled_node.width = node.width * x_scale;
+        scaled_node.height = node.height * y_scale;
+
+        match scaled_node.node_type.as_str() {
             "background" => {}
             "overlay" => draw_overlay(
                 &mut buffer,
                 target_width,
                 target_height,
-                node,
+                &scaled_node,
                 &snapshot.brand_color,
             ),
             _ => {
-                let accent = node
+                let accent = scaled_node
                     .accent_color
                     .as_deref()
                     .map(parse_hex_color)
-                    .unwrap_or_else(|| match node.node_type.as_str() {
+                    .unwrap_or_else(|| match scaled_node.node_type.as_str() {
                         "camera" => [255, 76, 76, 255],
                         "screen" => [0, 229, 255, 255],
                         "remote" => [0, 229, 255, 255],
                         _ => parse_hex_color(&snapshot.brand_color),
                     });
 
-                if let Some(source_id) = node.source_id.as_ref() {
+                if let Some(source_id) = scaled_node.source_id.as_ref() {
                     if let Some(source) = source_frames.get(source_id) {
-                        draw_source_frame(&mut buffer, target_width, target_height, node, source);
+                        draw_source_frame(
+                            &mut buffer,
+                            target_width,
+                            target_height,
+                            &scaled_node,
+                            source,
+                        );
                     } else {
-                        draw_placeholder(&mut buffer, target_width, target_height, node, accent);
+                        draw_placeholder(
+                            &mut buffer,
+                            target_width,
+                            target_height,
+                            &scaled_node,
+                            accent,
+                        );
                     }
                 } else {
-                    draw_placeholder(&mut buffer, target_width, target_height, node, accent);
+                    draw_placeholder(
+                        &mut buffer,
+                        target_width,
+                        target_height,
+                        &scaled_node,
+                        accent,
+                    );
                 }
             }
         }
@@ -611,6 +687,17 @@ pub fn render_native_scene_rgba(target_width: u32, target_height: u32) -> Result
     Ok(buffer)
 }
 
+pub fn render_native_scene_rgba(target_width: u32, target_height: u32) -> Result<Vec<u8>, String> {
+    render_native_scene_rgba_mode(target_width, target_height, false)
+}
+
+pub fn render_native_scene_alpha_rgba(
+    target_width: u32,
+    target_height: u32,
+) -> Result<Vec<u8>, String> {
+    render_native_scene_rgba_mode(target_width, target_height, true)
+}
+
 #[tauri::command]
 pub async fn update_scene_snapshot(snapshot: NativeSceneSnapshot) -> Result<String, String> {
     let scene_name = snapshot.active_scene_name.clone();
@@ -619,11 +706,15 @@ pub async fn update_scene_snapshot(snapshot: NativeSceneSnapshot) -> Result<Stri
     let layout = snapshot.layout.clone();
 
     let mut guard = scene_snapshot_store().lock().map_err(|e| e.to_string())?;
+    let (last_render_ms, last_error) = guard
+        .as_ref()
+        .map(|stored| (stored.last_render_ms, stored.last_error.clone()))
+        .unwrap_or((0, None));
     *guard = Some(StoredSceneSnapshot {
         snapshot,
         synced_at_ms: now_ms(),
-        last_render_ms: 0,
-        last_error: None,
+        last_render_ms,
+        last_error,
     });
 
     Ok(format!(
@@ -639,7 +730,7 @@ pub async fn update_scene_source_frame(
     height: u32,
     frame_data: Vec<u8>,
 ) -> Result<(), String> {
-    store_source_frame(&source_id, width, height, frame_data)
+    store_source_frame(&source_id, width, height, frame_data, false)
 }
 
 #[tauri::command]
@@ -651,5 +742,84 @@ pub async fn clear_scene_source_frame(source_id: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_scene_snapshot() -> Result<String, String> {
     let snapshot = scene_snapshot_store().lock().map_err(|e| e.to_string())?;
-    serde_json::to_string(&snapshot.as_ref().map(|stored| &stored.snapshot)).map_err(|e| e.to_string())
+    serde_json::to_string(&snapshot.as_ref().map(|stored| &stored.snapshot))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_lock() -> &'static Mutex<()> {
+        static INSTANCE: OnceLock<Mutex<()>> = OnceLock::new();
+        INSTANCE.get_or_init(|| Mutex::new(()))
+    }
+
+    fn install_snapshot(nodes: Vec<NativeSceneNode>) {
+        let snapshot = NativeSceneSnapshot {
+            revision: 1,
+            render_path: "test".into(),
+            canvas_width: 100,
+            canvas_height: 100,
+            active_scene_id: "scene-1".into(),
+            active_scene_name: "Scene 1".into(),
+            scene_type: "CAM".into(),
+            layout: "Solo".into(),
+            transition_type: "Cut".into(),
+            background: "Brand Theme".into(),
+            frame_style: "Flat".into(),
+            motion_style: "None".into(),
+            brand_color: "#336699".into(),
+            source_swap: false,
+            nodes,
+        };
+        *scene_snapshot_store().lock().unwrap() = Some(StoredSceneSnapshot {
+            snapshot,
+            synced_at_ms: 1,
+            last_render_ms: 0,
+            last_error: None,
+        });
+    }
+
+    #[test]
+    fn program_render_stays_opaque() {
+        let _guard = test_lock().lock().unwrap();
+        install_snapshot(Vec::new());
+
+        let frame = render_native_scene_rgba(4, 4).expect("program render");
+
+        assert_eq!(frame.len(), 4 * 4 * 4);
+        assert!(frame.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn alpha_render_keeps_background_transparent_and_draws_overlays() {
+        let _guard = test_lock().lock().unwrap();
+        install_snapshot(vec![NativeSceneNode {
+            id: "overlay-lower-third".into(),
+            node_type: "overlay".into(),
+            label: "Lower Third".into(),
+            source_id: Some("overlay:lower-third".into()),
+            x: 10.0,
+            y: 10.0,
+            width: 40.0,
+            height: 20.0,
+            z_index: 10,
+            visible: true,
+            content_fit: None,
+            status: None,
+            resolution: None,
+            fps: None,
+            audio_level: None,
+            accent_color: Some("#00e5ff".into()),
+            text: Some("Speaker | Title".into()),
+        }]);
+
+        let frame = render_native_scene_alpha_rgba(100, 100).expect("alpha render");
+        let overlay_idx = ((15 * 100 + 30) * 4) as usize;
+
+        assert_eq!(frame[3], 0);
+        assert!(frame[overlay_idx + 3] > 0);
+        assert!(frame[overlay_idx + 3] < 255);
+    }
 }

@@ -135,6 +135,7 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
   aiMode, setAiMode,
   layout, setLayout,
   activeGraphics, toggleGraphic,
+  telemetry,
   script, currentStepIndex, isScriptRunning, toggleScript, skipStep,
   isRemoteConnected, toggleRemote,
   activeTab, setActiveTab,
@@ -393,7 +394,9 @@ export const DirectorRack: React.FC<DirectorRackProps> = ({
                   <Monitor size={14} className="text-accent-green" />
                   <span className="text-[11px] font-bold uppercase tracking-wider">Input Manager</span>
                 </div>
-                <span className="text-[9px] text-gray-500 font-mono">LIVE: 1080p60</span>
+                <span className="text-[9px] text-gray-500 font-mono">
+                  LIVE: {telemetry.fps > 0 ? `${Math.round(telemetry.fps)} FPS` : 'ACTIVE'}
+                </span>
               </div>
               <div className="p-3 space-y-3">
                 <div className="grid grid-cols-2 gap-2">

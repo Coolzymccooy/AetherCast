@@ -6,7 +6,7 @@ use super::state::{
 };
 use super::telemetry::now_ms;
 
-const DEFAULT_AUDIO_BUFFER_MS: u32 = 50;
+const DEFAULT_AUDIO_BUFFER_MS: u32 = 500;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -75,7 +75,15 @@ pub fn list_audio_devices(ffmpeg_bin: &str) -> Vec<NativeAudioInput> {
 
     let mut command = Command::new(ffmpeg_bin);
     let output = match configure_background_command(&mut command)
-        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -133,14 +141,19 @@ pub fn build_audio_plan(
     }
 
     if inputs.is_empty() {
-        let want_system = config.include_system_audio && matches!(mode, "auto" | "hybrid" | "system");
+        let want_system =
+            config.include_system_audio && matches!(mode, "auto" | "hybrid" | "system");
         let want_microphone =
             config.include_microphone && matches!(mode, "auto" | "hybrid" | "microphone");
 
         if want_system {
-            if let Some(device) = select_preferred_device(&devices, DevicePreference::System, &inputs)
+            if let Some(device) =
+                select_preferred_device(&devices, DevicePreference::System, &inputs)
             {
-                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
+                inputs.push(to_audio_input_spec(
+                    device,
+                    resolve_bus_runtime(config, Some(device)),
+                ));
             }
         }
 
@@ -148,19 +161,30 @@ pub fn build_audio_plan(
             if let Some(device) =
                 select_preferred_device(&devices, DevicePreference::Microphone, &inputs)
             {
-                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
+                inputs.push(to_audio_input_spec(
+                    device,
+                    resolve_bus_runtime(config, Some(device)),
+                ));
             }
         }
 
         if inputs.is_empty() && mode == "microphone" {
-            if let Some(device) = select_preferred_device(&devices, DevicePreference::Any, &inputs) {
-                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
+            if let Some(device) = select_preferred_device(&devices, DevicePreference::Any, &inputs)
+            {
+                inputs.push(to_audio_input_spec(
+                    device,
+                    resolve_bus_runtime(config, Some(device)),
+                ));
             }
         }
 
         if inputs.is_empty() && matches!(mode, "system" | "auto" | "hybrid") {
-            if let Some(device) = select_preferred_device(&devices, DevicePreference::Any, &inputs) {
-                inputs.push(to_audio_input_spec(device, resolve_bus_runtime(config, Some(device))));
+            if let Some(device) = select_preferred_device(&devices, DevicePreference::Any, &inputs)
+            {
+                inputs.push(to_audio_input_spec(
+                    device,
+                    resolve_bus_runtime(config, Some(device)),
+                ));
             }
         }
     }
@@ -173,7 +197,9 @@ pub fn build_audio_plan(
             bitrate_kbps,
             lavfi_enabled,
             selection_note.or_else(|| {
-                Some("No native DirectShow audio device was available, using synthetic audio".into())
+                Some(
+                    "No native DirectShow audio device was available, using synthetic audio".into(),
+                )
             }),
         );
     }
@@ -296,6 +322,8 @@ pub fn append_audio_input_args(args: &mut Vec<String>, plan: &NativeAudioPlan) {
             input.backend.clone(),
             "-audio_buffer_size".into(),
             DEFAULT_AUDIO_BUFFER_MS.to_string(),
+            "-rtbufsize".into(),
+            "200M".into(),
             "-i".into(),
             format!("audio={}", input.name),
         ]);
@@ -486,7 +514,11 @@ fn fallback_silence_plan(
 ) -> NativeAudioPlan {
     NativeAudioPlan {
         mode: mode.into(),
-        backend: if lavfi_enabled { "lavfi".into() } else { "none".into() },
+        backend: if lavfi_enabled {
+            "lavfi".into()
+        } else {
+            "none".into()
+        },
         sample_rate,
         channels,
         bitrate_kbps,
@@ -570,7 +602,9 @@ fn infer_audio_source_kind(name: &str) -> NativeAudioSourceKind {
             "voicemeeter",
         ],
     ) {
-        if lowered.contains("cable") || lowered.contains("voicemeeter") || lowered.contains("vb-audio")
+        if lowered.contains("cable")
+            || lowered.contains("voicemeeter")
+            || lowered.contains("vb-audio")
         {
             NativeAudioSourceKind::Virtual
         } else {
@@ -756,15 +790,9 @@ fn audio_bus_matches(bus: &NativeAudioBusConfig, kind: &NativeAudioSourceKind) -
                 || bus_id.contains("mic")
                 || bus_id.contains("microphone")
         }
-        NativeAudioSourceKind::System => {
-            target == "system" || bus_id.contains("system")
-        }
-        NativeAudioSourceKind::Virtual => {
-            target == "virtual" || bus_id.contains("virtual")
-        }
-        NativeAudioSourceKind::Synthetic => {
-            target == "synthetic" || bus_id == "silent"
-        }
+        NativeAudioSourceKind::System => target == "system" || bus_id.contains("system"),
+        NativeAudioSourceKind::Virtual => target == "virtual" || bus_id.contains("virtual"),
+        NativeAudioSourceKind::Synthetic => target == "synthetic" || bus_id == "silent",
         NativeAudioSourceKind::Unknown => target == "unknown" || bus_id == "audio",
     }
 }
@@ -778,7 +806,11 @@ fn build_audio_filter_graph(plan: &NativeAudioPlan) -> Option<String> {
 
     for (idx, input) in plan.inputs.iter().enumerate() {
         let mut filters: Vec<String> = Vec::new();
-        let volume = if input.bus.muted { 0.0 } else { input.bus.volume };
+        let volume = if input.bus.muted {
+            0.0
+        } else {
+            input.bus.volume
+        };
         if (volume - 1.0).abs() > f32::EPSILON || input.bus.muted {
             filters.push(format!("volume={:.3}", volume));
         }

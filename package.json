@@ -1,7 +1,7 @@
 {
   "name": "aether-studio",
   "private": true,
-  "version": "1.0.21",
+  "version": "1.0.22",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -28,6 +28,7 @@
     "@capacitor/cli": "^8.3.0",
     "@capacitor/core": "^8.3.0",
     "@google/genai": "^1.29.0",
+    "@stagetimerio/grandiose": "^0.1.2",
     "@tailwindcss/vite": "^4.1.14",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-process": "^2.3.1",

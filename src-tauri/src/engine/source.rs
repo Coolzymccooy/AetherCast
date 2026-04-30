@@ -8,9 +8,7 @@ use tokio::sync::oneshot;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::state::{
-    EngineHealthState, NativeSourceKind, NativeSourceStatus, SourceBridgeRuntime,
-};
+use super::state::{EngineHealthState, NativeSourceKind, NativeSourceStatus, SourceBridgeRuntime};
 use super::telemetry::now_ms;
 use super::video::store_source_frame;
 
@@ -30,10 +28,14 @@ pub struct NativeSourceDescriptor {
 #[derive(Debug, Clone)]
 struct StoredSourceInventoryEntry {
     descriptor: NativeSourceDescriptor,
+    recovery_delay_ms: u64,
+    restart_count: u32,
+    last_event: Option<String>,
     last_inventory_sync_ms: u64,
     frame_width: u32,
     frame_height: u32,
     last_frame_ms: u64,
+    last_update_ms: u64,
     last_error: Option<String>,
 }
 
@@ -211,7 +213,9 @@ pub async fn start_source_bridge(session_id: u64) -> Result<String, String> {
                                     }
                                 }
 
-                                if let Err(err) = store_source_frame(source_id, width, height, payload) {
+                                if let Err(err) =
+                                    store_source_frame(source_id, width, height, payload, false)
+                                {
                                     note_source_error(source_id, err.clone());
                                     if let Ok(mut bridge) = source_bridge_runtime().lock() {
                                         if bridge.session_id == session_id {
@@ -293,6 +297,9 @@ pub fn current_source_statuses() -> Vec<NativeSourceStatus> {
                 label: entry.descriptor.label,
                 source_kind: entry.descriptor.source_kind,
                 state,
+                recovery_delay_ms: entry.recovery_delay_ms,
+                restart_count: entry.restart_count,
+                last_event: entry.last_event,
                 source_status: entry.descriptor.source_status,
                 resolution: entry.descriptor.resolution,
                 fps: entry.descriptor.fps,
@@ -302,19 +309,39 @@ pub fn current_source_statuses() -> Vec<NativeSourceStatus> {
                 frame_height: entry.frame_height,
                 last_frame_ms: entry.last_frame_ms,
                 last_inventory_sync_ms: entry.last_inventory_sync_ms,
+                last_update_ms: entry.last_update_ms,
                 last_error: entry.last_error,
             }
         })
         .collect()
 }
 
+/// Called by the source bridge (browser/JS path). Updates timing but does NOT clear
+/// last_error so JS can still detect that the native dshow capture failed.
 pub fn note_source_frame(source_id: &str, width: u32, height: u32) {
     if let Ok(mut guard) = source_inventory_store().lock() {
         if let Some(entry) = guard.get_mut(source_id) {
             entry.frame_width = width;
             entry.frame_height = height;
             entry.last_frame_ms = now_ms();
+            entry.last_update_ms = entry.last_frame_ms;
+            entry.last_event = Some("Browser bridge frame received".into());
+        }
+    }
+}
+
+/// Called by native dshow capture. Updates timing AND clears last_error because
+/// a native frame arriving means the capture process is genuinely working.
+pub fn note_native_source_frame(source_id: &str, width: u32, height: u32) {
+    if let Ok(mut guard) = source_inventory_store().lock() {
+        if let Some(entry) = guard.get_mut(source_id) {
+            entry.frame_width = width;
+            entry.frame_height = height;
+            entry.last_frame_ms = now_ms();
+            entry.last_update_ms = entry.last_frame_ms;
             entry.last_error = None;
+            entry.last_event = Some("Native capture frame received".into());
+            entry.recovery_delay_ms = 0;
         }
     }
 }
@@ -322,7 +349,12 @@ pub fn note_source_frame(source_id: &str, width: u32, height: u32) {
 pub fn note_source_error(source_id: &str, error: String) {
     if let Ok(mut guard) = source_inventory_store().lock() {
         if let Some(entry) = guard.get_mut(source_id) {
+            if entry.last_error.is_none() {
+                entry.restart_count += 1;
+            }
+            entry.last_event = Some(error.clone());
             entry.last_error = Some(error);
+            entry.last_update_ms = now_ms();
         }
     }
 }
@@ -360,22 +392,31 @@ pub async fn update_source_inventory(
         if let Some(existing) = guard.get_mut(&source_id) {
             existing.descriptor = source;
             existing.last_inventory_sync_ms = sync_time;
+            existing.last_update_ms = sync_time;
+            existing.last_event = Some("Source inventory synced".into());
         } else {
             guard.insert(
                 source_id,
                 StoredSourceInventoryEntry {
                     descriptor: source,
+                    recovery_delay_ms: 0,
+                    restart_count: 0,
+                    last_event: Some("Source inventory synced".into()),
                     last_inventory_sync_ms: sync_time,
                     frame_width: 0,
                     frame_height: 0,
                     last_frame_ms: 0,
+                    last_update_ms: sync_time,
                     last_error: None,
                 },
             );
         }
     }
 
-    Ok(format!("Native source inventory synced: {} source(s)", guard.len()))
+    Ok(format!(
+        "Native source inventory synced: {} source(s)",
+        guard.len()
+    ))
 }
 
 #[tauri::command]

@@ -14,8 +14,11 @@ import { isValidRoomId, resolveRoomId } from "./src/utils/roomId";
 import { createAiRouter } from "./src/server/ai";
 import { createLuminaRouter } from "./src/server/lumina";
 import { sanitizeText } from "./src/server/sanitize";
+import { normalizeDestinationUrl, normalizeStreamKey } from "./src/lib/streamDestinations";
 
 dotenv.config();
+
+const STREAM_PIPE_HIGH_WATER_MARK_BYTES = 8 * 1024 * 1024;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // fMP4 → raw H.264 Annex B demuxer
@@ -36,7 +39,10 @@ class FMP4Demuxer extends Transform {
   private headerSent = false;
 
   constructor(cachedSPS?: Buffer | null, cachedPPS?: Buffer | null) {
-    super();
+    super({
+      readableHighWaterMark: STREAM_PIPE_HIGH_WATER_MARK_BYTES,
+      writableHighWaterMark: STREAM_PIPE_HIGH_WATER_MARK_BYTES,
+    });
     this.sps = cachedSPS || null;
     this.pps = cachedPPS || null;
     if (this.sps) this.headerSent = false; // will send cached SPS/PPS before first mdat
@@ -345,6 +351,7 @@ async function startServer() {
     let currentSession: StreamSession | null = null;
     let lastStartData: StartStreamData | null = null;
     let destinationHealthMap: Map<string, DestinationHealth> = new Map();
+    let browserStreamReadyEmitted = false;
 
     // ── Backpressure State ────────────────────────────────────────────────
     let backpressureActive = false;
@@ -464,6 +471,13 @@ async function startServer() {
 
         // Throttle stats emission to every 2 seconds
         const now = Date.now();
+        if (!browserStreamReadyEmitted && stats.frame > 0) {
+          browserStreamReadyEmitted = true;
+          socket.emit('stream-started', {
+            message: `Live output confirmed (${stats.frame} frame${stats.frame === 1 ? '' : 's'} encoded)`,
+            timestamp: now,
+          });
+        }
         if (now - lastStatsEmit >= STATS_THROTTLE_MS) {
           lastStatsEmit = now;
           socket.emit('stream-stats', stats);
@@ -509,7 +523,7 @@ async function startServer() {
       const ristDests: any[] = [];
 
       for (const dest of destinations) {
-        const url = dest.rtmpUrl || dest.url || '';
+        const url = normalizeDestinationUrl(dest.rtmpUrl || dest.url || '');
         if (typeof url !== 'string' || !url) {
           socket.emit('server-log', { message: `Invalid destination: missing URL`, type: 'error' });
           return null;
@@ -538,12 +552,8 @@ async function startServer() {
 
       for (const dest of rtmpDests) {
         // Strip librtmp-style "key=" prefix if someone pasted it — FFmpeg's internal RTMP handler rejects it
-        const cleanKey = (dest.streamKey || '').replace(/^key=/i, '');
-        let destUrl = (dest.rtmpUrl || dest.url).replace(/\/$/, '');
-        // Auto-upgrade Twitch RTMP → RTMPS: ISPs commonly block outbound port 1935
-        if (/^rtmp:\/\/live\.twitch\.tv/.test(destUrl)) {
-          destUrl = destUrl.replace('rtmp://live.twitch.tv', 'rtmps://live.twitch.tv:443');
-        }
+        const cleanKey = normalizeStreamKey(dest.streamKey || '');
+        const destUrl = normalizeDestinationUrl(dest.rtmpUrl || dest.url || '');
         const url = `${destUrl}/${cleanKey}`;
         teeSegments.push(`[f=flv:onfail=ignore]${url}`);
       }
@@ -673,7 +683,7 @@ async function startServer() {
       console.log(`Streaming to ${totalDests} destinations (RTMP: ${rtmpDests.length}, SRT: ${srtDests.length}, RIST: ${ristDests.length})`);
       socket.emit('server-log', { message: `Initializing FFmpeg for ${totalDests} destinations...`, type: 'info' });
 
-      inputStream = new PassThrough();
+      inputStream = new PassThrough({ highWaterMark: STREAM_PIPE_HIGH_WATER_MARK_BYTES });
       backpressureActive = false;
 
       inputStream.on('drain', () => {
@@ -682,7 +692,7 @@ async function startServer() {
 
       // Initialize destination health as connected
       for (const dest of destinations) {
-        const url = dest.rtmpUrl || dest.url || '';
+        const url = normalizeDestinationUrl(dest.rtmpUrl || dest.url || '');
         const health: DestinationHealth = { url, status: 'connected' };
         destinationHealthMap.set(url, health);
         socket.emit('destination-status', health);
@@ -694,6 +704,7 @@ async function startServer() {
       const disableSyntheticAudio = data.disableSyntheticAudio === true;
       const outputArgs = buildOutputArgs(rtmpDests, srtDests, ristDests);
       lastFFmpegStartupIssue = null;
+      browserStreamReadyEmitted = false;
 
       if (transportMode === 'mediarecorder-h264') {
         // ═══════════════════════════════════════════════════════════════
@@ -741,7 +752,6 @@ async function startServer() {
           '-c:v', 'copy',
           ...(disableSyntheticAudio ? ['-an'] : ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-shortest']),
           '-max_interleave_delta', '0',
-          '-flags', '+global_header',
           '-flvflags', 'no_duration_filesize',
           ...outputArgs,
         ];
@@ -781,7 +791,7 @@ async function startServer() {
         const profile = getReencodeProfile(encodingProfile);
         console.log(`[stream] Browser transport requires server re-encode (${profile.scale} @ ${profile.fps}fps)`);
         socket.emit('server-log', {
-          message: `Re-encoding browser stream to H.264 (${profile.scale} @ ${profile.fps}fps)`,
+          message: `Re-encoding browser compatibility stream to H.264 (${profile.scale} @ ${profile.fps}fps)`,
           type: 'warning',
         });
 
@@ -809,7 +819,6 @@ async function startServer() {
           '-profile:v', 'high',
           ...(disableSyntheticAudio ? ['-an'] : ['-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-shortest']),
           '-max_interleave_delta', '0',
-          '-flags', '+global_header',
           '-flvflags', 'no_duration_filesize',
           ...outputArgs,
         ];
@@ -819,7 +828,7 @@ async function startServer() {
         }
 
         console.log(`FFmpeg command: ${resolvedFFmpegPath} ${args.join(' ')}`);
-        socket.emit('server-log', { message: 'FFmpeg started (browser re-encode path)', type: 'success' });
+        socket.emit('server-log', { message: 'FFmpeg started (browser compatibility re-encode path)', type: 'success' });
 
         const proc = spawn(resolvedFFmpegPath, args, {
           stdio: ['pipe', 'ignore', 'pipe'],
@@ -1045,11 +1054,11 @@ async function startServer() {
           const elapsed = now - lastChunkTime;
           if (elapsed > 6_000 && (now - lastRefreshRequestAt) > 12_000) {
             lastRefreshRequestAt = now;
-            socket.emit('server-log', { message: 'No browser chunks received for 6s — requesting transport refresh', type: 'warning' });
+            socket.emit('server-log', { message: 'No browser compatibility chunks received for 6s — requesting transport refresh', type: 'warning' });
             socket.emit('stream-refresh-request', { reason: 'server-chunk-stall', elapsedMs: elapsed });
           }
           if (elapsed > 10_000 && (now - lastHeartbeatWarn) > 30_000) {
-            socket.emit('server-log', { message: 'Warning: No chunks received for 10s — stream may be stalled', type: 'warning' });
+            socket.emit('server-log', { message: 'Warning: No browser compatibility chunks received for 10s — stream may be stalled', type: 'warning' });
             lastHeartbeatWarn = now;
           }
         }
@@ -1209,7 +1218,7 @@ async function startServer() {
       recordingPath = path.join(outputDir, filename);
 
       const browserH264 = data.browserH264 === true;
-      recordingStream = new PassThrough();
+      recordingStream = new PassThrough({ highWaterMark: STREAM_PIPE_HIGH_WATER_MARK_BYTES });
 
       let args: string[];
 

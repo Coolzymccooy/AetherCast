@@ -2,6 +2,7 @@ import { useState, useRef, MutableRefObject, useEffect, useCallback } from 'reac
 import { Socket } from 'socket.io-client';
 import { StreamDestination, Recording, ServerLog, EncodingProfile, Telemetry } from '../types';
 import { audioEngine } from '../lib/audioEngine';
+import { normalizeStreamDestinations } from '../lib/streamDestinations';
 
 interface UseStreamingOptions {
   socketRef: MutableRefObject<Socket | null>;
@@ -18,6 +19,11 @@ export type DestinationStatus = {
   name: string;
   status: 'connected' | 'disconnected' | 'error' | 'reconnecting';
   message?: string;
+};
+
+type StreamStartedPayload = {
+  message?: string;
+  timestamp?: number;
 };
 
 type BrowserTransportMode = 'mediarecorder-h264' | 'mediarecorder-webm';
@@ -49,6 +55,7 @@ const HEALTH_CHECK_INTERVAL_MS = 2000;
 const REQUEST_DATA_AFTER_MS = 2500;
 const RESTART_AFTER_MS = 6000;
 const TRANSPORT_RESTART_DELAY_MS = 750;
+const STREAM_READY_TIMEOUT_MS = 15000;
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -64,9 +71,11 @@ export function useStreaming({
   const [isRecording, setIsRecording] = useState(false);
   const [destinations, setDestinations] = useState<StreamDestination[]>(() => {
     const saved = localStorage.getItem('aether_destinations');
-    return saved ? JSON.parse(saved) : [
+    const parsed: StreamDestination[] = saved ? JSON.parse(saved) : [
       { id: '1', name: 'YouTube', rtmpUrl: 'rtmps://a.rtmp.youtube.com:443/live2', streamKey: '', enabled: true },
     ];
+    // Migrate any saved destinations that were incorrectly set to /live → /app (correct Twitch RTMP app name).
+    return normalizeStreamDestinations(parsed);
   });
   const [recordings, setRecordings] = useState<Recording[]>(() => {
     const saved = localStorage.getItem('aether_recordings');
@@ -107,6 +116,46 @@ export function useStreaming({
       ...prev,
     ]);
   }, [setServerLogs]);
+
+  const waitForStreamReady = useCallback((socket: Socket) => {
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+
+      const cleanup = () => {
+        window.clearTimeout(timeoutId);
+        socket.off('stream-started', handleStarted);
+        socket.off('stream-failed', handleFailed);
+        socket.off('disconnect', handleDisconnect);
+      };
+
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn();
+      };
+
+      const handleStarted = (payload?: StreamStartedPayload) => {
+        finish(() => resolve(payload?.message || 'Streaming started successfully.'));
+      };
+
+      const handleFailed = (payload?: { message?: string }) => {
+        finish(() => reject(new Error(payload?.message || 'FFmpeg failed before the stream became ready.')));
+      };
+
+      const handleDisconnect = () => {
+        finish(() => reject(new Error('Socket disconnected before the stream became ready.')));
+      };
+
+      const timeoutId = window.setTimeout(() => {
+        finish(() => reject(new Error('Timed out waiting for the stream to become ready.')));
+      }, STREAM_READY_TIMEOUT_MS);
+
+      socket.on('stream-started', handleStarted);
+      socket.on('stream-failed', handleFailed);
+      socket.on('disconnect', handleDisconnect);
+    });
+  }, []);
 
   const clearHealthTimer = useCallback(() => {
     if (healthTimerRef.current) {
@@ -307,14 +356,14 @@ export function useStreaming({
 
     restartInFlightRef.current = true;
     try {
-      addServerLog(`Rebuilding browser transport (${reason})`, 'info');
+      addServerLog(`Rebuilding browser compatibility transport (${reason})`, 'info');
       await stopActiveRecorder();
       emitStartStream(payload);
       await delay(TRANSPORT_RESTART_DELAY_MS);
       if (!streamWantedRef.current) return;
       const capturedStream = ensureCaptureStream(payload);
       createAndStartRecorder(capturedStream, payload);
-      addServerLog(`Browser transport recovered (${reason})`, 'success');
+      addServerLog(`Browser compatibility transport recovered (${reason})`, 'success');
     } catch (err: any) {
       const message = err?.message || `Failed to rebuild browser transport (${reason})`;
       addServerLog(message, 'error');
@@ -333,14 +382,14 @@ export function useStreaming({
 
     const handleConnect = () => {
       if (streamWantedRef.current && activePayloadRef.current) {
-        addServerLog('Socket reconnected — restarting browser stream transport', 'info');
+        addServerLog('Socket reconnected — restarting browser compatibility transport', 'info');
         void restartBrowserTransport('socket-reconnect');
       }
     };
 
     const handleDisconnect = () => {
       if (streamWantedRef.current) {
-        addServerLog('Socket disconnected — waiting to rebuild stream transport', 'warning');
+        addServerLog('Socket disconnected — waiting to rebuild browser compatibility transport', 'warning');
       }
     };
 
@@ -412,7 +461,9 @@ export function useStreaming({
   }, [addServerLog, onError, restartBrowserTransport, setTelemetry, socketRef, stopStreamingRuntime]);
 
   const startStreaming = async (showSettings: () => void) => {
-    const activeDestinations = destinations.filter((dest) => dest.enabled);
+    const activeDestinations = normalizeStreamDestinations(
+      destinations.filter((dest) => dest.enabled),
+    );
     if (activeDestinations.length === 0) {
       onError?.('No streaming destinations enabled. Configure at least one destination.');
       showSettings();
@@ -425,16 +476,18 @@ export function useStreaming({
     }
 
     try {
-      if (!socketRef.current?.connected) {
+      const socket = socketRef.current;
+      if (!socket?.connected) {
         onError?.('Not connected to server. Check your connection and try again.');
         return;
       }
 
       const payload = buildPayload(activeDestinations);
       const capturedStream = ensureCaptureStream(payload);
+      const readyPromise = waitForStreamReady(socket);
 
       if (encodingProfile === '1080p60') {
-        addServerLog('Browser streaming is capped at 30fps for stability. Use the desktop GPU path for true 60fps output.', 'warning');
+        addServerLog('Browser compatibility mode is capped at 30fps for stability. Use the desktop GPU path for true 60fps output.', 'warning');
       }
 
       activePayloadRef.current = payload;
@@ -442,18 +495,16 @@ export function useStreaming({
       droppedFramesRef.current = 0;
       setDroppedFrames(0);
 
-      addServerLog(`Browser transport: ${payload.transportMode} (${payload.mimeType})`, 'info');
+      addServerLog(`Browser compatibility transport: ${payload.transportMode} (${payload.mimeType})`, 'info');
       emitStartStream(payload);
       await delay(TRANSPORT_RESTART_DELAY_MS);
       createAndStartRecorder(capturedStream, payload);
+      const readyMessage = await readyPromise;
       setIsStreaming(true);
-      onSuccess?.('Streaming started successfully.');
+      onSuccess?.(readyMessage);
     } catch (err: any) {
       console.error('Failed to start stream:', err);
-      streamWantedRef.current = false;
-      activePayloadRef.current = null;
-      releaseCaptureStream(true);
-      setIsStreaming(false);
+      await stopStreamingRuntime(true, true);
       onError?.(`Failed to start stream: ${err?.message || 'Unknown error'}`);
       addServerLog(`Stream Error: ${err?.message || err}`, 'error');
     }

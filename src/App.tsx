@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react';
 import { AnimatePresence } from 'motion/react';
 import { motion } from 'motion/react';
-import { Terminal, Brain, X } from 'lucide-react';
+import { Terminal, Brain, X, Network, RefreshCw, Square } from 'lucide-react';
 
 // --- Constants ---
 import { SAMPLE_SCRIPT } from './constants';
@@ -22,7 +22,9 @@ import { useMIDI } from './hooks/useMIDI';
 import { useNativeEngine, type NativeAudioBusConfig } from './hooks/useNativeEngine';
 import { useNativeSourceFeeds } from './hooks/useNativeSourceFeeds';
 import { useBrowserSourceRuntime } from './hooks/useBrowserSourceRuntime';
+import { filterBrowserFedNativeSceneSources, resolveNativeCaptureProfile } from './lib/nativeStreaming';
 import { buildNativeSceneSnapshot, buildNativeSourceInventory } from './lib/sceneSchema';
+import { normalizeStreamDestinations } from './lib/streamDestinations';
 import { type EncodingProfile, type StreamDestination, type ServerLog } from './types';
 
 // --- Studio Components ---
@@ -71,6 +73,7 @@ declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
     __AETHER_EXPORT_NATIVE_DIAGNOSTICS__?: (() => unknown) | undefined;
+    __AETHER_EXPORT_AND_CHECK_NATIVE_DIAGNOSTICS__?: (() => Promise<unknown>) | undefined;
   }
 }
 
@@ -180,6 +183,41 @@ function StudioView() {
       notify(msg, 'error');
     },
   });
+  const [showNdiSourceModal, setShowNdiSourceModal] = React.useState(false);
+  const [ndiSources, setNdiSources] = React.useState<Array<{ name: string; url_address?: string | null }>>([]);
+  const [ndiDiscoveryBusy, setNdiDiscoveryBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    const ndi = nativeEngine.stats.ndiStatus;
+    if (!ndi?.desired_active) return;
+
+    let rafId = 0;
+    let disposed = false;
+    let sending = false;
+    let lastSentAt = 0;
+    const targetIntervalMs = 1000 / Math.max(1, Math.min(30, ndi.fps || 30));
+
+    const pump = (now: number) => {
+      if (disposed) return;
+      if (!sending && now - lastSentAt >= targetIntervalMs) {
+        const canvas = programViewRef.current?.getNativeCaptureSurface().canvas;
+        if (canvas) {
+          sending = true;
+          lastSentAt = now;
+          void nativeEngine.pushNdiProgramFrame(canvas).finally(() => {
+            sending = false;
+          });
+        }
+      }
+      rafId = window.requestAnimationFrame(pump);
+    };
+
+    rafId = window.requestAnimationFrame(pump);
+    return () => {
+      disposed = true;
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
+  }, [nativeEngine.pushNdiProgramFrame, nativeEngine.stats.ndiStatus?.desired_active, nativeEngine.stats.ndiStatus?.fps]);
 
   // ── Hooks ─────────────────────────────────────────────────────────────────
   const webrtc = useWebRTC({
@@ -238,9 +276,33 @@ function StudioView() {
           : null,
       ].filter((source): source is { sourceId: string; deviceName: string } => !!source)
     : [];
-  const nativeOwnedSourceIds = nativeEngine.isStreaming
-    ? nativeVideoSources.map((source) => source.sourceId)
-    : [];
+  const nativeProfilePreviewDestinations = React.useMemo<Array<Pick<StreamDestination, 'enabled' | 'protocol' | 'rtmpUrl' | 'url'>>>(() => {
+    const enabled = streaming.destinations
+      .filter((destination) => destination.enabled)
+      .map((destination) => ({
+        enabled: destination.enabled,
+        protocol: destination.protocol,
+        rtmpUrl: destination.rtmpUrl,
+        url: destination.url || destination.rtmpUrl || '',
+      }));
+
+    if (enabled.length > 0) {
+      return enabled;
+    }
+
+    return [{
+      enabled: true,
+      protocol: 'rtmp',
+      rtmpUrl: 'rtmp://preview.invalid/live',
+      url: 'rtmp://preview.invalid/live',
+    }];
+  }, [streaming.destinations]);
+  const nativeOwnedSourceIds = [
+    ...(nativeEngine.isStreaming ? nativeVideoSources.map((source) => source.sourceId) : []),
+    ...(nativeEngine.stats.ndiInputStatus?.desired_active
+      ? [nativeEngine.stats.ndiInputStatus.routed_source_id]
+      : []),
+  ];
   const nativeOwnedSourceIdsKey = nativeOwnedSourceIds.join('|');
   const mediaCaptureSources = React.useMemo(() => {
     const element = mediaPlayer.getVideoElement();
@@ -254,6 +316,122 @@ function StudioView() {
     }];
   }, [mediaPlayer, mediaPlayer.playbackState.currentItem]);
   const browserSourceRuntime = useBrowserSourceRuntime(browserSourceUrl);
+  const programStreamSummary = React.useMemo(() => {
+    if (!(studio.isStreaming || nativeEngine.isStreaming)) {
+      return 'IDLE';
+    }
+
+    const parts: string[] = [];
+    if (nativeEngine.stats.width > 0 && nativeEngine.stats.height > 0) {
+      parts.push(`${nativeEngine.stats.width}x${nativeEngine.stats.height}`);
+    }
+    if (telemetry.fps > 0) {
+      parts.push(`${Math.round(telemetry.fps)}fps`);
+    }
+    if (telemetry.bitrate && telemetry.bitrate !== '0.0 Mbps') {
+      parts.push(telemetry.bitrate);
+    }
+
+    return parts.join(' | ') || 'LIVE';
+  }, [
+    nativeEngine.isStreaming,
+    nativeEngine.stats.height,
+    nativeEngine.stats.width,
+    studio.isStreaming,
+    telemetry.bitrate,
+    telemetry.fps,
+  ]);
+  const ndiSummary = React.useMemo(() => {
+    const ndi = nativeEngine.stats.ndiStatus;
+    if (!ndi) return 'NDI idle';
+    const sourceNames = ndi.sources.map((source) => source.name).join(', ') || 'Aether-Program';
+    return `${ndi.state} | ${ndi.width}x${ndi.height}@${ndi.fps} | ${sourceNames}`;
+  }, [nativeEngine.stats.ndiStatus]);
+
+  const toggleNdiOutput = React.useCallback(async () => {
+    const ndi = nativeEngine.stats.ndiStatus;
+    try {
+      if (ndi?.active || ndi?.desired_active) {
+        await nativeEngine.stopNdi();
+        notify('NDI output stopped', 'info');
+        return;
+      }
+
+      await nativeEngine.startNdi({
+        resolution: '1080p',
+        fps: 30,
+        alphaEnabled: true,
+      });
+      notify('NDI output starting: Aether-Program + Aether-Alpha', 'success');
+    } catch (err: any) {
+      notify(`NDI failed: ${err?.message || err}`, 'error');
+    }
+  }, [nativeEngine, notify]);
+
+  const refreshNdiSources = React.useCallback(async () => {
+    setNdiDiscoveryBusy(true);
+    try {
+      const sources = await nativeEngine.listNdiSources();
+      setNdiSources(sources);
+      if (sources.length === 0) {
+        notify('No NDI sources found on this network yet.', 'warning');
+      }
+    } catch (err: any) {
+      notify(`NDI discovery failed: ${err?.message || err}`, 'error');
+    } finally {
+      setNdiDiscoveryBusy(false);
+    }
+  }, [nativeEngine, notify]);
+
+  const openNdiSourceModal = React.useCallback(() => {
+    setShowNdiSourceModal(true);
+    void refreshNdiSources();
+  }, [refreshNdiSources]);
+
+  const routeNdiSourceToCam2 = React.useCallback(async (sourceName: string) => {
+    try {
+      await nativeEngine.startNdiInput(sourceName, 'camera:local-2');
+      studio.setSources((prev) => prev.map((source) => (
+        source.name === 'Cam 2'
+          ? {
+              ...source,
+              kind: 'ndi',
+              ndiSourceName: sourceName,
+              status: 'standby' as const,
+              resolution: 'NDI',
+              fps: 30,
+              audioLevel: 0,
+            }
+          : source
+      )));
+      setShowNdiSourceModal(false);
+      notify(`NDI source routed to Cam 2: ${sourceName}`, 'success');
+    } catch (err: any) {
+      notify(`NDI input failed: ${err?.message || err}`, 'error');
+    }
+  }, [nativeEngine, notify, studio]);
+
+  const stopNdiInput = React.useCallback(async () => {
+    try {
+      await nativeEngine.stopNdiInput();
+      studio.setSources((prev) => prev.map((source) => (
+        source.name === 'Cam 2' && source.kind === 'ndi'
+          ? {
+              ...source,
+              kind: undefined,
+              ndiSourceName: undefined,
+              status: 'offline' as const,
+              resolution: '1080p',
+              fps: 60,
+              audioLevel: 0,
+            }
+          : source
+      )));
+      notify('NDI input stopped', 'info');
+    } catch (err: any) {
+      notify(`Could not stop NDI input: ${err?.message || err}`, 'error');
+    }
+  }, [nativeEngine, notify, studio]);
   const nativeSourceFeeds = useNativeSourceFeeds({
     webcamStream: webrtc.webcamStream,
     screenStream: webrtc.screenStream,
@@ -305,6 +483,37 @@ function StudioView() {
       };
     }));
   }, [browserSourceRuntime.fps, browserSourceRuntime.resolution, browserSourceRuntime.state, browserSourceUrl, studio.setSources]);
+
+  useEffect(() => {
+    const ndiInput = nativeEngine.stats.ndiInputStatus;
+    if (!ndiInput?.desired_active && !ndiInput?.active) return;
+
+    studio.setSources((prev) => prev.map((source) => {
+      if (source.name !== 'Cam 2') return source;
+      return {
+        ...source,
+        kind: 'ndi',
+        ndiSourceName: ndiInput.source_name || source.ndiSourceName,
+        status: ndiInput.active ? 'active' : ndiInput.state === 'error' ? 'offline' : 'standby',
+        resolution: ndiInput.width && ndiInput.height
+          ? `${ndiInput.width}x${ndiInput.height}`
+          : source.resolution === '1080p'
+            ? 'NDI'
+            : source.resolution,
+        fps: ndiInput.frames_received > 0 ? 30 : source.fps,
+        audioLevel: 0,
+      };
+    }));
+  }, [
+    nativeEngine.stats.ndiInputStatus?.active,
+    nativeEngine.stats.ndiInputStatus?.desired_active,
+    nativeEngine.stats.ndiInputStatus?.frames_received,
+    nativeEngine.stats.ndiInputStatus?.height,
+    nativeEngine.stats.ndiInputStatus?.source_name,
+    nativeEngine.stats.ndiInputStatus?.state,
+    nativeEngine.stats.ndiInputStatus?.width,
+    studio.setSources,
+  ]);
 
   useEffect(() => {
     if (!browserSourceUrl || !browserSourceRuntime.error) {
@@ -374,7 +583,9 @@ function StudioView() {
   }, [appendStudioLog]);
 
   const resolveLuminaDestinations = React.useCallback((payload?: Record<string, unknown>): StreamDestination[] => {
-    const enabledDestinations = streaming.destinations.filter((destination) => destination.enabled);
+    const enabledDestinations = normalizeStreamDestinations(
+      streaming.destinations.filter((destination) => destination.enabled),
+    );
     if (!payload) {
       return enabledDestinations;
     }
@@ -418,7 +629,7 @@ function StudioView() {
       });
     }
 
-    return Array.from(deduped.values());
+    return normalizeStreamDestinations(Array.from(deduped.values()));
   }, [appendStudioLog, streaming.destinations]);
 
   const applyLuminaScenePreference = React.useCallback((payload?: Record<string, unknown>) => {
@@ -503,6 +714,8 @@ function StudioView() {
     origin: 'Operator' | 'Lumina';
     payload?: Record<string, unknown>;
   }) => {
+    appendStudioLog(`[DEBUG] ${origin} requested stream start. nativeEngine.isAvailable=${nativeEngine.isAvailable}, isStreaming=${nativeEngine.isStreaming || studio.isStreaming}`, 'info');
+
     if (nativeEngine.isStreaming || studio.isStreaming) {
       appendStudioLog(`${origin} requested start, but the stream is already live.`, 'warning');
       return true;
@@ -514,15 +727,8 @@ function StudioView() {
 
     const requestedProfile = resolveLuminaProfile(payload) || streaming.encodingProfile;
     const rawDestinations = resolveLuminaDestinations(payload);
-    // Auto-upgrade Twitch RTMP → RTMPS (port 1935 is commonly blocked by ISPs)
-    const activeDestinations = rawDestinations.map((d) => {
-      const url = d.rtmpUrl || d.url || '';
-      if (/^rtmp:\/\/live\.twitch\.tv/.test(url)) {
-        const upgraded = url.replace('rtmp://live.twitch.tv', 'rtmps://live.twitch.tv:443');
-        return { ...d, rtmpUrl: upgraded, url: upgraded };
-      }
-      return d;
-    });
+    appendStudioLog(`[DEBUG] Resolved ${rawDestinations.length} destination(s) from storage.`, 'info');
+    const activeDestinations = normalizeStreamDestinations(rawDestinations);
 
     if (!activeDestinations.length) {
       appendStudioLog(`${origin} could not start streaming because no saved destinations were selected.`, 'warning');
@@ -550,7 +756,9 @@ function StudioView() {
     }
 
     if (nativeEngine.isAvailable) {
+      appendStudioLog(`[DEBUG] Native engine path: programViewRef.current=${!!programViewRef.current}`, 'info');
       const captureSurface = programViewRef.current?.getNativeCaptureSurface();
+      appendStudioLog(`[DEBUG] captureSurface=${!!captureSurface}, canvas=${!!captureSurface?.canvas}`, 'info');
       if (!captureSurface?.canvas) {
         appendStudioLog(`${origin} could not start streaming because the program output is not ready.`, 'warning');
         notify('Program output is not ready yet. Wait for the preview to initialize and retry.', 'warning');
@@ -558,11 +766,48 @@ function StudioView() {
       }
 
       const activeSourceFeeds = nativeSourceFeeds.getCaptureSources();
-      const hasVideoSources = nativeVideoSources.length > 0 || activeSourceFeeds.length > 0;
+      // Camera sources must remain available through the browser-fed bridge even
+      // when native dshow capture is configured. The native engine prefers dshow
+      // frames only while they are genuinely healthy and falls back to bridge
+      // frames when native capture is unavailable.
+      const hasBrowserOnlyProgramSources = Boolean(webrtc.screenStream || browserSourceUrl || activeSourceFeeds.length > 0);
+      const useNativeScene = nativeVideoSources.length > 0 && !hasBrowserOnlyProgramSources;
+      const runtimeProfile = resolveNativeCaptureProfile(
+        requestedProfile,
+        nativeEngine.encoderInfo?.isGPU ?? true,
+        {
+          mode: useNativeScene ? 'native-scene' : 'raw',
+          destinations: activeDestinations,
+        },
+      );
+      const getBrowserFedSourceFeeds = () => {
+        const filteredNativeIds = nativeVideoSources
+          .map((source) => source.sourceId)
+          .filter((sourceId) => !sourceId.startsWith('camera:'));
+        return filterBrowserFedNativeSceneSources(
+          nativeSourceFeeds.getCaptureSources(),
+          filteredNativeIds,
+        );
+      };
+
+      if (nativeVideoSources.length > 0) {
+        appendStudioLog(
+          `[DEBUG] Native capture workers own ${nativeVideoSources.length} local camera source(s); browser-fed bridge carries fallback frames if dshow capture fails.`,
+          'info',
+        );
+      }
+
+      if (runtimeProfile.reliabilityMode) {
+        appendStudioLog(
+          `[DEBUG] Windows native reliability mode selected: ${runtimeProfile.width}x${runtimeProfile.height} ${runtimeProfile.fps}fps @ ${runtimeProfile.bitrate} kbps.`,
+          'info',
+        );
+      }
 
       const micChannels = studio.audioChannels.filter((channel) => /^Mic/i.test(channel.name));
       const systemChannel = studio.audioChannels.find((channel) => channel.name === 'System');
 
+      appendStudioLog(`[DEBUG] Invoking native start_stream with ${activeDestinations.length} destination(s): ${activeDestinations.map(d => d.name).join(', ')}`, 'info');
       try {
         const message = await nativeEngine.startStream(captureSurface, activeDestinations, {
           encodingProfile: requestedProfile,
@@ -571,14 +816,14 @@ function StudioView() {
           includeSystemAudio: systemChannel ? !systemChannel.muted && systemChannel.volume > 0 : true,
           audioBuses: nativeAudioBuses,
           nativeVideoSources,
-          // Only pass sourceFeeds when there are active WebRTC/media sources.
-          // With no sources, omit this so startStream uses raw canvas mode instead
-          // of native-scene mode (which starts an idle source bridge with no feeds).
-          sourceFeeds: hasVideoSources ? nativeSourceFeeds.getCaptureSources : undefined,
+          sourceFeeds: useNativeScene ? getBrowserFedSourceFeeds : undefined,
         });
 
         studio.setIsStreaming(true);
-        appendStudioLog(`${origin} started the live stream (${requestedProfile}, ${activeDestinations.length} destination${activeDestinations.length === 1 ? '' : 's'}).`, 'success');
+        appendStudioLog(
+          `${origin} started the live stream (${runtimeProfile.width}x${runtimeProfile.height} ${runtimeProfile.fps}fps @ ${runtimeProfile.bitrate} kbps${runtimeProfile.reliabilityMode ? ', reliability mode' : ''}, ${activeDestinations.length} destination${activeDestinations.length === 1 ? '' : 's'}).`,
+          'success',
+        );
         notify(origin === 'Lumina' ? 'Lumina started the live stream.' : `GPU Stream: ${message}`, 'success');
         return true;
       } catch (error: any) {
@@ -590,13 +835,13 @@ function StudioView() {
     }
 
     if (origin === 'Lumina') {
-      appendStudioLog('Lumina start requests are desktop-only. Browser mode ignored the command.', 'warning');
+      appendStudioLog('Lumina start requests are desktop-only. Browser compatibility mode ignored the command.', 'warning');
       notify('Lumina live control is available only in the desktop app.', 'warning');
       return false;
     }
 
     await streaming.startStreaming(() => studio.setShowStreamSettings(true));
-    appendStudioLog(`Operator started browser streaming (${requestedProfile}).`, 'info');
+    appendStudioLog(`Operator started browser compatibility streaming (${requestedProfile}).`, 'info');
     return true;
   }, [
     appendStudioLog,
@@ -606,6 +851,7 @@ function StudioView() {
     nativeSourceFeeds,
     nativeVideoSources,
     notify,
+    browserSourceUrl,
     resolveLuminaDestinations,
     resolveLuminaProfile,
     streaming,
@@ -616,7 +862,7 @@ function StudioView() {
     const payload = request.payload || {};
 
     if (!window.__TAURI_INTERNALS__) {
-      appendStudioLog('Lumina stream control is available only in the desktop app. Browser mode ignored the request.', 'warning');
+      appendStudioLog('Lumina stream control is available only in the desktop app. Browser compatibility mode ignored the request.', 'warning');
       return;
     }
 
@@ -662,6 +908,7 @@ function StudioView() {
     const [, item] = action.split(':');
     switch (item) {
       case 'Add Camera': studio.setShowHardwareSetup(true); break;
+      case 'Add NDI Source': openNdiSourceModal(); break;
       case 'Add Screen Share': webrtc.startScreenShare(); break;
       case 'Add Browser Source': {
         const nextUrl = window.prompt(
@@ -780,14 +1027,22 @@ function StudioView() {
   useEffect(() => {
     if (!nativeEngine.isAvailable) {
       window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__ = undefined;
+      window.__AETHER_EXPORT_AND_CHECK_NATIVE_DIAGNOSTICS__ = undefined;
       return;
     }
 
     window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__ = nativeEngine.exportDiagnostics;
+    window.__AETHER_EXPORT_AND_CHECK_NATIVE_DIAGNOSTICS__ =
+      nativeEngine.exportAndCheckDiagnostics;
     return () => {
       window.__AETHER_EXPORT_NATIVE_DIAGNOSTICS__ = undefined;
+      window.__AETHER_EXPORT_AND_CHECK_NATIVE_DIAGNOSTICS__ = undefined;
     };
-  }, [nativeEngine.exportDiagnostics, nativeEngine.isAvailable]);
+  }, [
+    nativeEngine.exportAndCheckDiagnostics,
+    nativeEngine.exportDiagnostics,
+    nativeEngine.isAvailable,
+  ]);
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
@@ -831,7 +1086,7 @@ function StudioView() {
       <div className="flex-1 flex overflow-hidden" style={{ transform: `scale(${zoomLevel / 100})`, transformOrigin: 'top left', width: `${10000 / zoomLevel}%`, height: `${10000 / zoomLevel}%` }}>
         {showSourceRack && (
         <ErrorBoundary name="Source Rack" onError={(err) => notify(err.message, 'error')}>
-        <SourceRack sources={studio.sources} onSourceClick={s => {
+        <SourceRack sources={studio.sources} onOpenNdiSource={openNdiSourceModal} onSourceClick={s => {
           const scene =
             s.name === 'Screen Share'
               ? studio.scenes.find(sc => sc.type === 'SCREEN')
@@ -849,6 +1104,9 @@ function StudioView() {
             sources={studio.sources}
             isStreaming={studio.isStreaming || nativeEngine.isStreaming}
             isRecording={streaming.isRecording}
+            streamSummary={programStreamSummary}
+            ndiSummary={ndiSummary}
+            isNdiActive={!!(nativeEngine.stats.ndiStatus?.active || nativeEngine.stats.ndiStatus?.desired_active)}
             onToggleStreaming={() => {
               if (studio.isStreaming || nativeEngine.isStreaming) {
                 void stopConfiguredStreaming('Operator');
@@ -896,6 +1154,7 @@ function StudioView() {
                 }
               }
             }}
+            onToggleNdi={toggleNdiOutput}
             onToggleRecording={() => streaming.isRecording ? streaming.stopRecording() : streaming.startRecording()}
             webcamStream={webrtc.webcamStream}
             remoteStreams={webrtc.remoteStreams}
@@ -1071,9 +1330,16 @@ function StudioView() {
             setSelectedAudioDevice={webrtc.setSelectedAudioDevice}
             onClose={() => studio.setShowHardwareSetup(false)}
             onRefreshDevices={webrtc.refreshDevices}
-            onStart={() => {
-              webrtc.startCamera(webrtc.selectedVideoDevice, webrtc.selectedAudioDevice, webrtc.selectedVideoDevice2);
-              studio.setShowHardwareSetup(false);
+            onStart={async () => {
+              const started = await webrtc.startCamera(
+                webrtc.selectedVideoDevice,
+                webrtc.selectedAudioDevice,
+                webrtc.selectedVideoDevice2,
+              );
+              if (started) {
+                studio.setShowHardwareSetup(false);
+              }
+              return started;
             }}
           />
         )}
@@ -1087,6 +1353,88 @@ function StudioView() {
               void startConfiguredStreaming({ origin: 'Operator' });
             }}
           />
+        )}
+
+        {showNdiSourceModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-panel border border-border w-full max-w-xl rounded-2xl shadow-2xl overflow-hidden"
+            >
+              <div className="p-5 border-b border-border flex items-center justify-between bg-white/5">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-accent-cyan/10 flex items-center justify-center">
+                    <Network size={20} className="text-accent-cyan" />
+                  </div>
+                  <div>
+                    <h2 className="text-sm font-bold uppercase tracking-widest text-white">NDI Source Input</h2>
+                    <p className="text-[10px] text-gray-400">Route one NDI network source into Cam 2 for switching.</p>
+                  </div>
+                </div>
+                <button onClick={() => setShowNdiSourceModal(false)} className="p-2 text-gray-500 hover:text-white hover:bg-white/10 rounded-full transition-colors">
+                  <X size={20} />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="flex items-center justify-between rounded-xl border border-accent-cyan/20 bg-accent-cyan/5 p-3">
+                  <div>
+                    <p className="text-xs font-bold text-white">Current route</p>
+                    <p className="text-[10px] text-gray-400">
+                      {nativeEngine.stats.ndiInputStatus?.desired_active
+                        ? `${nativeEngine.stats.ndiInputStatus.source_name || 'NDI'} -> Cam 2 (${nativeEngine.stats.ndiInputStatus.state})`
+                        : 'No NDI input routed'}
+                    </p>
+                  </div>
+                  {nativeEngine.stats.ndiInputStatus?.desired_active && (
+                    <button
+                      onClick={() => void stopNdiInput()}
+                      className="px-3 py-2 rounded-lg border border-accent-red/30 text-accent-red text-[10px] font-bold uppercase hover:bg-accent-red/10 flex items-center gap-2"
+                    >
+                      <Square size={12} /> Stop
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  onClick={() => void refreshNdiSources()}
+                  disabled={ndiDiscoveryBusy}
+                  className="w-full py-3 rounded-xl border border-border text-gray-300 hover:text-white hover:bg-white/5 text-[10px] font-bold uppercase tracking-wider flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  <RefreshCw size={13} className={ndiDiscoveryBusy ? 'animate-spin' : ''} />
+                  {ndiDiscoveryBusy ? 'Scanning NDI Network...' : 'Refresh NDI Sources'}
+                </button>
+
+                <div className="space-y-2 max-h-72 overflow-y-auto">
+                  {ndiSources.map((source) => (
+                    <button
+                      key={`${source.name}:${source.url_address || ''}`}
+                      onClick={() => void routeNdiSourceToCam2(source.name)}
+                      className="w-full text-left p-4 rounded-xl border border-border bg-black/30 hover:border-accent-cyan/40 hover:bg-accent-cyan/5 transition-all"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-sm font-bold text-white">{source.name}</span>
+                        <span className="text-[9px] font-mono text-accent-cyan">Route to Cam 2</span>
+                      </div>
+                      <p className="text-[10px] text-gray-500 mt-1">{source.url_address || 'NDI network source'}</p>
+                    </button>
+                  ))}
+                  {!ndiDiscoveryBusy && ndiSources.length === 0 && (
+                    <div className="p-6 text-center rounded-xl border border-dashed border-border text-xs text-gray-500">
+                      No NDI sources found yet. Make sure the sender is on the same network, then refresh.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
         )}
 
         {studio.showQrModal && (
@@ -1158,6 +1506,9 @@ function StudioView() {
           <OutputQualityModal
             encodingProfile={streaming.encodingProfile}
             setEncodingProfile={streaming.setEncodingProfile}
+            isNativeDesktop={nativeEngine.isAvailable}
+            isGPU={nativeEngine.encoderInfo?.isGPU ?? nativeEngine.stats.isGPU}
+            destinations={nativeProfilePreviewDestinations}
             onClose={() => setShowOutputQuality(false)}
           />
         )}

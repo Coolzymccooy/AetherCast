@@ -14,19 +14,18 @@ use tokio_tungstenite::tungstenite::Message;
 use super::audio::{
     append_audio_input_args, append_audio_output_args, apply_audio_runtime_signal,
     build_audio_plan, build_audio_status, describe_audio_plan, detect_audio_engine,
-    set_audio_state,
-    NativeAudioPlan,
+    set_audio_state, NativeAudioPlan,
 };
 use super::capture::{start_native_source_captures, stop_native_source_captures};
+use super::ndi::{current_ndi_input_status, current_ndi_status};
 use super::output::{
     append_output_args, append_worker_output_args, apply_output_runtime_signal,
     build_archive_pattern, build_output_manager_plan, build_output_statuses,
-    set_output_state_by_worker_id, set_output_states, OutputManagerPlan, OutputWorkerKind,
-    OutputWorkerPlan, DEFAULT_ARCHIVE_SEGMENT_SECONDS,
+    set_output_recovery_delay_by_worker_id, set_output_state_by_worker_id, set_output_states,
+    OutputManagerPlan, OutputWorkerKind, OutputWorkerPlan, DEFAULT_ARCHIVE_SEGMENT_SECONDS,
 };
 use super::source::{
-    current_source_bridge_runtime, current_source_statuses, start_source_bridge,
-    stop_source_bridge,
+    current_source_bridge_runtime, current_source_statuses, start_source_bridge, stop_source_bridge,
 };
 use super::state::{
     EngineHealthState, FrameBridgeRuntime, GPUStreamConfig, NativeAudioDiscovery,
@@ -37,6 +36,7 @@ use super::video::{current_video_status, render_native_scene_rgba};
 
 const DEFAULT_MAX_RESTARTS: u32 = 48;
 const DEFAULT_OUTPUT_MAX_RESTARTS: u32 = 120;
+const WORKER_STDERR_CONTEXT_LINES: usize = 12;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[allow(dead_code)]
@@ -52,13 +52,74 @@ fn configure_background_command(command: &mut Command) -> &mut Command {
     command
 }
 
+#[cfg(target_os = "windows")]
+pub fn cleanup_stale_aether_ffmpeg_processes() {
+    let script = r#"
+Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.Name -eq 'ffmpeg.exe' -and
+    $_.CommandLine -match 'pipe:0' -and
+    $_.CommandLine -match 'rawvideo' -and
+    $_.CommandLine -match 'VB-Audio Virtual Cable'
+  } |
+  ForEach-Object {
+    try {
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+      Write-Output ('[aether] Cleaned stale FFmpeg worker PID ' + $_.ProcessId)
+    } catch {
+      Write-Output ('[aether] Failed to clean stale FFmpeg worker PID ' + $_.ProcessId + ': ' + $_.Exception.Message)
+    }
+  }
+"#;
+
+    let mut command = Command::new("powershell");
+    configure_background_command(&mut command)
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    match command.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                println!("{line}");
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stderr
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                println!("[aether] FFmpeg cleanup stderr: {line}");
+            }
+        }
+        Err(err) => {
+            println!("[aether] Failed to run stale FFmpeg cleanup: {err}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn cleanup_stale_aether_ffmpeg_processes() {}
+
 struct OutputWorkerSink {
     session_id: u64,
     kind: OutputWorkerKind,
     recovery_delay_ms: u64,
     spawned_at_ms: u64,
     child: Arc<Mutex<Child>>,
-    stdin: std::process::ChildStdin,
+    stdin: Arc<Mutex<std::process::ChildStdin>>,
 }
 
 fn output_worker_sinks() -> &'static Mutex<HashMap<String, OutputWorkerSink>> {
@@ -183,41 +244,85 @@ fn write_bytes_to_workers(bytes: &[u8]) -> Result<(), String> {
         state.desired_active
     };
 
-    let mut sinks = output_worker_sinks().lock().map_err(|e| e.to_string())?;
-    if sinks.is_empty() {
-        return if desired_active {
-            Err("STREAM_RESTARTING".into())
-        } else {
-            Err("STREAM_DEAD".into())
-        };
-    }
+    // Phase 1: collect stdin Arc handles without holding the main sinks lock.
+    // This is critical — the blocking write_all below would otherwise hold the
+    // sinks mutex for potentially hundreds of milliseconds, preventing the
+    // worker monitor thread from cleaning up dead workers.
+    type WriteTarget = (
+        String,
+        OutputWorkerKind,
+        u64,
+        Arc<Mutex<std::process::ChildStdin>>,
+    );
+    let targets: Vec<WriteTarget> = {
+        let sinks = output_worker_sinks().lock().map_err(|e| e.to_string())?;
+        if sinks.is_empty() {
+            return if desired_active {
+                Err("STREAM_RESTARTING".into())
+            } else {
+                Err("STREAM_DEAD".into())
+            };
+        }
+        sinks
+            .iter()
+            .map(|(id, sink)| {
+                (
+                    id.clone(),
+                    sink.kind.clone(),
+                    sink.recovery_delay_ms,
+                    Arc::clone(&sink.stdin),
+                )
+            })
+            .collect()
+    }; // sinks lock released — monitor thread can now clean up if FFmpeg dies
 
+    // Phase 2: write to each worker's stdin. Each write may block for the
+    // duration of the OS pipe flush. No main sinks lock held here.
     let mut succeeded = 0usize;
     let mut total_bytes_written = 0u64;
     let mut failures: Vec<(String, OutputWorkerKind, u64, String)> = Vec::new();
 
-    for (worker_id, sink) in sinks.iter_mut() {
-        match sink.stdin.write_all(bytes) {
+    for (worker_id, kind, recovery_delay_ms, stdin_arc) in &targets {
+        let mut stdin = match stdin_arc.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                failures.push((
+                    worker_id.clone(),
+                    kind.clone(),
+                    *recovery_delay_ms,
+                    "stdin lock poisoned".into(),
+                ));
+                continue;
+            }
+        };
+        match stdin.write_all(bytes) {
             Ok(()) => {
                 succeeded += 1;
                 total_bytes_written += bytes.len() as u64;
             }
             Err(err) => {
+                eprintln!(
+                    "[aether] write_all failed for worker {} ({:?}): {}",
+                    worker_id, kind, err
+                );
                 failures.push((
                     worker_id.clone(),
-                    sink.kind.clone(),
-                    sink.recovery_delay_ms,
+                    kind.clone(),
+                    *recovery_delay_ms,
                     err.to_string(),
                 ));
             }
         }
     }
 
-    for (worker_id, _, _, _) in &failures {
-        sinks.remove(worker_id);
+    // Phase 3: remove failed sinks (re-acquire lock briefly).
+    {
+        let mut sinks = output_worker_sinks().lock().map_err(|e| e.to_string())?;
+        for (worker_id, _, _, _) in &failures {
+            sinks.remove(worker_id);
+        }
     }
-    let remaining_workers = sinks.len();
-    drop(sinks);
+    let remaining_workers = output_worker_sinks().lock().map(|s| s.len()).unwrap_or(0);
 
     if succeeded > 0 {
         if let Ok(mut counter) = frame_counter().lock() {
@@ -243,9 +348,14 @@ fn write_bytes_to_workers(bytes: &[u8]) -> Result<(), String> {
             state.restarting = false;
         }
 
-        for (worker_id, kind, _, error) in &failures {
+        for (worker_id, kind, recovery_delay_ms, error) in &failures {
             match kind {
                 OutputWorkerKind::Destination => {
+                    set_output_recovery_delay_by_worker_id(
+                        &mut state.output_statuses,
+                        worker_id,
+                        *recovery_delay_ms,
+                    );
                     set_output_state_by_worker_id(
                         &mut state.output_statuses,
                         worker_id,
@@ -254,6 +364,7 @@ fn write_bytes_to_workers(bytes: &[u8]) -> Result<(), String> {
                     );
                 }
                 OutputWorkerKind::Archive => {
+                    state.archive_status.recovery_delay_ms = *recovery_delay_ms;
                     set_archive_state(
                         &mut state.archive_status,
                         EngineHealthState::Recovering,
@@ -266,6 +377,53 @@ fn write_bytes_to_workers(bytes: &[u8]) -> Result<(), String> {
 
     if succeeded > 0 {
         Ok(())
+    } else if desired_active {
+        Err("STREAM_RESTARTING".into())
+    } else {
+        Err("STREAM_DEAD".into())
+    }
+}
+
+fn write_bytes_to_shared_ffmpeg(bytes: &[u8]) -> Result<(), String> {
+    let desired_active = {
+        let state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        state.desired_active
+    };
+
+    let mut stdin_guard = ffmpeg_stdin().lock().map_err(|e| e.to_string())?;
+    if let Some(ref mut stdin) = *stdin_guard {
+        match stdin.write_all(bytes) {
+            Ok(()) => {
+                if let Ok(mut counter) = frame_counter().lock() {
+                    *counter += 1;
+                }
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.bytes_written += bytes.len() as u64;
+                    state.active = true;
+                    state.restarting = false;
+                }
+                Ok(())
+            }
+            Err(err) => {
+                println!(
+                    "[aether] FFmpeg stdin write failed: {} - clearing stream",
+                    err
+                );
+                *stdin_guard = None;
+                if let Ok(mut state) = stream_runtime().lock() {
+                    state.write_failures += 1;
+                    state.last_error = Some(format!("FFmpeg stdin write failed: {}", err));
+                    if desired_active {
+                        state.restarting = true;
+                    }
+                }
+                if desired_active {
+                    Err("STREAM_RESTARTING".into())
+                } else {
+                    Err("STREAM_DEAD".into())
+                }
+            }
+        }
     } else if desired_active {
         Err("STREAM_RESTARTING".into())
     } else {
@@ -323,7 +481,16 @@ fn handle_frame_bytes(bytes: Vec<u8>) -> Result<(), String> {
         state.last_frame = Some(bytes.clone());
     }
 
-    return write_bytes_to_workers(&bytes);
+    let has_worker_sinks = output_worker_sinks()
+        .lock()
+        .map(|sinks| !sinks.is_empty())
+        .unwrap_or(false);
+
+    if has_worker_sinks {
+        return write_bytes_to_workers(&bytes);
+    }
+
+    return write_bytes_to_shared_ffmpeg(&bytes);
     /*
         if let Some(ref mut stdin) = *guard {
             match stdin.write_all(&bytes) {
@@ -568,18 +735,48 @@ fn detect_gpu_encoder(ffmpeg_bin: &str) -> String {
 }
 
 fn probe_encoder(ffmpeg_bin: &str, encoder: &str) -> bool {
+    // First check if the encoder appears in the list (fast path)
+    let list_ok = {
+        let mut command = Command::new(ffmpeg_bin);
+        configure_background_command(&mut command)
+            .args(["-hide_banner", "-encoders"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains(encoder)
+            })
+            .unwrap_or(false)
+    };
+
+    if !list_ok {
+        return false;
+    }
+
+    // Actually try to encode 1 frame — catches nvcuda.dll / driver failures
     let mut command = Command::new(ffmpeg_bin);
     configure_background_command(&mut command)
-        .args(["-hide_banner", "-encoders"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-
-    command
-        .output()
-        .map(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            stdout.contains(encoder)
-        })
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=320x240:r=1",
+            "-frames:v",
+            "1",
+            "-c:v",
+            encoder,
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
         .unwrap_or(false)
 }
 
@@ -599,6 +796,78 @@ fn supports_lavfi(ffmpeg_bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_twitch_ingest_target(target: &str) -> bool {
+    let lowered = target.to_ascii_lowercase();
+    lowered.contains("live.twitch.tv")
+        || lowered.contains("ingest.global-contribute.live-video.net")
+        || lowered.contains(".contribute.live-video.net")
+        || lowered.contains(".contribute.video.net")
+}
+
+fn output_plan_targets_twitch(output_plan: &OutputManagerPlan) -> bool {
+    output_plan
+        .outputs
+        .iter()
+        .any(|output| output.protocol == "rtmp" && is_twitch_ingest_target(&output.ffmpeg_target))
+}
+
+fn append_h264_amf_args(
+    args: &mut Vec<String>,
+    config: &GPUStreamConfig,
+    bitrate_kbps: u32,
+    targets_twitch: bool,
+) {
+    args.extend(["-rc".into(), "cbr".into()]);
+
+    if targets_twitch {
+        // AMD exposes the compliance knobs below in FFmpeg. For Twitch ingest,
+        // favor a stricter broadcast-style stream over the bare low-latency
+        // profile so the FLV/RTMP output is easier for ingest to classify.
+        args.extend([
+            "-usage".into(),
+            "transcoding".into(),
+            "-quality".into(),
+            "speed".into(),
+            "-enforce_hrd".into(),
+            "true".into(),
+            "-filler_data".into(),
+            "true".into(),
+            "-aud".into(),
+            "true".into(),
+            "-forced_idr".into(),
+            "true".into(),
+            "-level".into(),
+            "4.1".into(),
+        ]);
+    } else {
+        args.extend([
+            "-usage".into(),
+            "lowlatency".into(),
+            "-quality".into(),
+            "speed".into(),
+        ]);
+    }
+
+    args.extend([
+        "-b:v".into(),
+        format!("{}k", bitrate_kbps),
+        "-maxrate".into(),
+        format!("{}k", bitrate_kbps),
+        "-bufsize".into(),
+        format!("{}k", bitrate_kbps * 2),
+        "-profile:v".into(),
+        "high".into(),
+        "-bf".into(),
+        "0".into(),
+        "-g".into(),
+        (config.fps * 2).to_string(),
+        "-keyint_min".into(),
+        (config.fps * 2).to_string(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+    ]);
+}
+
 #[allow(dead_code)]
 fn build_ffmpeg_args(
     config: &GPUStreamConfig,
@@ -608,6 +877,18 @@ fn build_ffmpeg_args(
     audio_plan: &NativeAudioPlan,
 ) -> Vec<String> {
     let is_jpeg_mode = config.mode == "jpeg";
+    let targets_twitch = output_plan_targets_twitch(output_plan);
+    let effective_is_gpu = is_gpu;
+    let effective_encoder = if effective_is_gpu {
+        encoder.to_string()
+    } else {
+        "libx264".to_string()
+    };
+    let effective_bitrate = if targets_twitch {
+        config.bitrate.min(4_500)
+    } else {
+        config.bitrate
+    };
     let mut args: Vec<String> = Vec::new();
 
     args.extend([
@@ -654,9 +935,9 @@ fn build_ffmpeg_args(
     append_audio_input_args(&mut args, audio_plan);
     append_audio_output_args(&mut args, audio_plan);
 
-    if is_gpu {
-        args.extend(["-c:v".into(), encoder.to_string()]);
-        match encoder {
+    if effective_is_gpu {
+        args.extend(["-c:v".into(), effective_encoder.clone()]);
+        match effective_encoder.as_str() {
             "h264_nvenc" => {
                 args.extend([
                     "-preset".into(),
@@ -666,11 +947,11 @@ fn build_ffmpeg_args(
                     "-rc".into(),
                     "cbr".into(),
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-maxrate".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-bufsize".into(),
-                    format!("{}k", config.bitrate * 2),
+                    format!("{}k", effective_bitrate * 2),
                     "-profile:v".into(),
                     "high".into(),
                     "-g".into(),
@@ -688,11 +969,11 @@ fn build_ffmpeg_args(
                     "-preset".into(),
                     "fast".into(),
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-maxrate".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-bufsize".into(),
-                    format!("{}k", config.bitrate * 2),
+                    format!("{}k", effective_bitrate * 2),
                     "-profile:v".into(),
                     "high".into(),
                     "-g".into(),
@@ -706,41 +987,18 @@ fn build_ffmpeg_args(
                 ]);
             }
             "h264_amf" => {
-                args.extend([
-                    "-usage".into(),
-                    "ultralowlatency".into(),
-                    "-rc".into(),
-                    "cbr".into(),
-                    "-b:v".into(),
-                    format!("{}k", config.bitrate),
-                    "-maxrate".into(),
-                    format!("{}k", config.bitrate),
-                    "-bufsize".into(),
-                    format!("{}k", config.bitrate * 2),
-                    "-profile:v".into(),
-                    "high".into(),
-                    "-g".into(),
-                    (config.fps * 2).to_string(),
-                    "-keyint_min".into(),
-                    (config.fps * 2).to_string(),
-                    "-sc_threshold".into(),
-                    "0".into(),
-                    "-pix_fmt".into(),
-                    "yuv420p".into(),
-                ]);
+                append_h264_amf_args(&mut args, config, effective_bitrate, targets_twitch);
             }
             "h264_videotoolbox" => {
                 args.extend([
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-profile:v".into(),
                     "high".into(),
                     "-g".into(),
                     (config.fps * 2).to_string(),
                     "-keyint_min".into(),
                     (config.fps * 2).to_string(),
-                    "-sc_threshold".into(),
-                    "0".into(),
                     "-pix_fmt".into(),
                     "yuv420p".into(),
                 ]);
@@ -750,7 +1008,7 @@ fn build_ffmpeg_args(
                     "-pix_fmt".into(),
                     "yuv420p".into(),
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                 ]);
             }
         }
@@ -759,15 +1017,19 @@ fn build_ffmpeg_args(
             "-c:v".into(),
             "libx264".into(),
             "-preset".into(),
-            "veryfast".into(),
+            if targets_twitch {
+                "ultrafast".into()
+            } else {
+                "veryfast".into()
+            },
             "-tune".into(),
             "zerolatency".into(),
             "-b:v".into(),
-            format!("{}k", config.bitrate),
+            format!("{}k", effective_bitrate),
             "-maxrate".into(),
-            format!("{}k", config.bitrate),
+            format!("{}k", effective_bitrate),
             "-bufsize".into(),
-            format!("{}k", config.bitrate * 2),
+            format!("{}k", effective_bitrate * 2),
             "-pix_fmt".into(),
             "yuv420p".into(),
             "-profile:v".into(),
@@ -781,14 +1043,21 @@ fn build_ffmpeg_args(
         ]);
     }
 
-    args.extend([
-        "-max_interleave_delta".into(),
-        "0".into(),
-        "-flags".into(),
-        "+global_header".into(),
-        "-flvflags".into(),
-        "no_duration_filesize".into(),
-    ]);
+    args.extend(["-max_interleave_delta".into(), "0".into()]);
+
+    // Do not force +global_header on the shared native path. With h264_amf
+    // going into Twitch FLV ingest, that can produce a connection that looks
+    // healthy locally but never shows as live on Twitch.
+    // Keep FFmpeg stats enabled so the terminal shows frame/fps/speed lines.
+    args.extend(["-stats".into(), "-stats_period".into(), "5".into()]);
+
+    let has_flv_output = output_plan
+        .outputs
+        .iter()
+        .any(|output| output.muxer == "flv");
+    if has_flv_output {
+        args.extend(["-flvflags".into(), "no_duration_filesize".into()]);
+    }
 
     append_output_args(&mut args, output_plan);
 
@@ -806,6 +1075,64 @@ struct WorkerLaunchContext {
     worker: OutputWorkerPlan,
 }
 
+fn mark_worker_runtime_state(
+    state: &mut NativeStreamRuntime,
+    worker: &OutputWorkerPlan,
+    next: EngineHealthState,
+    message: Option<String>,
+) {
+    match worker.kind {
+        OutputWorkerKind::Destination => {
+            set_output_recovery_delay_by_worker_id(
+                &mut state.output_statuses,
+                &worker.worker_id,
+                worker.recovery_delay_ms,
+            );
+            set_output_state_by_worker_id(
+                &mut state.output_statuses,
+                &worker.worker_id,
+                next,
+                message,
+            );
+        }
+        OutputWorkerKind::Archive => {
+            state.archive_status.recovery_delay_ms = worker.recovery_delay_ms;
+            set_archive_state(&mut state.archive_status, next, message);
+        }
+    }
+}
+
+fn apply_worker_start_failure(context: &WorkerLaunchContext, error: String) {
+    if let Ok(mut state) = stream_runtime().lock() {
+        state.active = output_worker_sinks()
+            .lock()
+            .map(|sinks| !sinks.is_empty())
+            .unwrap_or(false);
+        state.restarting = false;
+        state.last_error = Some(error.clone());
+        state.last_exit_status = Some(format!("{}: startup failure", context.worker.worker_id));
+        set_audio_state(
+            &mut state.audio_status,
+            EngineHealthState::Error,
+            Some(error.clone()),
+            Some(format!(
+                "Output worker {} failed to start",
+                context.worker.worker_id
+            )),
+        );
+        mark_worker_runtime_state(
+            &mut state,
+            &context.worker,
+            EngineHealthState::Error,
+            Some(error),
+        );
+    }
+}
+
+fn worker_prefers_software_encoder(worker: &OutputWorkerPlan) -> bool {
+    matches!(worker.kind, OutputWorkerKind::Archive)
+}
+
 fn build_worker_ffmpeg_args(
     config: &GPUStreamConfig,
     worker: &OutputWorkerPlan,
@@ -814,13 +1141,31 @@ fn build_worker_ffmpeg_args(
     audio_plan: &NativeAudioPlan,
 ) -> Vec<String> {
     let is_jpeg_mode = config.mode == "jpeg";
+    let targets_twitch =
+        worker.protocol == "rtmp" && is_twitch_ingest_target(&worker.ffmpeg_target);
+    // Keep archive on software for predictable segmented files, but let live
+    // RTMP use the detected GPU encoder. Running Twitch and archive as two
+    // software encodes was enough to drag 30fps output down to ~20fps.
+    let effective_is_gpu = is_gpu && !worker_prefers_software_encoder(worker);
+    let effective_encoder = if effective_is_gpu {
+        encoder.to_string()
+    } else {
+        "libx264".to_string()
+    };
+    let effective_bitrate = if targets_twitch {
+        config.bitrate.min(4_500)
+    } else if matches!(worker.kind, OutputWorkerKind::Archive) {
+        config.bitrate.min(4_000)
+    } else {
+        config.bitrate
+    };
     let mut args: Vec<String> = Vec::new();
 
     args.extend([
         "-y".into(),
         "-hide_banner".into(),
         "-loglevel".into(),
-        "warning".into(),
+        "info".into(),
     ]);
 
     if is_jpeg_mode {
@@ -860,9 +1205,9 @@ fn build_worker_ffmpeg_args(
     append_audio_input_args(&mut args, audio_plan);
     append_audio_output_args(&mut args, audio_plan);
 
-    if is_gpu {
-        args.extend(["-c:v".into(), encoder.to_string()]);
-        match encoder {
+    if effective_is_gpu {
+        args.extend(["-c:v".into(), effective_encoder.clone()]);
+        match effective_encoder.as_str() {
             "h264_nvenc" => {
                 args.extend([
                     "-preset".into(),
@@ -872,11 +1217,11 @@ fn build_worker_ffmpeg_args(
                     "-rc".into(),
                     "cbr".into(),
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-maxrate".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-bufsize".into(),
-                    format!("{}k", config.bitrate * 2),
+                    format!("{}k", effective_bitrate * 2),
                     "-profile:v".into(),
                     "high".into(),
                     "-g".into(),
@@ -894,11 +1239,11 @@ fn build_worker_ffmpeg_args(
                     "-preset".into(),
                     "fast".into(),
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-maxrate".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-bufsize".into(),
-                    format!("{}k", config.bitrate * 2),
+                    format!("{}k", effective_bitrate * 2),
                     "-profile:v".into(),
                     "high".into(),
                     "-g".into(),
@@ -912,41 +1257,18 @@ fn build_worker_ffmpeg_args(
                 ]);
             }
             "h264_amf" => {
-                args.extend([
-                    "-usage".into(),
-                    "ultralowlatency".into(),
-                    "-rc".into(),
-                    "cbr".into(),
-                    "-b:v".into(),
-                    format!("{}k", config.bitrate),
-                    "-maxrate".into(),
-                    format!("{}k", config.bitrate),
-                    "-bufsize".into(),
-                    format!("{}k", config.bitrate * 2),
-                    "-profile:v".into(),
-                    "high".into(),
-                    "-g".into(),
-                    (config.fps * 2).to_string(),
-                    "-keyint_min".into(),
-                    (config.fps * 2).to_string(),
-                    "-sc_threshold".into(),
-                    "0".into(),
-                    "-pix_fmt".into(),
-                    "yuv420p".into(),
-                ]);
+                append_h264_amf_args(&mut args, config, effective_bitrate, targets_twitch);
             }
             "h264_videotoolbox" => {
                 args.extend([
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                     "-profile:v".into(),
                     "high".into(),
                     "-g".into(),
                     (config.fps * 2).to_string(),
                     "-keyint_min".into(),
                     (config.fps * 2).to_string(),
-                    "-sc_threshold".into(),
-                    "0".into(),
                     "-pix_fmt".into(),
                     "yuv420p".into(),
                 ]);
@@ -956,7 +1278,7 @@ fn build_worker_ffmpeg_args(
                     "-pix_fmt".into(),
                     "yuv420p".into(),
                     "-b:v".into(),
-                    format!("{}k", config.bitrate),
+                    format!("{}k", effective_bitrate),
                 ]);
             }
         }
@@ -965,15 +1287,21 @@ fn build_worker_ffmpeg_args(
             "-c:v".into(),
             "libx264".into(),
             "-preset".into(),
-            "veryfast".into(),
+            if worker.protocol == "rtmp" {
+                "ultrafast".into()
+            } else if matches!(worker.kind, OutputWorkerKind::Archive) {
+                "superfast".into()
+            } else {
+                "veryfast".into()
+            },
             "-tune".into(),
             "zerolatency".into(),
             "-b:v".into(),
-            format!("{}k", config.bitrate),
+            format!("{}k", effective_bitrate),
             "-maxrate".into(),
-            format!("{}k", config.bitrate),
+            format!("{}k", effective_bitrate),
             "-bufsize".into(),
-            format!("{}k", config.bitrate * 2),
+            format!("{}k", effective_bitrate * 2),
             "-pix_fmt".into(),
             "yuv420p".into(),
             "-profile:v".into(),
@@ -987,14 +1315,20 @@ fn build_worker_ffmpeg_args(
         ]);
     }
 
-    args.extend([
-        "-max_interleave_delta".into(),
-        "0".into(),
-        "-flags".into(),
-        "+global_header".into(),
-        "-flvflags".into(),
-        "no_duration_filesize".into(),
-    ]);
+    args.extend(["-max_interleave_delta".into(), "0".into()]);
+
+    // -flvflags is FLV-specific; do NOT apply to other muxers (e.g. segment/matroska).
+    // NOTE: -flags +global_header is intentionally omitted for RTMP/FLV. With h264_amf
+    // it causes malformed SPS/PPS in the FLV bitstream — Twitch's ingest accepts the
+    // TCP connection but never registers the stream as live. The FLV muxer reads codec
+    // extradata automatically without needing +global_header.
+    if worker.muxer == "flv" {
+        args.extend(["-flvflags".into(), "no_duration_filesize".into()]);
+    }
+
+    // Force stats output even when stderr is a pipe (not a TTY), so we can see
+    // "frame=X fps=Y" progress lines in the terminal for debugging.
+    args.extend(["-stats".into(), "-stats_period".into(), "5".into()]);
 
     append_worker_output_args(&mut args, worker);
     args
@@ -1060,20 +1394,54 @@ fn spawn_output_worker(context: WorkerLaunchContext) -> Result<(), String> {
 
     configure_background_command(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn worker {}: {}", context.worker.worker_id, e))?;
-    let stdin_handle = child.stdin.take().ok_or_else(|| {
-        format!(
-            "Failed to capture worker stdin: {}",
-            context.worker.worker_id
-        )
-    })?;
+    {
+        let mut state = stream_runtime().lock().map_err(|e| e.to_string())?;
+        mark_worker_runtime_state(
+            &mut state,
+            &context.worker,
+            EngineHealthState::Starting,
+            Some(format!("Starting worker {}", context.worker.worker_id)),
+        );
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let error = format!("Failed to spawn worker {}: {}", context.worker.worker_id, e);
+            apply_worker_start_failure(&context, error.clone());
+            return Err(error);
+        }
+    };
+    let stdin_handle = match child.stdin.take() {
+        Some(handle) => handle,
+        None => {
+            let error = format!(
+                "Failed to capture worker stdin: {}",
+                context.worker.worker_id
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            apply_worker_start_failure(&context, error.clone());
+            return Err(error);
+        }
+    };
     let stderr_handle = child.stderr.take();
     let child_handle = Arc::new(Mutex::new(child));
 
     {
         let mut sinks = output_worker_sinks().lock().map_err(|e| e.to_string())?;
+        if sinks.contains_key(&context.worker.worker_id) {
+            if let Ok(mut child) = child_handle.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let error = format!(
+                "Refusing to register duplicate output worker id: {}",
+                context.worker.worker_id
+            );
+            apply_worker_start_failure(&context, error.clone());
+            return Err(error);
+        }
         sinks.insert(
             context.worker.worker_id.clone(),
             OutputWorkerSink {
@@ -1082,7 +1450,7 @@ fn spawn_output_worker(context: WorkerLaunchContext) -> Result<(), String> {
                 recovery_delay_ms: context.worker.recovery_delay_ms,
                 spawned_at_ms: now_ms(),
                 child: child_handle.clone(),
-                stdin: stdin_handle,
+                stdin: Arc::new(Mutex::new(stdin_handle)),
             },
         );
     }
@@ -1100,19 +1468,15 @@ fn spawn_output_worker(context: WorkerLaunchContext) -> Result<(), String> {
             None,
             Some(format!("Worker {} active", context.worker.worker_id)),
         );
-        match context.worker.kind {
-            OutputWorkerKind::Destination => {
-                set_output_state_by_worker_id(
-                    &mut state.output_statuses,
-                    &context.worker.worker_id,
-                    EngineHealthState::Active,
-                    None,
-                );
-            }
-            OutputWorkerKind::Archive => {
-                set_archive_state(&mut state.archive_status, EngineHealthState::Active, None);
-            }
-        }
+        mark_worker_runtime_state(
+            &mut state,
+            &context.worker,
+            EngineHealthState::Starting,
+            Some(format!(
+                "Worker {} process started; waiting for encoder progress",
+                context.worker.worker_id
+            )),
+        );
     }
 
     spawn_output_worker_monitor(context, child_handle, stderr_handle);
@@ -1128,6 +1492,8 @@ fn spawn_output_worker_monitor(
         use std::io::{BufRead, BufReader};
 
         let mut last_error_line: Option<String> = None;
+        let mut last_seen_line: Option<String> = None;
+        let mut stderr_context: Vec<String> = Vec::new();
 
         if let Some(stderr) = stderr {
             let reader = BufReader::new(stderr);
@@ -1137,6 +1503,11 @@ fn spawn_output_worker_monitor(
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
                             continue;
+                        }
+                        last_seen_line = Some(trimmed.to_string());
+                        stderr_context.push(trimmed.to_string());
+                        if stderr_context.len() > WORKER_STDERR_CONTEXT_LINES {
+                            stderr_context.remove(0);
                         }
                         println!("[ffmpeg:{}] {}", context.worker.worker_id, trimmed);
                         if let Ok(mut state) = stream_runtime().lock() {
@@ -1161,7 +1532,9 @@ fn spawn_output_worker_monitor(
                             || lowered.contains("invalid")
                             || lowered.contains("timed out")
                         {
-                            last_error_line = Some(trimmed.to_string());
+                            let context_text = stderr_context.join(" | ");
+                            last_error_line =
+                                Some(format!("{trimmed} | recent stderr: {context_text}"));
                         }
                     }
                     Err(_) => break,
@@ -1179,6 +1552,18 @@ fn spawn_output_worker_monitor(
                 Err(err) => format!("wait failed: {err}"),
             }
         };
+        if last_error_line.is_none() && !status_text.contains("exit code: 0") {
+            last_error_line = Some(format!(
+                "Worker {} exited with {}; last stderr: {}",
+                context.worker.worker_id,
+                status_text,
+                last_seen_line.unwrap_or_else(|| "no stderr captured".into())
+            ));
+        }
+        eprintln!(
+            "[aether] Worker {} exited: {} | last_error: {:?}",
+            context.worker.worker_id, status_text, last_error_line
+        );
 
         let worker_started_at_ms = {
             let mut started_at_ms = 0;
@@ -1246,8 +1631,10 @@ fn spawn_output_worker_monitor(
                 state.restart_count += 1;
                 state.restarting = true;
                 state.last_restart_at_ms = exit_at_ms;
-                restart_delay_ms =
-                    worker_recovery_delay_ms(context.worker.recovery_delay_ms, worker_restart_count);
+                restart_delay_ms = worker_recovery_delay_ms(
+                    context.worker.recovery_delay_ms,
+                    worker_restart_count,
+                );
                 state.last_restart_delay_ms = restart_delay_ms;
                 should_restart = true;
                 let last_error = state.last_error.clone();
@@ -1262,6 +1649,11 @@ fn spawn_output_worker_monitor(
                 );
                 match context.worker.kind {
                     OutputWorkerKind::Destination => {
+                        set_output_recovery_delay_by_worker_id(
+                            &mut state.output_statuses,
+                            &context.worker.worker_id,
+                            restart_delay_ms,
+                        );
                         set_output_state_by_worker_id(
                             &mut state.output_statuses,
                             &context.worker.worker_id,
@@ -1270,6 +1662,7 @@ fn spawn_output_worker_monitor(
                         );
                     }
                     OutputWorkerKind::Archive => {
+                        state.archive_status.recovery_delay_ms = restart_delay_ms;
                         set_archive_state(
                             &mut state.archive_status,
                             EngineHealthState::Recovering,
@@ -1298,6 +1691,11 @@ fn spawn_output_worker_monitor(
                 );
                 match context.worker.kind {
                     OutputWorkerKind::Destination => {
+                        set_output_recovery_delay_by_worker_id(
+                            &mut state.output_statuses,
+                            &context.worker.worker_id,
+                            context.worker.recovery_delay_ms,
+                        );
                         set_output_state_by_worker_id(
                             &mut state.output_statuses,
                             &context.worker.worker_id,
@@ -1310,6 +1708,7 @@ fn spawn_output_worker_monitor(
                         );
                     }
                     OutputWorkerKind::Archive => {
+                        state.archive_status.recovery_delay_ms = context.worker.recovery_delay_ms;
                         set_archive_state(
                             &mut state.archive_status,
                             if desired_active {
@@ -1334,7 +1733,14 @@ fn spawn_output_worker_monitor(
 fn spawn_output_workers_from_runtime() -> Result<(), String> {
     let contexts = worker_launch_contexts_from_runtime()?;
     for context in contexts {
-        spawn_output_worker(context)?;
+        if let Err(err) = spawn_output_worker(context) {
+            stop_output_workers();
+            if let Ok(mut state) = stream_runtime().lock() {
+                state.active = false;
+                state.restarting = false;
+            }
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -1361,9 +1767,37 @@ fn stop_output_workers() {
     }
 }
 
+fn stop_shared_ffmpeg() {
+    if let Ok(mut stdin_guard) = ffmpeg_stdin().lock() {
+        *stdin_guard = None;
+    }
+
+    let child = {
+        let mut process_guard = match ffmpeg_process().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        process_guard.take()
+    };
+
+    if let Some(mut child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 fn start_keepalive_loop(session_id: u64) {
     std::thread::spawn(move || loop {
-        let (should_run, current_session_id, mode, width, height, fps, last_frame, last_frame_at_ms) = {
+        let (
+            should_run,
+            current_session_id,
+            mode,
+            width,
+            height,
+            fps,
+            last_frame,
+            last_frame_at_ms,
+        ) = {
             let state = match stream_runtime().lock() {
                 Ok(guard) => guard,
                 Err(_) => return,
@@ -1389,9 +1823,13 @@ fn start_keepalive_loop(session_id: u64) {
         }
 
         let frame_interval_ms = u64::from(1000 / fps.max(1));
+        // Fill smaller frame gaps sooner so viewers see a steadier cadence instead
+        // of waiting for a full 2-frame stall before the watchdog duplicates.
+        let duplicate_threshold_ms =
+            frame_interval_ms.saturating_add((frame_interval_ms / 4).max(4));
         let now = now_ms();
         let frame_age_ms = now.saturating_sub(last_frame_at_ms);
-        let should_duplicate = last_frame.is_some() && frame_age_ms >= frame_interval_ms.saturating_mul(2);
+        let should_duplicate = last_frame.is_some() && frame_age_ms >= duplicate_threshold_ms;
         let should_render_natively =
             mode == "native-scene" && frame_age_ms >= frame_interval_ms.saturating_mul(4);
 
@@ -1715,16 +2153,26 @@ fn spawn_ffmpeg_monitor(child_pid: u32, stderr: Option<ChildStderr>) {
 #[tauri::command]
 pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
     {
-        let guard = stream_runtime().lock().map_err(|e| e.to_string())?;
-        if guard.desired_active {
+        let mut guard = stream_runtime().lock().map_err(|e| e.to_string())?;
+        let worker_count = output_worker_sinks()
+            .lock()
+            .map(|sinks| sinks.len())
+            .unwrap_or(0);
+        if guard.desired_active && (guard.active || guard.restarting || worker_count > 0) {
             return Err("Stream already running. Stop it first.".into());
+        }
+        if guard.desired_active {
+            guard.desired_active = false;
+            guard.active = false;
+            guard.restarting = false;
+            guard.last_error = None;
         }
     }
 
     let ffmpeg_bin = find_ffmpeg();
 
     // Auto-detect or use specified encoder
-    let encoder = if config.encoder.is_empty() || config.encoder == "auto" {
+    let requested_encoder = if config.encoder.is_empty() || config.encoder == "auto" {
         detect_gpu_encoder(&ffmpeg_bin)
     } else if config.encoder == "software" {
         "libx264".to_string()
@@ -1732,19 +2180,29 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         config.encoder.clone()
     };
 
+    let session_id = now_ms();
+    let archive_path_pattern = Some(build_archive_pattern(session_id)?);
+    let output_plan = build_output_manager_plan(&config, archive_path_pattern.as_deref())?;
+    let encoder = requested_encoder;
     let is_gpu = encoder != "libx264";
     let lavfi_enabled = supports_lavfi(&ffmpeg_bin);
-    let session_id = now_ms();
-    let archive_path_pattern = build_archive_pattern(session_id)?;
-    let output_plan = build_output_manager_plan(&config, Some(&archive_path_pattern))?;
     let audio_plan = build_audio_plan(&ffmpeg_bin, &config, lavfi_enabled);
-    let output_statuses = build_output_statuses(&output_plan);
+    let output_statuses = build_output_statuses(&output_plan, &config);
     let archive_status = build_archive_status(
         output_plan
             .archive_path_pattern()
             .map(|path| path.to_string()),
         output_plan.archive_segment_seconds(),
-        EngineHealthState::Starting,
+        output_plan
+            .archive
+            .as_ref()
+            .map(|archive| archive.recovery_delay_ms)
+            .unwrap_or(0),
+        if output_plan.archive_path_pattern().is_some() {
+            EngineHealthState::Starting
+        } else {
+            EngineHealthState::Stopped
+        },
     );
     let audio_status = build_audio_status(&audio_plan, EngineHealthState::Starting);
 
@@ -1785,6 +2243,9 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         state.archive_status = archive_status;
     }
 
+    stop_shared_ffmpeg();
+    stop_output_workers();
+
     if let Err(err) = start_native_source_captures(&ffmpeg_bin, &config, session_id) {
         if let Ok(mut state) = stream_runtime().lock() {
             state.last_error = Some(err.clone());
@@ -1792,9 +2253,10 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         return Err(err);
     }
 
-    start_keepalive_loop(session_id);
     if let Err(err) = spawn_output_workers_from_runtime() {
         stop_native_source_captures();
+        stop_output_workers();
+        stop_shared_ffmpeg();
         if let Ok(mut state) = stream_runtime().lock() {
             state.desired_active = false;
             state.active = false;
@@ -1804,7 +2266,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
                 &mut state.audio_status,
                 EngineHealthState::Error,
                 Some(err.clone()),
-                Some("Native audio worker failed to start".into()),
+                Some("Native output workers failed to start".into()),
             );
             set_output_states(
                 &mut state.output_statuses,
@@ -1819,6 +2281,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         }
         return Err(err);
     }
+    start_keepalive_loop(session_id);
 
     let bridge_url = if config.mode == "native-scene" {
         None
@@ -1873,7 +2336,7 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         _ => "raw-rgba",
     };
     let message = format!(
-        "Streaming via {} [native workers] video: {} audio: {} at {}x{} @{}fps to {} destination worker(s); archive: {}",
+        "Streaming via {} [native output workers] video: {} audio: {} at {}x{} @{}fps to {} destination(s); archive: {}",
         encoder_label,
         video_label,
         audio_label,
@@ -1883,7 +2346,8 @@ pub async fn start_stream(config: GPUStreamConfig) -> Result<String, String> {
         output_plan.destination_count(),
         output_plan
             .archive_path_pattern()
-            .unwrap_or(archive_path_pattern.as_str())
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| "disabled by operator".into())
     );
 
     let response = StartStreamResponse {
@@ -1928,6 +2392,7 @@ pub async fn stop_stream() -> Result<String, String> {
     stop_frame_bridge();
     stop_source_bridge();
     stop_native_source_captures();
+    stop_shared_ffmpeg();
     stop_output_workers();
 
     let frames = frame_counter().lock().map(|c| *c).unwrap_or(0);
@@ -1975,21 +2440,36 @@ pub async fn encode_frame(frame_data: Vec<u8>, width: u32, height: u32) -> Resul
 /// Render the current native scene snapshot into a raw RGBA frame and write it to worker stdin.
 #[tauri::command]
 pub async fn render_native_scene_frame() -> Result<(), String> {
-    let (mode, width, height) = current_frame_spec()
-        .ok_or_else(|| "NATIVE_SCENE_NOT_ACTIVE".to_string())?;
+    let (mode, width, height) =
+        current_frame_spec().ok_or_else(|| "NATIVE_SCENE_NOT_ACTIVE".to_string())?;
     if mode != "native-scene" {
-        return Err(format!("NATIVE_SCENE_MODE_REQUIRED: current mode is {}", mode));
+        return Err(format!(
+            "NATIVE_SCENE_MODE_REQUIRED: current mode is {}",
+            mode
+        ));
     }
 
-    let frame = render_native_scene_rgba(width, height)?;
-    {
-        if let Ok(mut rb) = replay_buffer().lock() {
-            rb.width = width;
-            rb.height = height;
-        }
+    // Phase 1: Render the scene on a blocking thread (CPU-intensive compositor).
+    // We await this so the JS frame loop knows when the GPU work is done and can
+    // schedule the next frame at the right time (~1-2 ms per frame with h264_amf).
+    let frame = tokio::task::spawn_blocking(move || render_native_scene_rgba(width, height))
+        .await
+        .map_err(|e| e.to_string())??;
+
+    // Update replay buffer dimensions immediately (fast, non-blocking).
+    if let Ok(mut rb) = replay_buffer().lock() {
+        rb.width = width;
+        rb.height = height;
     }
 
-    handle_frame_bytes(frame)
+    // Phase 2: write to the workers on a blocking thread and await completion.
+    // This preserves bounded backpressure: the JS frame loop will only queue the
+    // next native-scene frame after this dispatch finishes, which is far safer
+    // than piling up hundreds of 720p/1080p RGBA frames in memory when an output
+    // worker falls behind real-time.
+    tokio::task::spawn_blocking(move || handle_frame_bytes(frame))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Get streaming stats
@@ -2027,6 +2507,7 @@ pub async fn get_stream_stats() -> Result<String, String> {
         restarting: state.restarting,
         restart_count: state.restart_count,
         max_restarts: state.max_restarts,
+        session_id: state.session_id,
         encoder: state.encoder,
         is_gpu: state.is_gpu,
         width,
@@ -2047,6 +2528,7 @@ pub async fn get_stream_stats() -> Result<String, String> {
         last_error: state.last_error,
         last_exit_status: state.last_exit_status,
         ffmpeg_path: state.ffmpeg_path,
+        started_at_ms: state.started_at_ms,
         last_frame_age_ms,
         uptime_ms,
         lavfi_enabled: state.lavfi_enabled,
@@ -2079,6 +2561,8 @@ pub async fn get_stream_stats() -> Result<String, String> {
         audio_status: state.audio_status,
         output_statuses: state.output_statuses,
         archive_status: state.archive_status,
+        ndi_status: current_ndi_status(),
+        ndi_input_status: current_ndi_input_status(),
     })
     .map_err(|e| e.to_string())?);
 }
@@ -2100,7 +2584,8 @@ pub async fn detect_encoder() -> Result<String, String> {
 #[tauri::command]
 pub async fn list_audio_devices() -> Result<String, String> {
     let ffmpeg_bin = find_ffmpeg();
-    let discovery: NativeAudioDiscovery = detect_audio_engine(&ffmpeg_bin, supports_lavfi(&ffmpeg_bin));
+    let discovery: NativeAudioDiscovery =
+        detect_audio_engine(&ffmpeg_bin, supports_lavfi(&ffmpeg_bin));
     serde_json::to_string(&discovery).map_err(|e| e.to_string())
 }
 

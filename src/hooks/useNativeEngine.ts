@@ -2,6 +2,12 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { StreamDestination, ServerLog, EncodingProfile, Telemetry } from '../types';
 import type { NativeSceneSnapshot, NativeSourceDescriptor } from '../lib/sceneSchema';
+import {
+  parseOutputProgressLine,
+  resolveNativeCaptureProfile,
+  shouldPreferNativeSourceFrame,
+  type NativeCaptureProfile,
+} from '../lib/nativeStreaming';
 
 type TauriInvoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
 
@@ -50,15 +56,82 @@ interface NativeOutputStatus {
   state: NativeHealthState;
   last_error?: string | null;
   last_update_ms: number;
+  target_width?: number | null;
+  target_height?: number | null;
+  target_fps?: number | null;
+  target_bitrate_kbps?: number | null;
+  measured_fps?: number | null;
+  measured_bitrate_kbps?: number | null;
+  encoder_speed?: number | null;
+  first_progress_ms?: number | null;
+  last_progress_ms?: number | null;
 }
 
 interface NativeArchiveStatus {
   state: NativeHealthState;
   path_pattern?: string | null;
   segment_seconds: number;
+  recovery_delay_ms: number;
   restart_count: number;
+  last_event?: string | null;
   last_error?: string | null;
   last_update_ms: number;
+}
+
+interface NativeNdiSourceStatus {
+  key: string;
+  name: string;
+  state: NativeHealthState;
+  frames_sent: number;
+  dropped_frames: number;
+  last_frame_ms: number;
+  last_frame_age_ms: number;
+  last_error?: string | null;
+}
+
+export interface NativeNdiStatus {
+  state: NativeHealthState;
+  health: {
+    ok: boolean;
+    error?: string | null;
+    mock?: boolean;
+  };
+  active: boolean;
+  desired_active: boolean;
+  width: number;
+  height: number;
+  fps: number;
+  alpha_enabled: boolean;
+  frames_sent: number;
+  dropped_frames: number;
+  started_at_ms: number;
+  uptime_ms: number;
+  last_frame_ms: number;
+  last_frame_age_ms: number;
+  last_error?: string | null;
+  sources: NativeNdiSourceStatus[];
+}
+
+export interface NativeNdiDiscoveredSource {
+  name: string;
+  url_address?: string | null;
+}
+
+export interface NativeNdiInputStatus {
+  state: NativeHealthState;
+  active: boolean;
+  desired_active: boolean;
+  source_name?: string | null;
+  routed_source_id: string;
+  width: number;
+  height: number;
+  frames_received: number;
+  dropped_frames: number;
+  started_at_ms: number;
+  uptime_ms: number;
+  last_frame_ms: number;
+  last_frame_age_ms: number;
+  last_error?: string | null;
 }
 
 interface NativeAudioInput {
@@ -139,6 +212,9 @@ interface NativeSourceStatus {
   label: string;
   source_kind: NativeSourceKind;
   state: NativeHealthState;
+  recovery_delay_ms: number;
+  restart_count: number;
+  last_event?: string | null;
   source_status?: string | null;
   resolution?: string | null;
   fps?: number | null;
@@ -148,6 +224,7 @@ interface NativeSourceStatus {
   frame_height: number;
   last_frame_ms: number;
   last_inventory_sync_ms: number;
+  last_update_ms: number;
   last_error?: string | null;
 }
 
@@ -158,6 +235,7 @@ interface NativeStreamStats {
   restarting: boolean;
   restart_count: number;
   max_restarts: number;
+  session_id: number;
   encoder: string;
   is_gpu: boolean;
   width: number;
@@ -174,6 +252,7 @@ interface NativeStreamStats {
   last_error?: string | null;
   last_exit_status?: string | null;
   ffmpeg_path: string;
+  started_at_ms: number;
   last_frame_age_ms: number;
   uptime_ms: number;
   lavfi_enabled: boolean;
@@ -194,6 +273,8 @@ interface NativeStreamStats {
   audio_status: NativeAudioStatus;
   output_statuses: NativeOutputStatus[];
   archive_status: NativeArchiveStatus;
+  ndi_status: NativeNdiStatus;
+  ndi_input_status: NativeNdiInputStatus;
 }
 
 interface NativeStartStreamResponse {
@@ -230,6 +311,8 @@ interface GPUStreamStats {
   audioStatus: NativeAudioStatus | null;
   outputStatuses: NativeOutputStatus[];
   archiveStatus: NativeArchiveStatus | null;
+  ndiStatus: NativeNdiStatus | null;
+  ndiInputStatus: NativeNdiInputStatus | null;
 }
 
 interface NativeDiagnosticsSnapshot {
@@ -237,12 +320,14 @@ interface NativeDiagnosticsSnapshot {
   stats: NativeStreamStats;
 }
 
-type NativeCaptureProfile = {
-  width: number;
-  height: number;
-  fps: number;
-  bitrate: number;
-};
+interface NativeDiagnosticsArtifactResult {
+  file_path: string;
+  check_command: string;
+  check_passed: boolean;
+  check_exit_code: number;
+  stdout: string;
+  stderr: string;
+}
 
 export type NativeVideoSourceConfig = {
   sourceId: string;
@@ -268,14 +353,70 @@ type NativeFrameMode = 'raw' | 'native-scene';
 const STATS_POLL_MS = 1500;
 const BRIDGE_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
 const BRIDGE_RECONNECT_MS = 1000;
+const NATIVE_READY_TIMEOUT_MS = 30000;
+const NATIVE_READY_POLL_MS = 500;
+const NATIVE_OUTPUT_STABLE_MS = 3000;
+const NATIVE_PROGRESS_MAX_AGE_MS = 8000;
+const NATIVE_FRAME_LOOP_MIN_DELAY_MS = 4;
+const SOURCE_BRIDGE_FRAME_INTERVAL_MS = 50;
+
+const delay = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+function resolvePrimaryOutputProgress(native: NativeStreamStats): {
+  fps?: number;
+  bitrateMbps?: number;
+  bitrateKbps?: number;
+  encoderSpeed?: number;
+} {
+  const primaryOutput = native.output_statuses.find((output) => output.protocol !== 'archive');
+  if (
+    primaryOutput?.measured_fps !== undefined
+    || primaryOutput?.measured_bitrate_kbps !== undefined
+    || primaryOutput?.encoder_speed !== undefined
+  ) {
+    return {
+      fps: primaryOutput.measured_fps ?? undefined,
+      bitrateKbps: primaryOutput.measured_bitrate_kbps ?? undefined,
+      bitrateMbps:
+        primaryOutput.measured_bitrate_kbps !== undefined
+          ? primaryOutput.measured_bitrate_kbps / 1000
+          : undefined,
+      encoderSpeed: primaryOutput.encoder_speed ?? undefined,
+    };
+  }
+
+  const line = primaryOutput?.last_event || primaryOutput?.last_error || '';
+  return parseOutputProgressLine(line);
+}
+
+function resolveMeasuredOutputFps(native: NativeStreamStats): number {
+  const progress = resolvePrimaryOutputProgress(native);
+  if (progress.fps && Number.isFinite(progress.fps) && progress.fps > 0) {
+    return progress.fps;
+  }
+
+  if (native.uptime_ms <= 0 || native.frames <= 0) {
+    return native.fps || 0;
+  }
+
+  return native.frames / Math.max(native.uptime_ms / 1000, 1);
+}
 
 function resolveNativeNetworkState(native: NativeStreamStats): 'excellent' | 'good' | 'fair' | 'poor' {
+  const progress = resolvePrimaryOutputProgress(native);
+  const measuredFps = resolveMeasuredOutputFps(native);
+  const primaryOutput = native.output_statuses.find((output) => output.protocol !== 'archive');
+  const targetFps = primaryOutput?.target_fps || native.fps || 0;
+  const encoderSpeed = progress.encoderSpeed || 0;
+
   const outputStates = native.output_statuses.map((output) => output.state);
 
   if (
     outputStates.includes('error') ||
     native.archive_status?.state === 'error' ||
-    (!native.active && native.restarting)
+    (!native.active && native.restarting) ||
+    (encoderSpeed > 0 && encoderSpeed < 0.7) ||
+    (targetFps > 0 && measuredFps > 0 && measuredFps < targetFps * 0.7)
   ) {
     return 'poor';
   }
@@ -285,14 +426,19 @@ function resolveNativeNetworkState(native: NativeStreamStats): 'excellent' | 'go
     outputStates.includes('recovering') ||
     outputStates.includes('degraded') ||
     native.archive_status?.state === 'recovering' ||
-    native.archive_status?.state === 'degraded'
+    native.archive_status?.state === 'degraded' ||
+    native.write_failures > 0 ||
+    (encoderSpeed > 0 && encoderSpeed < 0.95) ||
+    (targetFps > 0 && measuredFps > 0 && measuredFps < targetFps * 0.9)
   ) {
     return 'fair';
   }
 
   if (
     native.last_frame_age_ms > 1500 ||
-    (native.transport_mode === 'bridge' && !native.bridge_connected)
+    (native.transport_mode === 'bridge' && !native.bridge_connected) ||
+    (encoderSpeed > 0 && encoderSpeed < 0.98) ||
+    (targetFps > 0 && measuredFps > 0 && measuredFps < targetFps * 0.97)
   ) {
     return 'good';
   }
@@ -316,40 +462,6 @@ function healthStateLogType(state: NativeHealthState): ServerLog['type'] {
     default:
       return 'info';
   }
-}
-
-function resolveCaptureProfile(
-  encodingProfile: EncodingProfile | undefined,
-  isGPU: boolean,
-  overrides?: { width?: number; height?: number; fps?: number; bitrate?: number },
-): NativeCaptureProfile {
-  const profile = encodingProfile || '1080p30';
-
-  let base: NativeCaptureProfile;
-  switch (profile) {
-    case '1080p60':
-    case '1080p30':
-      base = isGPU
-        ? { width: 1280, height: 720, fps: 30, bitrate: 6000 }
-        : { width: 960, height: 540, fps: 30, bitrate: 3500 };
-      break;
-    case '720p30':
-      base = isGPU
-        ? { width: 1280, height: 720, fps: 30, bitrate: 4500 }
-        : { width: 960, height: 540, fps: 30, bitrate: 3000 };
-      break;
-    case '480p30':
-    default:
-      base = { width: 854, height: 480, fps: 30, bitrate: 2000 };
-      break;
-  }
-
-  return {
-    width: overrides?.width || base.width,
-    height: overrides?.height || base.height,
-    fps: overrides?.fps || base.fps,
-    bitrate: overrides?.bitrate || base.bitrate,
-  };
 }
 
 function getCaptureElementDimensions(
@@ -403,14 +515,21 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     audioStatus: null,
     outputStatuses: [],
     archiveStatus: null,
+    ndiStatus: null,
+    ndiInputStatus: null,
   });
+  const statsRef = useRef<GPUStreamStats>(stats);
   const [encoderInfo, setEncoderInfo] = useState<{ encoder: string; isGPU: boolean; ffmpegPath: string } | null>(null);
   const [audioInfo, setAudioInfo] = useState<NativeAudioDiscovery | null>(null);
 
+  useEffect(() => {
+    statsRef.current = stats;
+  }, [stats]);
+
   const frameLoopRef = useRef<number | null>(null);
+  const frameLoopRunIdRef = useRef(0);
   const statsPollRef = useRef<number | null>(null);
   const diagnosticsHistoryRef = useRef<NativeDiagnosticsSnapshot[]>([]);
-  const lastFrameTimeRef = useRef(0);
   const frameCountRef = useRef(0);
   const droppedRef = useRef(0);
   const sendingRef = useRef(false);
@@ -435,19 +554,21 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
   const latestSceneSnapshotRef = useRef<NativeSceneSnapshot | null>(null);
   const sourceCaptureRef = useRef<(() => NativeSceneCaptureSource[]) | null>(null);
   const sourceScaleCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const sourceBridgeLastFrameAtRef = useRef<Map<string, number>>(new Map());
   const sourceCaptureFailureKeysRef = useRef<Set<string>>(new Set());
   const frameModeRef = useRef<NativeFrameMode>('raw');
   const activeNativeSourceIdsRef = useRef<Set<string>>(new Set());
   const sourceStoreOwnedSourceIdsRef = useRef<Set<string>>(new Set());
   const lastSyncedBrowserSourceIdsRef = useRef<Set<string>>(new Set());
 
+  const { setServerLogs } = options;
   const addServerLog = useCallback((message: string, type: ServerLog['type']) => {
-    if (!options.setServerLogs) return;
-    options.setServerLogs((prev) => [
+    if (!setServerLogs) return;
+    setServerLogs((prev) => [
       { message, type, id: Date.now() + Math.random() } as ServerLog,
       ...prev,
     ]);
-  }, [options]);
+  }, [setServerLogs]);
 
   const stopStatsPolling = useCallback(() => {
     if (statsPollRef.current !== null) {
@@ -640,12 +761,18 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     lastNativeStateRef.current = native;
     transportModeRef.current = native.transport_mode || 'invoke';
     bridgeUrlRef.current = native.bridge_url || null;
+    const progress = resolvePrimaryOutputProgress(native);
+    const measuredFps = resolveMeasuredOutputFps(native);
+    const displayedBitrate = progress.bitrateMbps && progress.bitrateMbps > 0
+      ? `${progress.bitrateMbps.toFixed(1)} Mbps`
+      : undefined;
+
     setStats({
       framesEncoded: native.frames,
       isActive: native.active,
       encoder: native.encoder,
       isGPU: native.is_gpu,
-      fps: native.fps,
+      fps: measuredFps,
       droppedFrames: droppedRef.current + native.write_failures,
       restarting: native.restarting,
       restartCount: native.restart_count,
@@ -666,12 +793,14 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       audioStatus: native.audio_status || null,
       outputStatuses: native.output_statuses || [],
       archiveStatus: native.archive_status || null,
+      ndiStatus: native.ndi_status || null,
+      ndiInputStatus: native.ndi_input_status || null,
     });
 
     options.setTelemetry?.((prev: any) => ({
       ...prev,
-      bitrate: native.bitrate_kbps > 0 ? `${(native.bitrate_kbps / 1000).toFixed(1)} Mbps` : prev.bitrate,
-      fps: native.fps || prev.fps,
+      bitrate: displayedBitrate || prev.bitrate,
+      fps: measuredFps || prev.fps,
       droppedFrames: droppedRef.current + native.write_failures,
       network: resolveNativeNetworkState(native),
       nativeFrameTransport: native.frame_transport || prev.nativeFrameTransport,
@@ -699,6 +828,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       const result = await invokeRef.current('get_stream_stats');
       const parsed = JSON.parse(result as string) as Partial<NativeStreamStats>;
       const native = {
+        session_id: 0,
         audio_status: {
           state: 'inactive',
           mode: 'silent',
@@ -742,10 +872,47 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           state: 'inactive',
           path_pattern: null,
           segment_seconds: 0,
+          recovery_delay_ms: 0,
           restart_count: 0,
+          last_event: null,
           last_error: null,
           last_update_ms: 0,
         },
+        ndi_status: {
+          state: 'inactive',
+          health: { ok: false, error: null },
+          active: false,
+          desired_active: false,
+          width: 1920,
+          height: 1080,
+          fps: 30,
+          alpha_enabled: true,
+          frames_sent: 0,
+          dropped_frames: 0,
+          started_at_ms: 0,
+          uptime_ms: 0,
+          last_frame_ms: 0,
+          last_frame_age_ms: 0,
+          last_error: null,
+          sources: [],
+        },
+        ndi_input_status: {
+          state: 'inactive',
+          active: false,
+          desired_active: false,
+          source_name: null,
+          routed_source_id: 'camera:local-2',
+          width: 0,
+          height: 0,
+          frames_received: 0,
+          dropped_frames: 0,
+          started_at_ms: 0,
+          uptime_ms: 0,
+          last_frame_ms: 0,
+          last_frame_age_ms: 0,
+          last_error: null,
+        },
+        started_at_ms: 0,
         ...parsed,
       } as NativeStreamStats;
       const previous = lastNativeStateRef.current;
@@ -886,6 +1053,40 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         );
       }
 
+      if (!previous?.ndi_status) {
+        addServerLog(
+          `[ndi] ${native.ndi_status.state} (${native.ndi_status.width}x${native.ndi_status.height}@${native.ndi_status.fps}, alpha ${native.ndi_status.alpha_enabled ? 'on' : 'off'})`,
+          healthStateLogType(native.ndi_status.state),
+        );
+      } else if (
+        native.ndi_status.state !== previous.ndi_status.state ||
+        native.ndi_status.last_error !== previous.ndi_status.last_error ||
+        native.ndi_status.active !== previous.ndi_status.active
+      ) {
+        const detail = native.ndi_status.last_error ? `: ${native.ndi_status.last_error}` : '';
+        addServerLog(
+          `[ndi] ${native.ndi_status.state} (${native.ndi_status.frames_sent} frames, dropped ${native.ndi_status.dropped_frames})${detail}`,
+          healthStateLogType(native.ndi_status.state),
+        );
+      }
+
+      if (!previous?.ndi_input_status) {
+        addServerLog(
+          `[ndi-input] ${native.ndi_input_status.state} (${native.ndi_input_status.source_name || 'no source'})`,
+          healthStateLogType(native.ndi_input_status.state),
+        );
+      } else if (
+        native.ndi_input_status.state !== previous.ndi_input_status.state ||
+        native.ndi_input_status.last_error !== previous.ndi_input_status.last_error ||
+        native.ndi_input_status.frames_received !== previous.ndi_input_status.frames_received
+      ) {
+        const detail = native.ndi_input_status.last_error ? `: ${native.ndi_input_status.last_error}` : '';
+        addServerLog(
+          `[ndi-input] ${native.ndi_input_status.state} ${native.ndi_input_status.source_name || ''} (${native.ndi_input_status.width}x${native.ndi_input_status.height}, ${native.ndi_input_status.frames_received} frames)${detail}`,
+          healthStateLogType(native.ndi_input_status.state),
+        );
+      }
+
       if (native.last_error && native.last_error !== previous?.last_error) {
         addServerLog(`[native] ${native.last_error}`, 'error');
       }
@@ -931,9 +1132,10 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       ) {
         stopStatsPolling();
         if (frameLoopRef.current !== null) {
-          cancelAnimationFrame(frameLoopRef.current);
+          window.clearTimeout(frameLoopRef.current);
           frameLoopRef.current = null;
         }
+        frameLoopRunIdRef.current++;
         canvasRef.current = null;
         sendingRef.current = false;
         isStreamingRef.current = false;
@@ -1022,8 +1224,50 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     }, STATS_POLL_MS);
   }, [pollNativeState, stopStatsPolling]);
 
+  const waitForNativeStreamReady = useCallback(async (destinationCount: number) => {
+    const startedAt = Date.now();
+    let lastKnownError: string | null = null;
+
+    while ((Date.now() - startedAt) < NATIVE_READY_TIMEOUT_MS) {
+      const native = await pollNativeState();
+      if (native) {
+        const now = Date.now();
+        lastKnownError = native.last_error || native.last_exit_status || lastKnownError;
+        lastKnownError = native.archive_status?.last_error || lastKnownError;
+        const readyOutputs = (native.output_statuses || []).filter((output) =>
+          output.state === 'active'
+          && !!output.first_progress_ms
+          && !!output.last_progress_ms
+          && now - output.first_progress_ms >= NATIVE_OUTPUT_STABLE_MS
+          && now - output.last_progress_ms <= NATIVE_PROGRESS_MAX_AGE_MS,
+        );
+        const archiveRequired = !!(native.archive_status?.path_pattern || native.archive_path_pattern);
+        const archiveReady = !archiveRequired || (
+          native.archive_status?.state === 'active'
+          && !!native.archive_status.last_update_ms
+          && now - native.archive_status.last_update_ms <= NATIVE_PROGRESS_MAX_AGE_MS
+        );
+
+        if (native.frames > 0 && readyOutputs.length > 0 && archiveReady && !native.restarting) {
+          return `Live output confirmed (${readyOutputs.length}/${destinationCount} destination${destinationCount === 1 ? '' : 's'} active${archiveRequired ? ', archive active' : ''})`;
+        }
+
+        if (!native.desired_active && !native.active && !native.restarting) {
+          throw new Error(lastKnownError || 'Native stream stopped before it became ready.');
+        }
+      }
+
+      await delay(NATIVE_READY_POLL_MS);
+    }
+
+    throw new Error(lastKnownError || 'Timed out waiting for native outputs to become ready.');
+  }, [pollNativeState]);
+
+  const engineInitRef = useRef(false);
   useEffect(() => {
     if (!window.__TAURI_INTERNALS__) return;
+    if (engineInitRef.current) return;
+    engineInitRef.current = true;
 
     let disposed = false;
 
@@ -1158,14 +1402,17 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       currentBrowserSourceIds.add(source.sourceId);
       sourceStoreOwnedIds.add(source.sourceId);
 
-      const nativeSourceStatus = lastNativeStateRef.current?.source_statuses?.find(
-        (candidate) => candidate.source_id === source.sourceId,
+      const shouldPreferNativeSource = shouldPreferNativeSourceFrame(
+        source.sourceId,
+        activeNativeSourceIdsRef.current,
+        lastNativeStateRef.current?.source_statuses || [],
       );
-      const shouldPreferNativeSource = activeNativeSourceIdsRef.current.has(source.sourceId)
-        && !!nativeSourceStatus
-        && ['active', 'recovering', 'degraded'].includes(nativeSourceStatus.state);
       if (shouldPreferNativeSource) {
-        closeSourceBridgeSocket(source.sourceId, 'native source active');
+        continue;
+      }
+
+      const sourceFrameSentAt = sourceBridgeLastFrameAtRef.current.get(source.sourceId) || 0;
+      if (Date.now() - sourceFrameSentAt < SOURCE_BRIDGE_FRAME_INTERVAL_MS) {
         continue;
       }
 
@@ -1214,13 +1461,9 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
           frameBytes,
         );
         if (!sentViaBridge) {
-          await invokeRef.current('update_scene_source_frame', {
-            sourceId: source.sourceId,
-            width: captureWidth,
-            height: captureHeight,
-            frameData: Array.from(frameBytes),
-          });
+          continue;
         }
+        sourceBridgeLastFrameAtRef.current.set(source.sourceId, Date.now());
         sourceCaptureFailureKeysRef.current.delete(source.sourceId);
         updatedSources += 1;
       } catch (error: any) {
@@ -1242,6 +1485,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       if (activeNativeSourceIdsRef.current.has(previousSourceId)) continue;
 
       sourceScaleCanvasesRef.current.delete(previousSourceId);
+      sourceBridgeLastFrameAtRef.current.delete(previousSourceId);
       closeSourceBridgeSocket(previousSourceId, 'source removed');
       await invokeRef.current('clear_scene_source_frame', {
         sourceId: previousSourceId,
@@ -1321,9 +1565,10 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       if (message.includes('STREAM_DEAD')) {
         addServerLog('Native encoder died and could not recover', 'error');
         if (frameLoopRef.current !== null) {
-          cancelAnimationFrame(frameLoopRef.current);
+          window.clearTimeout(frameLoopRef.current);
           frameLoopRef.current = null;
         }
+        frameLoopRunIdRef.current++;
         canvasRef.current = null;
         sourceCaptureRef.current = null;
         isStreamingRef.current = false;
@@ -1334,6 +1579,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
         lastSyncedBrowserSourceIdsRef.current.clear();
         lastOwnedSourceIdsKeyRef.current = '';
         sourceCaptureFailureKeysRef.current.clear();
+        sourceBridgeLastFrameAtRef.current.clear();
         setIsStreaming(false);
         stopStatsPolling();
         options.onError?.('Native encoder stopped unexpectedly.');
@@ -1375,15 +1621,6 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       invokeRef.current = invoke;
     }
 
-    const nativeProfile = resolveCaptureProfile(
-      startOptions?.encodingProfile,
-      encoderInfo?.isGPU ?? true,
-      startOptions,
-    );
-
-    fpsRef.current = nativeProfile.fps;
-    widthRef.current = nativeProfile.width;
-    heightRef.current = nativeProfile.height;
     const captureSurface = surface instanceof HTMLCanvasElement
       ? { canvas: surface, captureSources: undefined }
       : surface;
@@ -1392,6 +1629,18 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     const nativeVideoSources = (startOptions?.nativeVideoSources || []).filter(
       (source) => !!source.sourceId && !!source.deviceName,
     );
+    const nativeProfile = resolveNativeCaptureProfile(
+      startOptions?.encodingProfile,
+      encoderInfo?.isGPU ?? true,
+      {
+        mode: useNativeScene ? 'native-scene' : 'raw',
+        destinations,
+      },
+    );
+
+    fpsRef.current = nativeProfile.fps;
+    widthRef.current = nativeProfile.width;
+    heightRef.current = nativeProfile.height;
     frameModeRef.current = useNativeScene ? 'native-scene' : 'raw';
     canvasRef.current = captureSurface.canvas;
     sourceCaptureRef.current = resolvedSourceFeeds || null;
@@ -1409,6 +1658,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     scaleCanvasRef.current.height = nativeProfile.height;
 
     try {
+      const destinationCount = destinations.filter((destination) => destination.enabled !== false).length;
       const result = await invokeRef.current('start_stream', {
         config: {
           destinations: destinations.map((d) => ({
@@ -1485,40 +1735,67 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
 
       if (useNativeScene && sourceBridgeUrlRef.current) {
         addServerLog(`Native source bridge ready: ${sourceBridgeUrlRef.current}`, 'info');
+        const initialSources = resolvedSourceFeeds ? resolvedSourceFeeds() : [];
+        await Promise.all(initialSources.map((source) => ensureSourceBridgeSocket(source.sourceId)));
       }
 
       frameCountRef.current = 0;
       droppedRef.current = 0;
-      lastFrameTimeRef.current = 0;
       lastNativeStateRef.current = null;
       diagnosticsHistoryRef.current = [];
+      frameLoopRunIdRef.current++;
       setIsStreaming(true);
       if (latestSourceInventoryRef.current.length > 0) {
         await syncSourceInventory(latestSourceInventoryRef.current);
       }
       addServerLog(
-        `Native ${useNativeScene ? 'scene' : 'raw'} stream started at ${nativeProfile.width}x${nativeProfile.height} ${nativeProfile.fps}fps`,
-        'success',
+        `Native ${useNativeScene ? 'scene' : 'raw'} stream starting at ${nativeProfile.width}x${nativeProfile.height} ${nativeProfile.fps}fps`,
+        'info',
       );
       startStatsPolling();
 
       const frameDuration = 1000 / nativeProfile.fps;
-      const captureLoop = (time: number) => {
-        if (!canvasRef.current || !isStreamingRef.current) return;
+      const runId = frameLoopRunIdRef.current;
+      const scheduleNextCapture = (delayMs: number) => {
+        frameLoopRef.current = window.setTimeout(() => {
+          frameLoopRef.current = null;
+          if (!canvasRef.current || !isStreamingRef.current || frameLoopRunIdRef.current !== runId) {
+            return;
+          }
 
-        const elapsed = time - lastFrameTimeRef.current;
-        if (elapsed >= frameDuration) {
-          lastFrameTimeRef.current = time - (elapsed % frameDuration);
-          void captureAndSendFrame(canvasRef.current);
-        }
+          const captureCanvas = canvasRef.current;
+          const startedAt = performance.now();
+          void captureAndSendFrame(captureCanvas).finally(() => {
+            if (!canvasRef.current || !isStreamingRef.current || frameLoopRunIdRef.current !== runId) {
+              return;
+            }
 
-        frameLoopRef.current = requestAnimationFrame(captureLoop);
+            const elapsed = performance.now() - startedAt;
+            scheduleNextCapture(Math.max(NATIVE_FRAME_LOOP_MIN_DELAY_MS, frameDuration - elapsed));
+          });
+        }, Math.max(0, delayMs));
       };
 
-      frameLoopRef.current = requestAnimationFrame(captureLoop);
-      options.onSuccess?.(startResponse.message);
-      return startResponse.message;
+      scheduleNextCapture(0);
+      try {
+        const readyMessage = await waitForNativeStreamReady(destinationCount);
+        addServerLog(readyMessage, 'success');
+        options.onSuccess?.(readyMessage);
+        return readyMessage;
+      } catch (readyError) {
+        try {
+          await invokeRef.current('stop_stream');
+        } catch {
+          // Best effort cleanup before bubbling the readiness failure.
+        }
+        throw readyError;
+      }
     } catch (err) {
+      frameLoopRunIdRef.current++;
+      if (frameLoopRef.current !== null) {
+        window.clearTimeout(frameLoopRef.current);
+        frameLoopRef.current = null;
+      }
       closeBridgeSocket('start failed');
       closeAllSourceBridgeSockets('start failed');
       sourceBridgeUrlRef.current = null;
@@ -1529,6 +1806,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastSyncedBrowserSourceIdsRef.current.clear();
       lastOwnedSourceIdsKeyRef.current = '';
       sourceCaptureFailureKeysRef.current.clear();
+      sourceBridgeLastFrameAtRef.current.clear();
       frameModeRef.current = 'raw';
       isStreamingRef.current = false;
       diagnosticsHistoryRef.current = [];
@@ -1545,13 +1823,15 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     options,
     startStatsPolling,
     syncSourceInventory,
+    waitForNativeStreamReady,
   ]);
 
   const stopStream = useCallback(async () => {
     if (frameLoopRef.current !== null) {
-      cancelAnimationFrame(frameLoopRef.current);
+      window.clearTimeout(frameLoopRef.current);
       frameLoopRef.current = null;
     }
+    frameLoopRunIdRef.current++;
     canvasRef.current = null;
     isStreamingRef.current = false;
     stopStatsPolling();
@@ -1569,6 +1849,7 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     lastSyncedBrowserSourceIdsRef.current.clear();
     lastOwnedSourceIdsKeyRef.current = '';
     sourceCaptureFailureKeysRef.current.clear();
+    sourceBridgeLastFrameAtRef.current.clear();
     frameModeRef.current = 'raw';
     sourceScaleCanvasesRef.current.clear();
     diagnosticsHistoryRef.current = [];
@@ -1601,8 +1882,164 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       audioStatus: null,
       outputStatuses: [],
       archiveStatus: null,
+      ndiStatus: prev.ndiStatus,
+      ndiInputStatus: prev.ndiInputStatus,
     }));
   }, [addServerLog, closeAllSourceBridgeSockets, closeBridgeSocket, stopStatsPolling, syncSourceInventory]);
+
+  const startNdi = useCallback(async (config?: {
+    resolution?: '720p' | '1080p';
+    fps?: number;
+    alphaEnabled?: boolean;
+  }) => {
+    if (!window.__TAURI_INTERNALS__) {
+      throw new Error('NDI output is available only in the desktop app.');
+    }
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const result = JSON.parse(
+      await invokeRef.current('start_ndi', {
+        config: {
+          resolution: config?.resolution || '1080p',
+          fps: config?.fps || 30,
+          alphaEnabled: config?.alphaEnabled !== false,
+        },
+      }) as string,
+    ) as NativeNdiStatus;
+
+    setStats((prev) => ({ ...prev, ndiStatus: result }));
+    addServerLog(
+      `[ndi] starting ${result.width}x${result.height}@${result.fps} (${result.sources.map((source) => source.name).join(', ')})`,
+      'info',
+    );
+    startStatsPolling();
+    return result;
+  }, [addServerLog, startStatsPolling]);
+
+  const stopNdi = useCallback(async () => {
+    if (!window.__TAURI_INTERNALS__) {
+      return null;
+    }
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const result = JSON.parse(await invokeRef.current('stop_ndi') as string) as NativeNdiStatus;
+    setStats((prev) => ({ ...prev, ndiStatus: result }));
+    addServerLog('[ndi] stopped', 'info');
+    if (!isStreamingRef.current) {
+      stopStatsPolling();
+    }
+    return result;
+  }, [addServerLog, stopStatsPolling]);
+
+  const refreshNdiStatus = useCallback(async () => {
+    if (!window.__TAURI_INTERNALS__) {
+      return null;
+    }
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const result = JSON.parse(await invokeRef.current('get_ndi_status') as string) as NativeNdiStatus;
+    setStats((prev) => ({ ...prev, ndiStatus: result }));
+    return result;
+  }, []);
+
+  const pushNdiProgramFrame = useCallback(async (canvas: HTMLCanvasElement) => {
+    if (!window.__TAURI_INTERNALS__) return;
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const ndi = statsRef.current.ndiStatus;
+    if (!ndi?.desired_active) return;
+
+    const width = ndi.width || 1280;
+    const height = ndi.height || 720;
+    if (!scaleCanvasRef.current) {
+      scaleCanvasRef.current = document.createElement('canvas');
+    }
+    const scaleCanvas = scaleCanvasRef.current;
+    scaleCanvas.width = width;
+    scaleCanvas.height = height;
+    const scaleCtx = scaleCanvas.getContext('2d', { willReadFrequently: true });
+    if (!scaleCtx) return;
+
+    scaleCtx.imageSmoothingEnabled = true;
+    scaleCtx.imageSmoothingQuality = 'high';
+    scaleCtx.clearRect(0, 0, width, height);
+    scaleCtx.drawImage(canvas, 0, 0, width, height);
+    const imageData = scaleCtx.getImageData(0, 0, width, height);
+    await invokeRef.current('push_ndi_program_frame', {
+      width,
+      height,
+      frameData: Array.from(new Uint8Array(imageData.data.buffer)),
+    });
+  }, []);
+
+  const listNdiSources = useCallback(async () => {
+    if (!window.__TAURI_INTERNALS__) {
+      return [] as NativeNdiDiscoveredSource[];
+    }
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    return JSON.parse(await invokeRef.current('list_ndi_sources') as string) as NativeNdiDiscoveredSource[];
+  }, []);
+
+  const startNdiInput = useCallback(async (sourceName: string, routedSourceId = 'camera:local-2') => {
+    if (!window.__TAURI_INTERNALS__) {
+      throw new Error('NDI input is available only in the desktop app.');
+    }
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const result = JSON.parse(
+      await invokeRef.current('start_ndi_input', {
+        config: { sourceName, routedSourceId },
+      }) as string,
+    ) as NativeNdiInputStatus;
+    setStats((prev) => ({ ...prev, ndiInputStatus: result }));
+    addServerLog(`[ndi-input] routing ${sourceName} into Cam 2`, 'info');
+    startStatsPolling();
+    return result;
+  }, [addServerLog, startStatsPolling]);
+
+  const stopNdiInput = useCallback(async () => {
+    if (!window.__TAURI_INTERNALS__) {
+      return null;
+    }
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const result = JSON.parse(await invokeRef.current('stop_ndi_input') as string) as NativeNdiInputStatus;
+    setStats((prev) => ({ ...prev, ndiInputStatus: result }));
+    addServerLog('[ndi-input] stopped', 'info');
+    if (!isStreamingRef.current && !stats.ndiStatus?.desired_active) {
+      stopStatsPolling();
+    }
+    return result;
+  }, [addServerLog, stats.ndiStatus?.desired_active, stopStatsPolling]);
 
   useEffect(() => {
     return () => {
@@ -1614,25 +2051,55 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
       lastSyncedBrowserSourceIdsRef.current.clear();
       lastOwnedSourceIdsKeyRef.current = '';
       sourceCaptureFailureKeysRef.current.clear();
+      sourceBridgeLastFrameAtRef.current.clear();
       sourceScaleCanvasesRef.current.clear();
       diagnosticsHistoryRef.current = [];
       if (frameLoopRef.current !== null) {
-        cancelAnimationFrame(frameLoopRef.current);
+        window.clearTimeout(frameLoopRef.current);
+        frameLoopRef.current = null;
       }
+      frameLoopRunIdRef.current++;
     };
   }, [closeAllSourceBridgeSockets, closeBridgeSocket, stopStatsPolling]);
 
   const isAvailable = !!window.__TAURI_INTERNALS__;
 
-  const exportDiagnostics = useCallback(() => {
-    const payload = {
+  const buildDiagnosticsPayload = useCallback(() => {
+    const latest = lastNativeStateRef.current;
+    return {
+      artifactVersion: 2,
       exportedAt: new Date().toISOString(),
+      soakGate: {
+        maxRestartCount: 3,
+        maxFrameAgeMs: 5000,
+        maxDegradedRatio: 0.1,
+        outputsMustAvoidError: true,
+        archiveMustAvoidError: true,
+      },
+      session: latest ? {
+        sessionId: latest.session_id,
+        startedAtMs: latest.started_at_ms,
+        uptimeMs: latest.uptime_ms,
+        encoder: latest.encoder,
+        isGPU: latest.is_gpu,
+        width: latest.width,
+        height: latest.height,
+        fps: latest.fps,
+        bitrateKbps: latest.bitrate_kbps,
+        transportMode: latest.transport_mode,
+        frameTransport: latest.frame_transport,
+        outputCount: latest.output_statuses?.length || 0,
+        sourceCount: latest.source_statuses?.length || 0,
+        archivePathPattern: latest.archive_path_pattern || latest.archive_status?.path_pattern || null,
+      } : null,
       encoderInfo,
       audioInfo,
-      latest: lastNativeStateRef.current,
+      latest,
       history: diagnosticsHistoryRef.current,
     };
+  }, [audioInfo, encoderInfo]);
 
+  const downloadDiagnosticsPayload = useCallback((payload: unknown) => {
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -1640,8 +2107,42 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     anchor.download = `aether-native-diagnostics-${Date.now()}.json`;
     anchor.click();
     URL.revokeObjectURL(url);
+  }, []);
+
+  const exportDiagnostics = useCallback(() => {
+    const payload = buildDiagnosticsPayload();
+    downloadDiagnosticsPayload(payload);
     return payload;
-  }, [audioInfo, encoderInfo]);
+  }, [buildDiagnosticsPayload, downloadDiagnosticsPayload]);
+
+  const exportAndCheckDiagnostics = useCallback(async () => {
+    if (!window.__TAURI_INTERNALS__) {
+      throw new Error('Diagnostics artifact export is available only in the desktop app.');
+    }
+
+    if (!invokeRef.current) {
+      const { invoke } = await import('@tauri-apps/api/core');
+      invokeRef.current = invoke;
+    }
+
+    const payload = buildDiagnosticsPayload();
+    const result = JSON.parse(
+      await invokeRef.current('export_native_diagnostics_artifact', {
+        payloadJson: JSON.stringify(payload),
+      }) as string,
+    ) as NativeDiagnosticsArtifactResult;
+
+    addServerLog(`[diagnostics] saved soak artifact: ${result.file_path}`, 'info');
+    addServerLog(
+      `[diagnostics] ${result.check_passed ? 'check passed' : 'check failed'}: ${result.check_command}`,
+      result.check_passed ? 'success' : 'warning',
+    );
+
+    return {
+      payload,
+      ...result,
+    };
+  }, [addServerLog, buildDiagnosticsPayload]);
 
   return {
     isAvailable,
@@ -1653,7 +2154,15 @@ export function useNativeEngine(options: UseNativeEngineOptions = {}) {
     syncSourceInventory,
     startStream,
     stopStream,
+    startNdi,
+    stopNdi,
+    refreshNdiStatus,
+    pushNdiProgramFrame,
+    listNdiSources,
+    startNdiInput,
+    stopNdiInput,
     exportDiagnostics,
+    exportAndCheckDiagnostics,
     // Transitional aliases while the app migrates off the old hook name.
     startGPUStream: startStream,
     stopGPUStream: stopStream,

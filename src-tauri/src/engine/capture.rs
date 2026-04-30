@@ -87,12 +87,8 @@ pub fn start_native_source_captures(
             continue;
         };
 
-        if let Err(err) = spawn_native_source_worker(
-            ffmpeg_bin,
-            session_id,
-            source.clone(),
-            device,
-        ) {
+        if let Err(err) = spawn_native_source_worker(ffmpeg_bin, session_id, source.clone(), device)
+        {
             note_source_error(&source.source_id, err.clone());
             clear_source_frame(&source.source_id);
         }
@@ -236,6 +232,7 @@ fn spawn_native_source_monitor(
                         source.width,
                         source.height,
                         frame.clone(),
+                        true,
                     ) {
                         if let Ok(mut guard) = last_error.lock() {
                             *guard = Some(err.clone());
@@ -337,7 +334,15 @@ fn build_native_source_ffmpeg_args(
 fn list_video_devices(ffmpeg_bin: &str) -> Vec<NativeVideoDevice> {
     let mut command = Command::new(ffmpeg_bin);
     let output = match configure_background_command(&mut command)
-        .args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
